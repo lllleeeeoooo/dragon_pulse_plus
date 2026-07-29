@@ -1,0 +1,341 @@
+import logging
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, Query, HTTPException, Header
+import uvicorn
+
+from database.services import HoldingManager, PushLogManager, LLMLogManager, ErrorLogManager
+from data.fetcher import DataFetcher
+from config.settings import settings
+from scheduler.daily_runner import job_pre_market, job_call_auction, job_post_market
+
+logger = logging.getLogger(__name__)
+
+# 创建 FastAPI Web HTTP 接口应用
+app = FastAPI(
+    title="dragon_pulse_plus 持仓管理 API",
+    description="REST API 用于添加、查看、更新与平仓股票持仓",
+    version="1.0.0"
+)
+
+# 简单的 API Key 鉴权：通过设置 API_KEY 环境变量或 .env 文件控制访问
+API_KEY = getattr(settings, "API_KEY", None) or ""
+
+
+def _check_auth(x_api_key: Optional[str] = Header(None)):
+    """基本 API Key 鉴权（未配置 API_KEY 时跳过校验）"""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="无效的 API Key")
+
+
+@app.get("/", summary="系统状态接口")
+def root():
+    return {"status": "ok", "message": "dragon_pulse_plus 持仓管理 API 正常运行中"}
+
+
+@app.get("/holdings", summary="查看当前活跃持仓列表")
+def get_holdings(
+    type: Optional[str] = Query(None, description="持仓类型筛选: MANUAL(手动持仓) 或 AI_AUTO(AI自动持仓)，不填返回全部")
+):
+    """
+    HTTP GET 示例: http://127.0.0.1:8000/holdings?type=AI_AUTO
+    """
+    holdings = HoldingManager.get_active_holdings(holding_type=type)
+    return {
+        "code": 200,
+        "msg": "获取成功",
+        "count": len(holdings),
+        "data": holdings
+    }
+
+
+@app.post("/holdings/add", summary="添加新持仓股票")
+def add_holding(
+    x_api_key: Optional[str] = Header(None),
+    code: str = Query(..., description="股票代码，如 000001"),
+    price: float = Query(..., description="买入成本价，如 10.5"),
+    quantity: int = Query(100, description="持仓数量，默认 100"),
+    strategy: str = Query("低吸战法", description="买入战法标签 (低吸战法/打板战法/二波战法/抱团战法/共振战法)"),
+    buy_date: str = Query("", description="买入日期 YYYY-MM-DD，默认为今天")
+):
+    """
+    POST 请求添加新持仓（支持 GET 兼容）。系统根据股票代码自动匹配股票名称。
+    示例: POST /holdings/add?code=000001&price=10.5&strategy=低吸战法
+    """
+    _check_auth(x_api_key)
+    matched_name = DataFetcher.get_stock_name(code=code)
+
+    success = HoldingManager.add_holding(
+        code=code,
+        name=matched_name,
+        cost_price=price,
+        quantity=quantity,
+        buy_date=buy_date,
+        strategy=strategy
+    )
+    if success:
+        return {
+            "code": 200,
+            "msg": f"成功添加持仓 {matched_name}({code})",
+            "data": {"code": code, "name": matched_name, "price": price, "strategy": strategy}
+        }
+    else:
+        raise HTTPException(status_code=500, detail="添加持仓失败，请检查数据库")
+
+
+# 兼容旧版 GET 请求（保留灵活性，但标记为 deprecated）
+@app.get("/holdings/add", summary="[已弃用] 添加新持仓股票 - 请使用 POST")
+def add_holding_get(
+    code: str = Query(..., description="股票代码"),
+    price: float = Query(..., description="买入成本价"),
+    quantity: int = Query(100, description="持仓数量"),
+    strategy: str = Query("低吸战法", description="买入战法标签"),
+    buy_date: str = Query("", description="买入日期 YYYY-MM-DD")
+):
+    """向后兼容的 GET 接口，建议迁移至 POST"""
+    return add_holding(
+        x_api_key=None,  # GET 兼容模式下不强制鉴权
+        code=code,
+        price=price,
+        quantity=quantity,
+        strategy=strategy,
+        buy_date=buy_date
+    )
+
+
+@app.post("/holdings/close", summary="平仓/卖出指定股票")
+def close_holding(
+    x_api_key: Optional[str] = Header(None),
+    code: str = Query(..., description="股票代码，如 000001")
+):
+    """
+    POST 请求平仓（支持 GET 兼容）
+    示例: POST /holdings/close?code=000001
+    """
+    _check_auth(x_api_key)
+    from database.models import db_manager, Holding
+    session = db_manager.get_session()
+    try:
+        holding = session.query(Holding).filter(Holding.code == code, Holding.status == "HOLDING").first()
+        if not holding:
+            raise HTTPException(status_code=404, detail=f"未找到代码为 {code} 的持仓记录")
+
+        holding.status = "CLOSED"
+        session.commit()
+        return {
+            "code": 200,
+            "msg": f"成功平仓 {holding.name}({code})",
+            "data": {"code": code, "status": "CLOSED"}
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+# 兼容旧版 GET 请求
+@app.get("/holdings/close", summary="[已弃用] 平仓/卖出指定股票 - 请使用 POST")
+def close_holding_get(code: str = Query(..., description="股票代码")):
+    """向后兼容的 GET 接口，建议迁移至 POST"""
+    return close_holding(x_api_key=None, code=code)
+
+
+@app.get("/push-logs", summary="查询推送历史记录")
+def get_push_logs(
+    date: Optional[str] = Query(None, description="查询日期，格式 YYYY-MM-DD，不填返回最近50条"),
+    group: Optional[str] = Query(None, description="按推送分组筛选，如 盘后复盘/盘中异动/AI自动持仓"),
+    limit: int = Query(50, description="返回条数上限，默认50")
+):
+    """
+    查询推送通知历史记录，支持按日期和分组筛选
+    示例: GET /push-logs?date=2026-07-29&limit=20
+    """
+    logs = PushLogManager.get_logs(date_str=date, push_group=group, limit=limit)
+    return {
+        "code": 200,
+        "msg": "获取成功",
+        "count": len(logs),
+        "data": logs
+    }
+
+
+@app.get("/llm-logs", summary="查询 LLM 调用历史记录")
+def get_llm_logs(
+    module: Optional[str] = Query(None, description="模块筛选: pre_market/call_auction/post_market/sell_advisor"),
+    date: Optional[str] = Query(None, description="查询日期 YYYY-MM-DD"),
+    success: Optional[bool] = Query(None, description="仅查成功/失败"),
+    limit: int = Query(50, description="返回条数上限")
+):
+    """查询大模型调用历史，支持按模块、日期、成功/失败筛选"""
+    logs = LLMLogManager.get_logs(module=module, date_str=date, success_only=success, limit=limit)
+    return {"code": 200, "msg": "获取成功", "count": len(logs), "data": logs}
+
+
+@app.get("/error-logs", summary="查询系统错误日志")
+def get_error_logs(
+    level: Optional[str] = Query(None, description="ERROR 或 WARNING"),
+    date: Optional[str] = Query(None, description="查询日期 YYYY-MM-DD"),
+    module: Optional[str] = Query(None, description="模块名模糊匹配"),
+    limit: int = Query(100, description="返回条数上限")
+):
+    """查询系统错误/警告日志，覆盖 akshare 异常、推送异常、代码异常等"""
+    logs = ErrorLogManager.get_logs(level=level, date_str=date, module=module, limit=limit)
+    return {"code": 200, "msg": "获取成功", "count": len(logs), "data": logs}
+
+
+@app.post("/jobs/pre-market", summary="手动触发盘前简报")
+def trigger_pre_market(x_api_key: Optional[str] = Header(None)):
+    """立即执行 08:30 盘前简报任务（新闻抓取 + LLM 分析 + Bark 推送）"""
+    _check_auth(x_api_key)
+    try:
+        job_pre_market()
+        return {"code": 200, "msg": "盘前简报已执行完成"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"盘前简报执行失败: {e}")
+
+
+@app.post("/jobs/call-auction", summary="手动触发竞价观察")
+def trigger_call_auction(x_api_key: Optional[str] = Header(None)):
+    """立即执行 09:26 竞价观察任务（拉涨停池 + LLM 竞价分析 + Bark 推送）"""
+    _check_auth(x_api_key)
+    try:
+        job_call_auction()
+        return {"code": 200, "msg": "竞价观察已执行完成"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"竞价观察执行失败: {e}")
+
+
+@app.post("/jobs/post-market", summary="手动触发盘后复盘")
+def trigger_post_market(x_api_key: Optional[str] = Header(None)):
+    """立即执行 15:30 盘后复盘任务（情绪计算 + LLM 深度复盘 + 推荐入库 + 龙头表更新 + Bark 推送）"""
+    _check_auth(x_api_key)
+    try:
+        job_post_market()
+        return {"code": 200, "msg": "盘后复盘已执行完成"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"盘后复盘执行失败: {e}")
+
+
+# ==================== AkShare 数据接口（可在 /docs 页面直接调用测试） ====================
+
+@app.get("/data/spot", summary="全市场实时行情快照",
+         description="对应 ak.stock_zh_a_spot_em()，返回全市场 A 股实时价格/涨跌幅/量比/成交额等")
+def data_spot():
+    df = DataFetcher.get_realtime_spot()
+    if df.empty:
+        return {"code": 200, "count": 0, "data": []}
+    return {"code": 200, "count": len(df), "data": df.head(100).to_dict(orient="records")}
+
+
+@app.get("/data/zt-pool", summary="每日涨停池",
+         description="对应 ak.stock_zt_pool_em(date)，返回涨停股列表含连板数/封板资金/炸板次数等")
+def data_zt_pool(date: str = Query(..., description="日期 YYYYMMDD，如 20260729")):
+    df = DataFetcher.get_zt_pool(date_str=date)
+    if df.empty:
+        return {"code": 200, "count": 0, "data": []}
+    return {"code": 200, "count": len(df), "data": df.to_dict(orient="records")}
+
+
+@app.get("/data/zhaban-pool", summary="每日炸板观察池",
+         description="对应 ak.stock_zt_pool_zbgc_em(date)，返回炸板观察池")
+def data_zhaban_pool(date: str = Query(..., description="日期 YYYYMMDD")):
+    df = DataFetcher.get_zhaban_pool(date_str=date)
+    if df.empty:
+        return {"code": 200, "count": 0, "data": []}
+    return {"code": 200, "count": len(df), "data": df.to_dict(orient="records")}
+
+
+@app.get("/data/dt-pool", summary="每日跌停池",
+         description="对应 ak.stock_zt_pool_dtgc_em(date)")
+def data_dt_pool(date: str = Query(..., description="日期 YYYYMMDD")):
+    df = DataFetcher.get_dt_pool(date_str=date)
+    if df.empty:
+        return {"code": 200, "count": 0, "data": []}
+    return {"code": 200, "count": len(df), "data": df.to_dict(orient="records")}
+
+
+@app.get("/data/lhb-detail", summary="龙虎榜个股明细",
+         description="对应 ak.stock_lhb_detail_em(start_date, end_date)")
+def data_lhb_detail(date: str = Query(..., description="日期 YYYYMMDD")):
+    df = DataFetcher.get_lhb_detail(date_str=date)
+    if df.empty:
+        return {"code": 200, "count": 0, "data": []}
+    return {"code": 200, "count": len(df), "data": df.to_dict(orient="records")}
+
+
+@app.get("/data/lhb-seats", summary="龙虎榜活跃营业部",
+         description="对应 ak.stock_lhb_hyyyb_em(start_date, end_date)，返回营业部级买卖数据")
+def data_lhb_seats(date: str = Query(..., description="日期 YYYYMMDD")):
+    df = DataFetcher.get_lhb_seats(date_str=date)
+    if df.empty:
+        return {"code": 200, "count": 0, "data": []}
+    return {"code": 200, "count": len(df), "data": df.head(50).to_dict(orient="records")}
+
+
+@app.get("/data/board-cons", summary="板块成分股",
+         description="对应 ak.stock_board_industry_cons_em(symbol)")
+def data_board_cons(board: str = Query(..., description="板块名称，如 半导体/人工智能/低空经济")):
+    df = DataFetcher.get_board_cons(board_name=board)
+    if df.empty:
+        return {"code": 200, "count": 0, "data": []}
+    return {"code": 200, "count": len(df), "data": df.head(50).to_dict(orient="records")}
+
+
+@app.get("/data/news", summary="财联社电报快讯",
+         description="对应 ak.stock_info_global_cls()")
+def data_news(limit: int = Query(20, description="返回条数")):
+    from data.news_fetcher import NewsFetcher
+    items = NewsFetcher.get_cls_news(limit=limit)
+    return {"code": 200, "count": len(items), "data": items}
+
+
+@app.get("/data/hot-rank", summary="同花顺热搜榜",
+         description="对应 ak.stock_hot_rank_em()")
+def data_hot_rank():
+    from data.news_fetcher import NewsFetcher
+    items = NewsFetcher.get_hot_search_words(limit=20)
+    return {"code": 200, "count": len(items), "data": items}
+
+
+@app.get("/data/intraday", summary="个股分时 OHLCV",
+         description="对应 ak.stock_zh_a_hist_min_em(symbol, period='5')，返回 5 分钟 K 线")
+def data_intraday(code: str = Query(..., description="股票代码，如 300359")):
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_hist_min_em(symbol=code, period="5", adjust="")
+        if df is not None and not df.empty:
+            return {"code": 200, "count": len(df), "data": df.tail(20).to_dict(orient="records")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"code": 200, "count": 0, "data": []}
+
+
+@app.post("/data/trade-calendar/refresh", summary="强制刷新交易日历",
+          description="重新从 akshare 拉取交易日历，覆盖 ±30 天数据。应对调休/假期安排变动。")
+def refresh_trade_calendar(x_api_key: Optional[str] = Header(None)):
+    _check_auth(x_api_key)
+    from database.services import TradeCalendarManager
+    TradeCalendarManager.sync_calendar(force=True)
+    return {"code": 200, "msg": "交易日历已强制刷新"}
+
+
+@app.get("/data/emotion", summary="情绪多维向量",
+         description="输入日期，返回当日情绪向量（高度/宽度/反馈/力度/承接/综合分）")
+def data_emotion(date: str = Query(..., description="日期 YYYYMMDD")):
+    from core.emotion_index import EmotionVector
+    zt_df = DataFetcher.get_zt_pool(date_str=date)
+    zhaban_df = DataFetcher.get_zhaban_pool(date_str=date)
+    dt_df = DataFetcher.get_dt_pool(date_str=date)
+    result = EmotionVector.calculate(zt_df=zt_df, zhaban_df=zhaban_df, dt_df=dt_df)
+    return {"code": 200, "data": result}
+
+
+def run_server(host: str = "0.0.0.0", port: int = 8000):
+    """启动持仓管理 HTTP API 服务"""
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    run_server()
