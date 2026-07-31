@@ -33,10 +33,14 @@ class RegulatoryYidongCalculator:
         if not settings.REGULATORY_MONITOR_ENABLED:
             return {"level": "INFO", "warning_msg": "监管异动监控未开启", "remaining_space": 100.0}
 
-        # 1. 确定板类型 (主板 10% vs 创业板/科创板 20%)
-        is_gem = str(code).startswith(("300", "301"))
-        is_star = str(code).startswith("688")
-        if is_star:
+        # 1. 确定板类型 (主板 10% / 创业板科创板 20% / 北交所 30%)
+        code_str = str(code)
+        is_gem = code_str.startswith(("300", "301"))
+        is_star = code_str.startswith("688")
+        is_bse = code_str.startswith(("82", "83", "87", "88", "92"))
+        if is_bse:
+            dev_3d_limit = 45.0  # 北交所 30% 涨跌幅，偏离度红线更高
+        elif is_star:
             dev_3d_limit = settings.STAR_3D_DEV_LIMIT
         elif is_gem:
             dev_3d_limit = settings.GEM_3D_DEV_LIMIT

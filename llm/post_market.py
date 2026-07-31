@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import pandas as pd
 
 from llm.client import llm_client
@@ -38,6 +38,52 @@ class PostMarketAnalyzer:
         except Exception as e:
             logger.warning(f"获取大盘指数涨跌数据失败: {e}")
         return 0.0, 0.0
+
+    @classmethod
+    def _get_stock_recent_pct(cls, code: str) -> Tuple[float, float]:
+        """
+        拉取个股近 10 天日 K 线，计算实际 3 日和 10 日累计涨跌幅。
+        失败时返回 0, 0（兜底，不影响主流程）。
+        """
+        try:
+            from data.fetcher import DataFetcher
+            import akshare as ak
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="", end_date="", adjust="qfq")
+            if df is None or df.empty:
+                return 0.0, 0.0
+            closes = pd.to_numeric(df["收盘"], errors="coerce").dropna()
+            if len(closes) < 3:
+                return 0.0, 0.0
+            latest = closes.iloc[-1]
+            # 3 日累计
+            if len(closes) >= 4:
+                real_3d = round((latest - closes.iloc[-4]) / closes.iloc[-4] * 100, 2)
+            else:
+                real_3d = 0.0
+            # 10 日累计
+            if len(closes) >= 11:
+                real_10d = round((latest - closes.iloc[-11]) / closes.iloc[-11] * 100, 2)
+            else:
+                real_10d = round((latest - closes.iloc[0]) / closes.iloc[0] * 100, 2)
+            return real_3d, real_10d
+        except Exception:
+            return 0.0, 0.0
+
+    @classmethod
+    def _detect_leading_sectors(cls, zt_df: pd.DataFrame) -> List[str]:
+        """从涨停池聚类主线板块：涨停数量 Top 5 行业"""
+        if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
+            return []
+        sectors = zt_df["industry"].dropna().astype(str)
+        # 过滤空值和无意义标签
+        sectors = sectors[sectors.str.len() > 0]
+        counts = sectors.value_counts().head(5)
+        lines = []
+        for industry, count in counts.items():
+            stocks = zt_df[zt_df["industry"].astype(str) == industry]
+            names = stocks["name"].astype(str).head(5).tolist()
+            lines.append(f"- **{industry}**：{count}只涨停，代表：{'/'.join(names)}")
+        return lines
 
     @classmethod
     def _score_stocks(cls, zt_df: pd.DataFrame) -> dict:
@@ -101,20 +147,25 @@ class PostMarketAnalyzer:
         lhb_df: pd.DataFrame,
         spot_df: pd.DataFrame = None,
         lhb_seats_df: pd.DataFrame = None,
-        yesterday_zt_yield: float = 1.5
+        yesterday_zt_yield: float = 1.5,
+        market_style_info: str = "",
+        precomputed_emotion: dict = None
     ) -> str:
         """
         运行盘后深度复盘
         """
         logger.info(f"开始执行 {trade_date} 盘后深度复盘...")
 
-        # 1. 计算情绪多维向量分值
-        emotion_res = EmotionVector.calculate(
-            zt_df=zt_df,
-            zhaban_df=zhaban_df,
-            dt_df=dt_df,
-            yesterday_zt_avg_premium=yesterday_zt_yield
-        )
+        # 1. 计算情绪多维向量分值（若有预计算数据则复用，避免重复调用）
+        if precomputed_emotion is not None:
+            emotion_res = precomputed_emotion
+        else:
+            emotion_res = EmotionVector.calculate(
+                zt_df=zt_df,
+                zhaban_df=zhaban_df,
+                dt_df=dt_df,
+                yesterday_zt_avg_premium=yesterday_zt_yield
+            )
 
         # 2. 从数据库检索昨日推荐标的进行胜率复盘（修复 #4：按日期过滤+全市场匹配）
         import datetime
@@ -143,10 +194,13 @@ class PostMarketAnalyzer:
         core_pool_lines = [f"- {c['name']}({c['code']}): 涨幅 {c['change_pct']}%, 日成交额 {c['amount_billion']}亿, 总市值 {c['market_cap_billion']}亿" for c in core_leaders]
         active_core_pool_text = "\n".join(core_pool_lines) if core_pool_lines else "暂无符合条件的大成交额核心中军"
 
-        # 4. 评估高位龙头异动风控（修复 #4：精准区分主板/双创涨跌幅）
+        # 4. 主线板块检测（涨停池行业聚类）
+        sector_lines = cls._detect_leading_sectors(zt_df)
+        leading_sector_text = "\n".join(sector_lines) if sector_lines else "无明显主线板块"
+
+        # 5. 评估高位龙头异动风控（拉取真实 K 线计算累计涨幅）
         yidong_warning_lines = []
         if zt_df is not None and not zt_df.empty:
-            # 获取近期大盘指数涨跌用于偏离度计算
             index_3d_pct, index_10d_pct = cls._get_recent_index_pct()
             for _, row in zt_df.head(10).iterrows():
                 code = str(row.get("code", ""))
@@ -157,21 +211,15 @@ class PostMarketAnalyzer:
                 except (ValueError, TypeError):
                     lbc = 1
                 if lbc >= 2:
-                    # 根据板块确定单板涨幅：双创/科创板 20%, 主板 10%
-                    is_gem = str(code).startswith(("300", "301"))
-                    is_star = str(code).startswith("688")
-                    board_pct = 19.8 if (is_gem or is_star) else 9.9  # 约等于涨停幅度
-                    # 3 日最大估计涨幅：取 min(lbc, 3) * 单板涨幅
-                    est_3d_pct = round(min(lbc, 3) * board_pct, 2)
-                    # 10 日累计大致涨幅
-                    est_10d_pct = round(min(lbc, 10) * board_pct, 2)
+                    # 拉取真实日 K 线计算累计涨幅（替代估算）
+                    real_3d, real_10d = cls._get_stock_recent_pct(code)
                     yidong_info = RegulatoryYidongCalculator.evaluate_stock_yidong(
                         code=code, name=name,
-                        recent_3d_pct=est_3d_pct,
+                        recent_3d_pct=real_3d,
                         index_3d_pct=index_3d_pct,
-                        recent_10d_pct=est_10d_pct,
+                        recent_10d_pct=real_10d,
                         index_10d_pct=index_10d_pct,
-                        yidong_count_10d=0  # 当前版本暂无法自动统计历史异动次数
+                        yidong_count_10d=0
                     )
                     if yidong_info["level"] != "NORMAL":
                         yidong_warning_lines.append(f"- 🚨【{name}({code})】{yidong_info['warning_msg']}")
@@ -184,7 +232,6 @@ class PostMarketAnalyzer:
         if zt_df is not None and not zt_df.empty and "lbc" in zt_df.columns:
             try:
                 import time as _time
-                import akshare as _ak
                 import numpy as _np
 
                 # ---- 3.1 多维度打分，区分核心标的与杂毛 ----
@@ -232,18 +279,19 @@ class PostMarketAnalyzer:
 
                     if is_core:
                         try:
-                            df = _ak.stock_zh_a_hist_min_em(symbol=code, period="5", adjust="")
+                            from data.fetcher import DataFetcher
+                            df = DataFetcher._fetch_intraday_5min(code)
                             if df is not None and not df.empty:
                                 rows = []
                                 for _, r in df.iterrows():
-                                    t = str(r[df.columns[0]])
-                                    if any(m in t for m in ["09:", "10:", "11:", "13:", "14:", "15:"]):
-                                        o_val = float(r[df.columns[1]]) if len(df.columns) > 1 else 0
-                                        c_val = float(r[df.columns[2]]) if len(df.columns) > 2 else 0
-                                        h_val = float(r[df.columns[3]]) if len(df.columns) > 3 else 0
-                                        l_val = float(r[df.columns[4]]) if len(df.columns) > 4 else 0
-                                        v_val = float(r[df.columns[7]]) / 1e4 if len(df.columns) > 7 else 0
-                                        rows.append(f"{t[-8:-3]} O{o_val:.2f} H{h_val:.2f} L{l_val:.2f} C{c_val:.2f} V{v_val:.0f}万")
+                                    t = str(r.get("time", r.iloc[0]))
+                                    if any(m in str(t) for m in ["09:", "10:", "11:", "13:", "14:", "15:"]):
+                                        o_val = float(r.get("open", 0))
+                                        c_val = float(r.get("close", 0))
+                                        h_val = float(r.get("high", 0))
+                                        l_val = float(r.get("low", 0))
+                                        v_val = float(r.get("volume", 0)) / 1e4
+                                        rows.append(f"{str(t)[-8:-3]} O{o_val:.2f} H{h_val:.2f} L{l_val:.2f} C{c_val:.2f} V{v_val:.0f}万")
                                 if rows:
                                     core_intra_lines.append(
                                         f"--- {name}({code}) {lbc}板 得分{s:.0f} ---\n" + "\n".join(rows)
@@ -323,8 +371,10 @@ class PostMarketAnalyzer:
             ladder_text=ladder_text,
             top_amount_text=top_amount_text,
             lhb_text=lhb_text,
+            leading_sector_text=leading_sector_text,
             dragon_text=dragon_text,
-            intraday_text=intraday_text
+            intraday_text=intraday_text,
+            market_style_info=market_style_info or ""
         )
 
         # 6. 调用 LLM 生成复盘分析

@@ -73,13 +73,12 @@ class ActiveCorePool:
 
         results = []
         for _, row in core_candidates.iterrows():
-            # 实际计算 Beta 相关系数（修复 #6：之前硬编码 0.85，从未调用 calculate_beta）
+            # Beta 相关系数：有指数序列时真实计算，否则使用默认值（后续可接板块指数数据）
             beta = 0.85  # 默认值
             if board_index_series is not None:
-                # 尝试从 row 中提取历史价格序列计算真实 Beta
                 hist_prices = row.get("history_prices")
-                if hist_prices is not None and isinstance(hist_prices, pd.Series):
-                    beta = cls.calculate_beta(hist_prices, board_index_series) or 0.85
+                if hist_prices is not None:
+                    beta = cls.calculate_beta(pd.Series(hist_prices), board_index_series) or 0.85
 
             results.append({
                 "code": str(row.get("code")),

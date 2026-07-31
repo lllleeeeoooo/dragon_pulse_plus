@@ -97,3 +97,23 @@ class EmotionVector:
             "yidong_bravery": yidong_bravery,
             "sentiment_index": sentiment_index
         }
+
+    @staticmethod
+    def compute_intraday_sentiment(height: int, zt_count: int, dt_count: int,
+                                     zhaban_rate: float, premium: float) -> float:
+        """
+        盘中快速情绪分计算（与 _classify_intraday_style 和 _log_startup_report 共用）。
+        """
+        from config.settings import settings
+        score_premium = min(max((premium + 3) * 12.5, 0), 100)
+        score_height = min(height * 12, 100)
+        score_breadth = max(min(((zt_count - dt_count) + 30) * 1.25, 100), 0)
+        score_support = max(100 - zhaban_rate * 2, 20) * 0.5  # 下限10分
+        return round(
+            score_premium * settings.PREMIUM_WEIGHT +
+            score_breadth * settings.BREADTH_WEIGHT +
+            score_height * settings.HEIGHT_WEIGHT +
+            score_support * settings.SUPPORT_WEIGHT, 1
+        )
+
+

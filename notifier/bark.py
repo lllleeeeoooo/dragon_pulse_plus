@@ -12,8 +12,15 @@ BARK_MAX_CHARS = 1000  # 中文每字3字节，1000字≈3000字节，留安全�
 
 
 def _strip_json_block(text: str) -> str:
-    """去掉末尾的 JSON 代码块（机器解析用的，不用推送到手机）"""
-    return re.sub(r'\n*```json\s*\{.*?\}\s*```\s*$', '', text, flags=re.DOTALL).strip()
+    """去掉 JSON 代码块（```json ... ```），保留标题和总结"""
+    text = text.replace("\r\n", "\n")
+    start = text.rfind("\n```json")
+    if start < 0:
+        return text
+    end = text.find("\n```", start + 3)
+    if end < 0:
+        return text
+    return text[:start] + text[end + 4:]
 
 
 def _split_body(body: str, max_chars: int = BARK_MAX_CHARS) -> List[str]:
@@ -144,8 +151,9 @@ class BarkNotifier:
         total = len(chunks)
 
         all_ok = True
-        for i, chunk in enumerate(chunks):
-            chunk_title = f"{title} ({i + 1}/{total})" if total > 1 else title
+        for i, chunk in enumerate(reversed(chunks)):
+            seq = total - i  # 编号保持 3/3, 2/3, 1/3 倒序发送
+            chunk_title = f"{title} ({seq}/{total})" if total > 1 else title
             ok = self._do_send(chunk_title, chunk, resolved_group, level, resolved_sound)
             if not ok:
                 all_ok = False

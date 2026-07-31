@@ -22,7 +22,7 @@ class HoldingMonitor:
         stock_name: str,
         current_price: float,
         cost_price: float,
-        avg_分时_price: float,
+        avg_vwap_price: float,
         ma5_price: float,
         is_limit_up: bool,
         was_limit_up_today: bool,
@@ -46,11 +46,11 @@ class HoldingMonitor:
             })
 
         # 规则 2：破位止损 (跌破分时均线且跌破5日线)
-        if current_price < avg_分时_price and ma5_price > 0 and current_price < ma5_price:
+        if current_price < avg_vwap_price and ma5_price > 0 and current_price < ma5_price:
             signals.append({
                 "type": "破位止损",
                 "level": "HIGH",
-                "reason": f"标的 {stock_name}({stock_code}) 当前现价({current_price}) 已破分时均线({avg_分时_price}) 且跌破5日均线({ma5_price})，建议及时止损/止盈。"
+                "reason": f"标的 {stock_name}({stock_code}) 当前现价({current_price}) 已破分时均线({avg_vwap_price}) 且跌破5日均线({ma5_price})，建议及时止损/止盈。"
             })
 
         # 规则 3：情绪到顶预警 (市场环境风控，阈值可通过 settings 配置)

@@ -1,16 +1,53 @@
+import os
+
+# ---------------------------------------------------------------------------
+# 必须在任何项目模块导入之前设置 DB_PATH 环境变量。
+# 注意：如果其他测试文件先于本文件导入了 database 模块（字母序），
+# 生产库会被触碰。确保本文件是唯一导入 database 的测试文件。
+# ---------------------------------------------------------------------------
+# DatabaseManager 单例在 database/services.py 导入时实例化，
+# __init__ 优先读取 os.environ["DB_PATH"] > settings.DB_PATH。
+# 若不在这里设置，test_core.py（字母序先加载）触发 settings 创建时
+# 会缓存生产路径，导致 DatabaseManager 初始化时落到生产库。
+# ---------------------------------------------------------------------------
+os.environ["DB_PATH"] = "dragon_pulse_test.db"
+
 import unittest
 from database.services import HoldingManager, RecommendationManager, SentimentManager, db_manager
-from database.models import Holding, Recommendation, DailySentiment
+from database.models import Holding, Recommendation, DailySentiment, Base
+from config.settings import settings
 
 
 class TestDatabaseServices(unittest.TestCase):
     """
     数据库 CRUD 与持久化功能单元测试
+    使用独立的测试数据库（dragon_pulse_test.db），不污染生产库
     """
 
+    @classmethod
+    def setUpClass(cls):
+        """
+        确保测试数据库处于干净状态。
+        注意：db_manager 已在导入时通过 os.environ["DB_PATH"] 初始化到测试库，
+        此处仅重建表结构确保无残留。
+        """
+        Base.metadata.drop_all(bind=db_manager.engine)
+        Base.metadata.create_all(bind=db_manager.engine)
+
+    @classmethod
+    def tearDownClass(cls):
+        """测试类结束后：关闭引擎连接（测试库文件保留，方便排查）"""
+        db_manager.engine.dispose()
+
     def setUp(self):
-        """测试前环境准备"""
-        self.db = db_manager
+        """每个测试方法运行前：清空所有表数据，确保用例间相互隔离"""
+        session = db_manager.get_session()
+        try:
+            for table in reversed(Base.metadata.sorted_tables):
+                session.execute(table.delete())
+            session.commit()
+        finally:
+            session.close()
 
     def test_holding_crud(self):
         """测试持仓表的增删改查、持仓类型与收益率计算"""
@@ -32,7 +69,7 @@ class TestDatabaseServices(unittest.TestCase):
 
         # 3. 更新收益率
         test_code = "600519"
-        HoldingManager.update_holding_profit_rate(code=test_code, current_price=1870.0) # 上涨 10% (1870 - 1700)/1700
+        HoldingManager.update_holding_profit_rate(code=test_code, current_price=1870.0)  # 上涨 10%
         updated = HoldingManager.get_active_holdings(holding_type="AI_AUTO")
         target = next((h for h in updated if h["code"] == test_code), None)
         self.assertIsNotNone(target)

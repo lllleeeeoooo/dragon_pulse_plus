@@ -1,6 +1,7 @@
 import datetime
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+import pandas as pd
 
 from config.settings import settings
 from data.fetcher import DataFetcher
@@ -9,6 +10,7 @@ from llm.client import llm_client
 from llm.pre_market import PreMarketAnalyzer
 from llm.call_auction import CallAuctionAnalyzer
 from llm.post_market import PostMarketAnalyzer
+from core.strategies import MarketStyle
 from notifier.bark import bark_notifier
 from core.trade_calendar import is_trading_day, is_last_non_trading_day
 from database.services import RecommendationManager, SentimentManager, HoldingManager
@@ -89,9 +91,12 @@ def job_call_auction():
         spot_df = DataFetcher.get_realtime_spot()
 
         # ---- 5. LLM 竞价观察指令 ----
+        # 获取昨日涨停溢价，用于竞价风控
+        premium_info = DataFetcher.get_yesterday_zt_premium()
         result = CallAuctionAnalyzer.run_auction_analysis(
             trade_date=today_str,
             auction_df=spot_df,
+            yesterday_zt_auction_yield=premium_info.get("intraday_premium", 1.5),
             recommended_targets_summary=recs_summary,
             predicted_sectors_summary=predicted_summary
         )
@@ -128,42 +133,85 @@ def job_post_market():
         # 排序成交额 Top 20
         top_amount_df = spot_df.sort_values(by="amount", ascending=False).head(20) if not spot_df.empty else None
 
-        # 生成深度复盘分析
-        review_report = PostMarketAnalyzer.run_review(
-            trade_date=today_str,
-            zt_df=zt_df,
-            zhaban_df=zhaban_df,
-            dt_df=dt_df,
-            top_amount_df=top_amount_df,
-            lhb_df=lhb_df,
-            spot_df=spot_df,  # 修复 #4：传入全市场快照用于胜率复盘
-            lhb_seats_df=lhb_seats_df  # 传入营业部级席位数据
+        # ---- 盘后市场风格判定（在复盘前执行，传给 LLM 作为上下文）----
+        from core.emotion_index import EmotionVector
+        # 获取真实溢价和成交额，替换默认值
+        premium_data = DataFetcher.get_yesterday_zt_premium()
+        total_amount = float(spot_df["amount"].sum()) if not spot_df.empty else 8e11
+        emotion_res = EmotionVector.calculate(
+            zt_df=zt_df, zhaban_df=zhaban_df, dt_df=dt_df,
+            total_market_amount=total_amount,
+            yesterday_zt_avg_premium=premium_data.get("intraday_premium", 1.5)
+        )
+        total_amount_billion = total_amount / 1e8
+        bl = DataFetcher.get_adaptive_baseline()
+        baseline = bl["ma_amount"]
+        market_style = MarketStyle.classify(emotion_res,
+                                            market_amount=total_amount_billion,
+                                            baseline=baseline)
+        cycle_stage = market_style.get("style", "未判定")
+        style_reason = market_style.get("reason", "")
+        k_factor = market_style.get("capacity_factor", 1.0)
+        logger.info(
+            f"盘后风格判定: [{cycle_stage}] {style_reason} | "
+            f"K={k_factor:.2f}(今日{total_amount:.0f}亿/均{baseline:.0f}亿) | "
+            f"涨停{emotion_res['zt_count']}/跌停{emotion_res['dt_count']}/"
+            f"溢价{emotion_res['yield_rate']}%/情绪{emotion_res['sentiment_index']}"
         )
 
-        # ---- 落库：每日情绪向量 ----
-        from core.emotion_index import EmotionVector
-        emotion_res = EmotionVector.calculate(
-            zt_df=zt_df,
-            zhaban_df=zhaban_df,
-            dt_df=dt_df
+        # 生成深度复盘分析（传入风格判定供 LLM 参考）
+        style_info = (
+            f"风格={cycle_stage} K={k_factor:.2f}(今日{total_amount:.0f}亿/均{baseline:.0f}亿) "
+            f"推荐战法={market_style.get('priority_strategy', '')} {style_reason}"
         )
-        cycle_stage = "未判定"
-        for keyword in ["高潮期", "退潮期", "冰点期", "启动期", "发酵期"]:
-            if keyword in review_report:
-                cycle_stage = keyword
-                break
+        review_report = ""
+        try:
+            review_report = PostMarketAnalyzer.run_review(
+                trade_date=today_str,
+                zt_df=zt_df,
+                zhaban_df=zhaban_df,
+                dt_df=dt_df,
+                top_amount_df=top_amount_df,
+                lhb_df=lhb_df,
+                spot_df=spot_df,
+                lhb_seats_df=lhb_seats_df,
+                yesterday_zt_yield=premium_data.get("intraday_premium", 1.5),
+                market_style_info=style_info,
+                precomputed_emotion=emotion_res
+            )
+        except Exception as e:
+            logger.warning(f"LLM 复盘生成失败: {e}，使用定量数据兜底")
+            review_report = (
+                f"⚠️ LLM 服务不可用，以下为定量数据摘要：\n\n"
+                f"风格判定: {cycle_stage} | {style_reason}\n"
+                f"情绪分: {emotion_res['sentiment_index']} | "
+                f"涨停{emotion_res['zt_count']}/跌停{emotion_res['dt_count']}/"
+                f"炸板{emotion_res['zhaban_count']}({emotion_res['zhaban_rate']}%)\n"
+                f"最高连板: {emotion_res['height']}板 | "
+                f"昨日涨停溢价: {emotion_res['yield_rate']}%\n"
+                f"容量因子: K={k_factor:.2f} | "
+                f"今日成交: {total_amount_billion:.0f}亿 | 基准: {baseline:.0f}亿\n"
+                f"推荐战法: {market_style.get('priority_strategy', '')}"
+            )
+
+        # ---- 落库：每日情绪向量 ----
         SentimentManager.save_daily_sentiment(
             trade_date=today_str,
             sentiment_data=emotion_res,
             cycle_stage=cycle_stage,
-            summary=review_report[:500]
+            summary=style_reason + "\n" + review_report[:400],
+            total_amount=total_amount_billion
         )
-        logger.info(f"情绪向量数据已落库 ({today_str})，周期: {cycle_stage}")
+        logger.info(f"情绪向量已落库 ({today_str})，风格: {cycle_stage} K={k_factor:.2f}")
+
 
         # ---- 落库：推荐标的 ----
         _parse_and_save_recommendations(today_str, review_report)
 
-        # ---- 自动填充历史龙头表（修复 #5）----
+        # ---- LLM 复盘打分：评估昨日推荐胜率 ----
+        _evaluate_yesterday_recommendations(today_str, spot_df)
+
+        # ---- 自动填充历史龙头表 ----
         _auto_populate_dragons(today_str, zt_df)
 
         # 发送 Bark 推送
@@ -172,8 +220,99 @@ def job_post_market():
             body=review_report,
             group="盘后复盘"
         )
+
+        # ---- 策略回测报告 ----
+        _generate_backtest_report(today_str)
+
     except Exception as e:
         logger.error(f"15:30 盘后复盘执行异常: {e}")
+
+
+def _generate_backtest_report(trade_date: str):
+    """盘后实盘回测报告：从 AI 自动交易的平仓记录中统计真实盈亏"""
+    from database.services import db_manager
+    from database.models import Holding
+    import datetime
+
+    session = db_manager.get_session()
+    try:
+        closed = session.query(Holding).filter(
+            Holding.status == "CLOSED",
+            Holding.holding_type == "AI_AUTO",
+            Holding.sell_price > 0
+        ).order_by(Holding.updated_at.desc()).limit(200).all()
+
+        if not closed:
+            session.close()
+            return
+
+        lines = ["📊 AI实盘回测报告", f"共 {len(closed)} 笔已平仓交易", ""]
+
+        total_trades = 0
+        wins = 0
+        returns = []
+        stock_returns: Dict[str, List[float]] = {}
+        stock_names: Dict[str, str] = {}
+
+        for h in closed:
+            if h.cost_price <= 0 or h.sell_price <= 0:
+                continue
+            ret = round((h.sell_price - h.cost_price) / h.cost_price * 100, 2)
+            total_trades += 1
+            if ret > 0:
+                wins += 1
+            returns.append(ret)
+            stock_returns.setdefault(h.code, []).append(ret)
+            stock_names[h.code] = h.name
+
+        if total_trades == 0:
+            session.close()
+            return
+
+        avg_ret = round(sum(returns) / len(returns), 2)
+        win_rate = round(wins / total_trades * 100, 2)
+
+        cumulative = 1.0
+        peak = 1.0
+        max_dd = 0.0
+        for r in returns:
+            cumulative *= (1 + r / 100)
+            peak = max(peak, cumulative)
+            dd = (peak - cumulative) / peak * 100
+            max_dd = max(max_dd, dd)
+
+        lines.append(f"胜率: {win_rate}% | 均收益: {avg_ret}% | 最大回撤: {round(max_dd, 2)}%")
+        lines.append(f"总收益: {round((cumulative-1)*100, 2)}%")
+
+        # 个股排行
+        stock_avg = [(c, round(sum(v) / len(v), 2), len(v), stock_names.get(c, c))
+                     for c, v in stock_returns.items() if len(v) >= 1]
+        stock_avg.sort(key=lambda x: x[1], reverse=True)
+        if stock_avg:
+            lines.append("")
+            lines.append(f"━━━ 个股收益排行（{len(stock_avg)}只）━━━")
+            top5 = stock_avg[:5]
+            bottom5 = stock_avg[-5:] if len(stock_avg) >= 5 else []
+            lines.append("🏆 Top5:")
+            for c, ret, cnt, n in top5:
+                lines.append(f"  {n}({c}): +{ret}% ({cnt}次)")
+            if bottom5:
+                lines.append("💀 Bottom5:")
+                for c, ret, cnt, n in bottom5:
+                    lines.append(f"  {n}({c}): {ret}% ({cnt}次)")
+
+        session.close()
+        body = "\n".join(lines)
+        logger.info(f"AI实盘回测报告:\n{body}")
+        bark_notifier.send(
+            title="📊 AI实盘回测报告",
+            body=body,
+            group="回测报告",
+            level="passive"
+        )
+    except Exception as e:
+        session.close()
+        logger.warning(f"实盘回测报告生成失败: {e}")
 
 
 def _parse_and_save_recommendations(trade_date: str, report_text: str):
@@ -185,13 +324,32 @@ def _parse_and_save_recommendations(trade_date: str, report_text: str):
     import json
     items = []
 
-    json_match = re.search(r'```json\s*(\{.*?\})\s*```', report_text, re.DOTALL)
-    if not json_match:
-        json_match = re.search(r'\{[^{]*"recommendations"\s*:\s*\[.*?\][^{]*\}', report_text, re.DOTALL)
+    json_parsed = False  # 标记是否成功解析了 JSON（包括空数组）
 
-    if json_match:
+    # 优先取 ```json ... ``` 代码块
+    json_block = re.search(r'```json\s*(.*?)\s*```', report_text, re.DOTALL)
+    json_text = None
+    if json_block:
+        json_text = json_block.group(1)
+        # 手动提取最外层 {} 避免非贪婪匹配被嵌套对象截断
+        start = json_text.find("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(json_text)):
+                if json_text[i] == "{":
+                    depth += 1
+                elif json_text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        json_text = json_text[start:i + 1]
+                        break
+    if not json_text:
+        json_text = ""  # 无法提取
+
+    if json_text:
         try:
-            data = json.loads(json_match.group(1) if json_match.lastindex else json_match.group(0))
+            data = json.loads(json_text)
+            json_parsed = True
             recs = data.get("recommendations", [])
             for r in recs:
                 code = str(r.get("code", "")).strip()
@@ -209,7 +367,8 @@ def _parse_and_save_recommendations(trade_date: str, report_text: str):
         except json.JSONDecodeError as e:
             logger.warning(f"JSON 推荐解析失败，回退到正则匹配: {e}")
 
-    if not items:
+    # 正则兜底仅当 JSON 解析完全失败时启用，空数组说明 AI 明确判定不应买入
+    if not items and not json_parsed:
         stock_pattern = re.compile(r'[一-鿿]{2,8}\s*[（(]\s*(\d{6})\s*[）)]')
         found = stock_pattern.findall(report_text)
         seen = set()
@@ -235,22 +394,73 @@ def _parse_and_save_recommendations(trade_date: str, report_text: str):
         logger.info(f"从复盘报告中解析并落库 {len(items)} 个推荐标的: "
                     f"{', '.join(i['name'] + '(' + i['code'] + ')' for i in items)}")
     else:
-        logger.info("复盘报告中未检测到明确的推荐标的代码")
+        reason = "AI判定不推荐" if json_parsed else "未检测到推荐标的代码"
+        logger.info(f"复盘报告推荐标的: {reason}，跳过入库")
+
+
+def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame = None):
+    """
+    LLM 复盘打分：让 LLM 评估昨日推荐标的今日的实际表现，形成闭环反馈。
+    评分存入 recommendations 表的 sell_condition 字段（复用为评分备注）。
+    """
+    import datetime
+    yesterday = (datetime.datetime.strptime(trade_date, "%Y%m%d") -
+                 datetime.timedelta(days=1)).strftime("%Y%m%d")
+    pending = RecommendationManager.get_pending_recommendations(trade_date=yesterday)
+    if not pending or spot_df is None or spot_df.empty:
+        return
+
+    # 拼昨日推荐 + 今日表现的评估 Prompt
+    lines = ["评估昨日推荐标的今日表现："]
+    for r in pending:
+        code = r["code"]
+        match = spot_df[spot_df["code"].astype(str) == str(code)]
+        if not match.empty:
+            row = match.iloc[0]
+            lines.append(
+                f"- {r['name']}({code}) [{r['strategy_type']}]: "
+                f"今日涨幅 {row.get('change_pct', 0)}%, 现价 {row.get('price', 0)}元"
+            )
+        else:
+            lines.append(f"- {r['name']}({code}) [{r['strategy_type']}]: 未找到今日数据")
+    eval_text = "\n".join(lines)
+
+    try:
+        score_prompt = "你是短线交易复盘专家。请用一句话评估昨日推荐标的今天的表现（不超过50字），并给出胜率评分（0-100）。"
+        evaluation = llm_client.generate(
+            system_prompt=score_prompt,
+            user_prompt=eval_text,
+            module="recommendation_eval"
+        )
+        logger.info(f"昨日推荐复盘评估: {evaluation}")
+    except Exception as e:
+        logger.warning(f"LLM 复盘打分失败: {e}")
 
 
 def _auto_populate_dragons(trade_date: str, zt_df):
     """
-    修复 #5：将当日连板 >= 3 的高标自动写入 HistoricDragon 表，
+    将当日连板 >= 3 的高标自动写入 HistoricDragon 表，
     供二波战法在过去 30 天内溯源人气总龙头。
+
+    去重规则：同一 code 只保留一条活跃记录，新数据的连板数更高时更新峰值。
     """
     if zt_df is None or zt_df.empty or "lbc" not in zt_df.columns:
         return
     try:
         from database.services import db_manager
         from database.models import HistoricDragon
+        import datetime
         session = db_manager.get_session()
         try:
+            # 30 天前的龙头标记为失效
+            cutoff = (datetime.datetime.strptime(trade_date, "%Y%m%d") -
+                      datetime.timedelta(days=30)).strftime("%Y%m%d")
+            session.query(HistoricDragon).filter(
+                HistoricDragon.peak_date < cutoff
+            ).update({"is_active": False}, synchronize_session="fetch")
+
             highs = zt_df[zt_df["lbc"].astype(int) >= 3]
+            updated_count = 0
             for _, row in highs.iterrows():
                 code = str(row.get("code", ""))
                 lbc = int(row.get("lbc", 3))
@@ -258,23 +468,34 @@ def _auto_populate_dragons(trade_date: str, zt_df):
                 peak_price = float(row.get("price", 0))
                 industry = str(row.get("industry", "")) if "industry" in row.index else ""
 
-                # 避免重复：同日同代码已存在则跳过
-                exists = session.query(HistoricDragon).filter(
+                existing = session.query(HistoricDragon).filter(
                     HistoricDragon.code == code,
-                    HistoricDragon.peak_date == trade_date
+                    HistoricDragon.is_active == True
                 ).first()
-                if not exists:
+
+                if existing:
+                    # 同一只股票已在表中：连板数更高时更新峰值
+                    if lbc > existing.max_lbc:
+                        existing.max_lbc = lbc
+                        existing.peak_date = trade_date
+                        existing.peak_price = peak_price
+                        existing.name = name
+                        existing.board_name = industry or existing.board_name
+                        existing.is_active = True
+                        updated_count += 1
+                    else:
+                        # 连板数持平或更低，只刷新 active 状态
+                        existing.is_active = True
+                else:
+                    # 新龙头
                     session.add(HistoricDragon(
-                        code=code,
-                        name=name,
-                        max_lbc=lbc,
-                        peak_date=trade_date,
-                        peak_price=peak_price,
-                        board_name=industry,
-                        is_active=True
+                        code=code, name=name, max_lbc=lbc,
+                        peak_date=trade_date, peak_price=peak_price,
+                        board_name=industry, is_active=True
                     ))
+                    updated_count += 1
             session.commit()
-            logger.info(f"历史龙头表已更新，录入 {len(highs)} 只高标")
+            logger.info(f"历史龙头表已更新，新增/更新 {updated_count} 只高标，失效旧记录")
         except Exception as e:
             session.rollback()
             logger.warning(f"历史龙头表自动填充失败: {e}")

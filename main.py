@@ -50,6 +50,11 @@ def main():
     logger.info(f"盘中轮询间隔: {settings.MONITOR_INTERVAL_SECONDS} 秒")
     logger.info(f"情绪到顶预警阈值: 连板>={settings.EMOTION_TOP_MAX_LBC}板 & 炸板率>{settings.EMOTION_TOP_ZHABAN_RATE}%")
 
+    # 0. 启动时同步交易日历，确保后续任务不会在假期触发
+    from database.services import TradeCalendarManager
+    TradeCalendarManager.sync_calendar()
+    logger.info("交易日历已同步。")
+
     # 1. 初始化 APScheduler 定时任务
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 
@@ -93,8 +98,56 @@ def main():
         name="20:00 假日消息汇总"
     )
 
+    # 04:00 日志保留清理
+    from database.services import LogRetentionCleaner
+    scheduler.add_job(
+        LogRetentionCleaner.cleanup,
+        trigger="cron",
+        hour=4,
+        minute=0,
+        id="job_log_cleanup",
+        name="04:00 日志清理(系统/LLM/错误保留15天，推送保留30天)"
+    )
+
+    # 04:05 龙头过期标记（超过 30 天无人气自动失效）
+    def _expire_dragons():
+        from database.services import db_manager
+        from database.models import HistoricDragon
+        import datetime
+        session = db_manager.get_session()
+        try:
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y%m%d")
+            updated = session.query(HistoricDragon).filter(
+                HistoricDragon.is_active == True,
+                HistoricDragon.peak_date < cutoff
+            ).update({"is_active": False}, synchronize_session="fetch")
+            if updated:
+                session.commit()
+                logger.info(f"龙头过期标记: {updated} 只超过30天，标记为失效")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"龙头过期标记失败: {e}")
+        finally:
+            session.close()
+
+    scheduler.add_job(
+        _expire_dragons,
+        trigger="cron",
+        hour=4,
+        minute=5,
+        id="job_dragon_expire",
+        name="04:05 龙头过期(>30天自动失效)"
+    )
+
     scheduler.start()
-    logger.info("定时任务调度器已启动 (08:30 简报 / 09:26 竞价 / 15:30 复盘)。")
+    logger.info("定时任务调度器已启动：")
+    logger.info("  04:00  日志清理（系统/LLM/错误 15天，推送 30天）")
+    logger.info("  04:05  龙头过期标记（>30天自动失效）")
+    logger.info("  08:30  盘前简报（新闻+热搜→LLM 预测板块）")
+    logger.info("  09:26  竞价观察（竞价快照→LLM 买卖指令）")
+    logger.info("  09:30  盘中实时监控（15秒轮询，自动买卖+风控）")
+    logger.info("  15:30  盘后复盘+回测报告（情绪→风格→LLM复盘→策略回测→推送）")
+    logger.info("  20:00  假日消息汇总（假期最后一天推送）")
 
     # 2. 在后台异步启动持仓管理 FastAPI API Web 服务 (端口 8000)
     import threading

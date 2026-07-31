@@ -1,11 +1,23 @@
 import logging
 from typing import List, Dict, Any, Optional
-from database.models import DatabaseManager, Holding, Recommendation, DailySentiment, HistoricDragon, PushLog, LLMLog, ErrorLog, TradeCalendar
+from database.models import DatabaseManager, Holding, Recommendation, DailySentiment, HistoricDragon, PushLog, LLMLog, ErrorLog, TradeCalendar, SystemLog
 
 logger = logging.getLogger(__name__)
 
 # 全局数据库单例
 db_manager = DatabaseManager()
+
+
+def switch_to_test_db():
+    """切换到测试数据库（测试用例 setUp 中调用）"""
+    from config.settings import settings
+    db_manager.reinitialize(settings.TEST_DB_PATH)
+
+
+def switch_to_prod_db():
+    """切换回生产数据库（测试用例 tearDown 中调用，可选）"""
+    from config.settings import settings
+    db_manager.reinitialize(settings.DB_PATH)
 
 
 class HoldingManager:
@@ -82,11 +94,14 @@ class HoldingManager:
             session.close()
 
     @staticmethod
-    def update_holding_profit_rate(code: str, current_price: float):
-        """更新持仓最新实时价格与收益率"""
+    def update_holding_profit_rate(code: str, current_price: float, holding_type: Optional[str] = None):
+        """更新持仓最新实时价格与收益率（支持按 holding_type 区分同代码多持仓）"""
         session = db_manager.get_session()
         try:
-            holding = session.query(Holding).filter(Holding.code == code, Holding.status == "HOLDING").first()
+            query = session.query(Holding).filter(Holding.code == code, Holding.status == "HOLDING")
+            if holding_type:
+                query = query.filter(Holding.holding_type == holding_type)
+            holding = query.first()
             if holding and holding.cost_price > 0:
                 holding.current_price = current_price
                 holding.profit_rate = round(((current_price - holding.cost_price) / holding.cost_price) * 100, 2)
@@ -98,23 +113,26 @@ class HoldingManager:
             session.close()
 
     @staticmethod
-    def update_was_limit_up(code: str, was_zt: bool):
-        """更新持仓股票今日是否曾封涨停状态"""
+    def update_was_limit_up(code: str, was_zt: bool, holding_type: Optional[str] = None):
+        """更新持仓股票今日是否曾封涨停状态（支持按 holding_type 区分同代码多持仓）"""
         session = db_manager.get_session()
         try:
-            holding = session.query(Holding).filter(Holding.code == code, Holding.status == "HOLDING").first()
+            query = session.query(Holding).filter(Holding.code == code, Holding.status == "HOLDING")
+            if holding_type:
+                query = query.filter(Holding.holding_type == holding_type)
+            holding = query.first()
             if holding:
                 holding.was_limit_up_today = was_zt
                 session.commit()
         except Exception as e:
             session.rollback()
-            logger.error(f"更新曾封涨停牌状态失败: {e}")
+            logger.error(f"更新曾封涨停状态失败: {e}")
         finally:
             session.close()
 
     @staticmethod
-    def close_holding(code: str, holding_type: Optional[str] = None) -> bool:
-        """平仓指定持仓股票"""
+    def close_holding(code: str, holding_type: Optional[str] = None, sell_price: float = 0.0) -> bool:
+        """平仓指定持仓股票，记录卖出价"""
         session = db_manager.get_session()
         try:
             query = session.query(Holding).filter(Holding.code == code, Holding.status == "HOLDING")
@@ -123,8 +141,9 @@ class HoldingManager:
             holding = query.first()
             if holding:
                 holding.status = "CLOSED"
+                holding.sell_price = sell_price if sell_price > 0 else holding.current_price
                 session.commit()
-                logger.info(f"成功平仓 [{holding.holding_type}] 股票 {holding.name}({code})")
+                logger.info(f"成功平仓 [{holding.holding_type}] 股票 {holding.name}({code}), 卖出价:{holding.sell_price}")
                 return True
             return False
         except Exception as e:
@@ -184,7 +203,8 @@ class RecommendationManager:
                     "strategy_type": r.strategy_type,
                     "open_requirement": r.open_requirement,
                     "auction_vol_ratio": r.auction_vol_ratio,
-                    "buy_condition": r.buy_condition
+                    "buy_condition": r.buy_condition,
+                    "sell_condition": r.sell_condition
                 }
                 for r in recs
             ]
@@ -198,7 +218,7 @@ class SentimentManager:
     """
 
     @staticmethod
-    def save_daily_sentiment(trade_date: str, sentiment_data: Dict[str, Any], cycle_stage: str = "", summary: str = ""):
+    def save_daily_sentiment(trade_date: str, sentiment_data: Dict[str, Any], cycle_stage: str = "", summary: str = "", total_amount: float = 0.0):
         """保存每日情绪分值与周期定性"""
         session = db_manager.get_session()
         try:
@@ -219,6 +239,7 @@ class SentimentManager:
             record.sentiment_index = sentiment_data.get("sentiment_index", 0.0)
             record.cycle_stage = cycle_stage
             record.summary = summary
+            record.total_amount = total_amount
 
             session.commit()
             logger.info(f"已保存 {trade_date} 每日情绪向量与周期结论")
@@ -236,10 +257,15 @@ class DragonManager:
 
     @staticmethod
     def get_recent_dragons(days_lookback: int = 30) -> List[Dict[str, Any]]:
-        """获取近 30 天内的人气总龙头"""
+        """获取近 N 天内的人气总龙头"""
+        import datetime
         session = db_manager.get_session()
         try:
-            dragons = session.query(HistoricDragon).filter(HistoricDragon.is_active == True).all()
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=days_lookback)).strftime("%Y%m%d")
+            dragons = session.query(HistoricDragon).filter(
+                HistoricDragon.is_active == True,
+                HistoricDragon.peak_date >= cutoff
+            ).all()
             return [
                 {
                     "code": d.code,
@@ -524,5 +550,87 @@ class TradeCalendarManager:
         except Exception as e:
             session.rollback()
             logger.warning(f"交易日历同步失败: {e}")
+        finally:
+            session.close()
+
+
+class SystemLogManager:
+    """系统运行日志管理服务"""
+
+    @staticmethod
+    def add_log(log_date: str, category: str, title: str, detail: str = ""):
+        """新增一条系统运行日志"""
+        session = db_manager.get_session()
+        try:
+            log = SystemLog(log_date=log_date, category=category, title=title, detail=detail)
+            session.add(log)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"保存系统日志失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_logs(log_date: Optional[str] = None, category: Optional[str] = None,
+                 limit: int = 50) -> List[Dict[str, Any]]:
+        """查询系统运行日志"""
+        session = db_manager.get_session()
+        try:
+            query = session.query(SystemLog).order_by(SystemLog.created_at.desc())
+            if log_date:
+                query = query.filter(SystemLog.log_date == log_date)
+            if category:
+                query = query.filter(SystemLog.category == category)
+            logs = query.limit(limit).all()
+            return [
+                {"id": l.id, "log_date": l.log_date, "category": l.category,
+                 "title": l.title, "detail": l.detail[:500] if l.detail else "",
+                 "created_at": l.created_at.strftime("%Y-%m-%d %H:%M:%S") if l.created_at else ""}
+                for l in logs
+            ]
+        finally:
+            session.close()
+
+
+class LogRetentionCleaner:
+    """
+    日志保留策略清理器
+    - system_logs / error_logs / llm_logs: 保留 15 天
+    - push_logs: 保留 30 天
+    """
+
+    @staticmethod
+    def cleanup():
+        """清理所有过期日志，每日调用一次"""
+        import datetime
+        today = datetime.date.today()
+        cutoff_15 = (today - datetime.timedelta(days=15)).isoformat()
+        cutoff_30 = (today - datetime.timedelta(days=30)).isoformat()
+
+        session = db_manager.get_session()
+        try:
+            from sqlalchemy import func
+            # 15 天保留的表：用 func.date() 做日期级别比较，避免字符串拼接
+            for model, label in [(SystemLog, "system_logs"),
+                                  (ErrorLog, "error_logs"),
+                                  (LLMLog, "llm_logs")]:
+                deleted = session.query(model).filter(
+                    func.date(model.created_at) < cutoff_15
+                ).delete(synchronize_session="fetch")
+                if deleted:
+                    logger.info(f"日志清理: {label} 删除 {deleted} 条 (>15天)")
+
+            # 30 天保留
+            deleted_push = session.query(PushLog).filter(
+                func.date(PushLog.created_at) < cutoff_30
+            ).delete(synchronize_session="fetch")
+            if deleted_push:
+                logger.info(f"日志清理: push_logs 删除 {deleted_push} 条 (>30天)")
+
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"日志清理失败: {e}")
         finally:
             session.close()

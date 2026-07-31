@@ -22,10 +22,11 @@ class Holding(Base):
     current_price = Column(Float, default=0.0, comment="最新实时价格")
     profit_rate = Column(Float, default=0.0, comment="实时收益率 (%) = (最新价 - 成本价) / 成本价 * 100")
     quantity = Column(Integer, nullable=False, default=100, comment="持仓数量")
-    buy_date = Column(String(10), nullable=False, comment="买入日期 YYYY-MM-DD")
+    buy_date = Column(String(10), nullable=False, comment="买入日期 YYYY-MM-DD（注意：与其他表的 YYYYMMDD 格式不同）")
     buy_strategy = Column(String(32), default="手动/通用", comment="买入战法标签 (低吸/打板/二波/抱团/共振)")
     holding_type = Column(String(16), default="MANUAL", comment="持仓类型: MANUAL(手动持仓), AI_AUTO(AI自动持仓)")
     was_limit_up_today = Column(Boolean, default=False, comment="今日是否曾经封涨停")
+    sell_price = Column(Float, default=0.0, comment="卖出/平仓价格")
     status = Column(String(16), default="HOLDING", comment="持仓状态: HOLDING(持仓中), CLOSED(已平仓)")
     created_at = Column(DateTime, default=datetime.datetime.now)
     updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
@@ -70,6 +71,7 @@ class DailySentiment(Base):
     zhaban_rate = Column(Float, default=0.0, comment="炸板率(%)")
     sentiment_index = Column(Float, default=0.0, comment="综合情绪分值(0-100)")
     cycle_stage = Column(String(32), comment="情绪周期定性 (冰点/启动/发酵/高潮/退潮)")
+    total_amount = Column(Float, default=0.0, comment="全市场当日总成交额(亿元)")
     summary = Column(Text, comment="复盘总结摘要")
     created_at = Column(DateTime, default=datetime.datetime.now)
 
@@ -159,6 +161,21 @@ class ErrorLog(Base):
     )
 
 
+class SystemLog(Base):
+    """
+    系统运行日志表
+    记录每日启动报告、市场风格切换、关键阈值等
+    """
+    __tablename__ = "system_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    log_date = Column(String(10), nullable=False, index=True, comment="日期 YYYY-MM-DD")
+    category = Column(String(32), nullable=False, index=True, comment="分类: startup/style_switch/daily_summary")
+    title = Column(String(256), nullable=False, comment="标题")
+    detail = Column(Text, comment="详细内容")
+    created_at = Column(DateTime, default=datetime.datetime.now, index=True, comment="记录时间")
+
+
 class TradeCalendar(Base):
     """
     交易日历表
@@ -199,8 +216,18 @@ class DatabaseManager:
     SQLite 数据库管理器
     """
 
-    def __init__(self, db_path: str = "dragon_pulse.db"):
+    def __init__(self, db_path: str = None):
+        # 优先级: 1) 显式传参 > 2) 环境变量 DB_PATH > 3) settings 配置
+        if db_path is None:
+            db_path = os.environ.get("DB_PATH")
+        if db_path is None:
+            from config.settings import settings
+            db_path = settings.DB_PATH
         self.db_path = db_path
+        self._init_engine()
+
+    def _init_engine(self):
+        """根据 self.db_path 创建数据库引擎、会话工厂、建表并启用 WAL 模式"""
         self.engine = create_engine(
             f"sqlite:///{self.db_path}",
             connect_args={
@@ -216,6 +243,19 @@ class DatabaseManager:
         self.create_tables()
         # 启用 WAL 模式提升并发读/写性能，降低 "database is locked" 概率
         self._enable_wal()
+
+    def reinitialize(self, db_path: str):
+        """
+        切换数据库路径并重建引擎与会话工厂。
+        关闭旧引擎连接后，指向新路径重新建库建表。
+        用于测试环境动态切换至独立测试数据库。
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.info(f"数据库引擎切换: {self.db_path} → {db_path}")
+        self.engine.dispose()
+        self.db_path = db_path
+        self._init_engine()
 
     def _enable_wal(self):
         try:
@@ -234,6 +274,8 @@ class DatabaseManager:
         _ensure_column(self.engine, "holdings", "current_price", "FLOAT DEFAULT 0.0")
         _ensure_column(self.engine, "holdings", "profit_rate", "FLOAT DEFAULT 0.0")
         _ensure_column(self.engine, "holdings", "holding_type", "VARCHAR(16) DEFAULT 'MANUAL'")
+        _ensure_column(self.engine, "holdings", "sell_price", "FLOAT DEFAULT 0.0")
+        _ensure_column(self.engine, "daily_sentiment", "total_amount", "FLOAT DEFAULT 0.0")
 
     def get_session(self) -> Session:
         """获取数据库 Session"""

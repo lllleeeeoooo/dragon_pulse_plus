@@ -85,6 +85,32 @@ class LLMClient:
                     raise e
                 time.sleep(2.0)
 
+        # 主模型全部失败 → 尝试备用模型
+        if settings.LLM_BACKUP_BASE_URL and settings.LLM_BACKUP_MODEL:
+            backup_model = settings.LLM_BACKUP_MODEL
+            backup_key = settings.LLM_BACKUP_API_KEY or self.api_key
+            logger.info(f"主模型 [{self.model}] 失败，切换备用模型 [{backup_model}]")
+            try:
+                backup_client = OpenAI(
+                    api_key=backup_key,
+                    base_url=settings.LLM_BACKUP_BASE_URL,
+                    timeout=self.timeout,
+                    max_retries=0
+                )
+                response = backup_client.chat.completions.create(
+                    model=backup_model,
+                    messages=messages,
+                    temperature=temp,
+                )
+                content = response.choices[0].message.content or ""
+                tokens = response.usage.total_tokens if response.usage else 0
+                logger.info(f"备用模型 [{backup_model}] 响应成功 (消耗 Tokens: {tokens})")
+                self._persist_llm_log(module, system_prompt, user_prompt, content.strip(),
+                                      tokens, True, f"fallback:{backup_model}")
+                return content.strip()
+            except Exception as e:
+                logger.error(f"备用模型 [{backup_model}] 也失败: {e}")
+
         return ""
 
     def _persist_llm_log(self, module: str, system_prompt: str, user_prompt: str,

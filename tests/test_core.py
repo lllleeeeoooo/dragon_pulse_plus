@@ -96,7 +96,7 @@ class TestQuantCore(unittest.TestCase):
             stock_name="断板股",
             current_price=10.0,
             cost_price=9.5,
-            avg_分时_price=10.2,
+            avg_vwap_price=10.2,
             ma5_price=10.1,
             is_limit_up=False,
             was_limit_up_today=True

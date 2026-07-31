@@ -15,6 +15,10 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
+    # ==================== 数据库配置 ====================
+    DB_PATH: str = Field(default="dragon_pulse.db", description="SQLite 数据库文件路径（生产库）")
+    TEST_DB_PATH: str = Field(default="dragon_pulse_test.db", description="测试用 SQLite 数据库文件路径")
+
     # ==================== LLM 大模型配置 ====================
     LLM_API_KEY: str = Field(default="your_llm_api_key_here", description="LLM API Key")
     LLM_BASE_URL: str = Field(default="https://api.deepseek.com/v1", description="LLM API Base URL")
@@ -22,6 +26,9 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(default=0.3, description="生成随机性温度，短线量化分析建议 0.1 ~ 0.4")
     LLM_TIMEOUT: int = Field(default=60, description="LLM 请求超时时间(秒)")
     LLM_MAX_RETRIES: int = Field(default=3, description="LLM 请求失败重试次数")
+    LLM_BACKUP_BASE_URL: str = Field(default="", description="备用 LLM API Base URL（主模型失败时自动切换）")
+    LLM_BACKUP_MODEL: str = Field(default="", description="备用 LLM 模型名称")
+    LLM_BACKUP_API_KEY: str = Field(default="", description="备用 LLM API Key（为空则复用主 Key）")
 
     # ==================== 情绪到顶/退潮预警阈值 ====================
     EMOTION_TOP_MAX_LBC: int = Field(default=8, description="全市场连板高度触发情绪到顶预警的最低板数")
@@ -35,10 +42,11 @@ class Settings(BaseSettings):
     BARK_ENABLED: bool = Field(default=True, description="是否启用 Bark 推送")
 
     # ==================== 盘中监控轮询配置 ====================
+    FUND_INFLOW_THRESHOLD: float = Field(default=5000.0, description="主力资金合力扫货阈值 (万元)")
     MONITOR_INTERVAL_SECONDS: int = Field(default=15, description="盘中实时快照轮询间隔(秒)")
     VOL_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动成交量相比过去5日均值的倍数门槛")
     PRICE_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动股价涨幅下限 (%)，低于此值不触发")
-    PRICE_BURST_MAX: float = Field(default=9.0, description="点火异动股价涨幅上限 (%)，已涨停(>=9.5%)的不算点火")
+    PRICE_BURST_MAX: float = Field(default=9.5, description="点火异动股价涨幅上限 (%)，已涨停(>=9.5%)的不算点火")
     FETCH_RETRY_COUNT: int = Field(default=3, description="数据抓取重试次数")
     FETCH_RETRY_DELAY: float = Field(default=2.0, description="数据抓取重试延迟(秒)")
 
@@ -67,6 +75,15 @@ class Settings(BaseSettings):
     SECOND_WAVE_RETREAT_MIN: float = Field(default=0.30, description="二波战法龙头回撤最小比例 (30%)")
     SECOND_WAVE_RETREAT_MAX: float = Field(default=0.50, description="二波战法龙头回撤最大比例 (50%)")
     SECOND_WAVE_LOOKBACK_DAYS: int = Field(default=30, description="二波战法追溯人气龙头的天数")
+
+    # ==================== 动态阈值配置 ====================
+    CAPACITY_K_MIN: float = Field(default=0.7, description="容量因子 K 下限（流动性枯竭）")
+    CAPACITY_K_MAX: float = Field(default=1.5, description="容量因子 K 上限（流动性泛滥）")
+    PREMIUM_PANIC_THRESHOLD: float = Field(default=-2.5, description="溢价崩塌阈值(%)，低于此值触发抱团避险")
+    PREMIUM_WEIGHT: float = Field(default=0.40, description="溢价在盘中情绪分中的权重")
+    BREADTH_WEIGHT: float = Field(default=0.25, description="宽度在盘中情绪分中的权重")
+    HEIGHT_WEIGHT: float = Field(default=0.20, description="高度在盘中情绪分中的权重")
+    SUPPORT_WEIGHT: float = Field(default=0.15, description="承接在盘中情绪分中的权重")
 
 
 # 全局单例配置实例
