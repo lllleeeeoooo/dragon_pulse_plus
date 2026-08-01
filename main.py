@@ -100,8 +100,12 @@ def main():
 
     # 04:00 日志保留清理
     from database.services import LogRetentionCleaner
+    def _cleanup_with_track():
+        from scheduler.daily_runner import _record_job_run
+        _record_job_run("job_log_cleanup", "日志清理")
+        LogRetentionCleaner.cleanup()
     scheduler.add_job(
-        LogRetentionCleaner.cleanup,
+        _cleanup_with_track,
         trigger="cron",
         hour=4,
         minute=0,
@@ -111,6 +115,8 @@ def main():
 
     # 04:05 龙头过期标记（超过 30 天无人气自动失效）
     def _expire_dragons():
+        from scheduler.daily_runner import _record_job_run
+        _record_job_run("job_dragon_expire", "龙头过期标记")
         from database.services import db_manager
         from database.models import HistoricDragon
         import datetime

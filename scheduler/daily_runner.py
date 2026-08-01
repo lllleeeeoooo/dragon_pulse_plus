@@ -20,11 +20,49 @@ logger = logging.getLogger(__name__)
 # 模块级缓存：盘前简报预测结果，供竞价观察读取
 _cached_pre_market_report: str = ""
 
+# 定时任务执行追踪，供看板查询
+_job_last_run: Dict[str, Dict[str, Any]] = {}
+
+
+def _record_job_run(job_id: str, job_name: str):
+    """记录定时任务执行时间"""
+    now = datetime.datetime.now()
+    _job_last_run[job_id] = {
+        "name": job_name,
+        "last_run": now.strftime("%H:%M:%S"),
+        "last_date": now.strftime("%Y%m%d"),
+        "today": now.strftime("%Y%m%d"),
+    }
+
+
+def _get_job_status() -> List[Dict[str, Any]]:
+    """获取所有定时任务的状态列表"""
+    today = datetime.datetime.now().strftime("%Y%m%d")
+    all_jobs = [
+        {"id": "job_log_cleanup",    "name": "日志清理",         "time": "04:00", "desc": "系统/LLM/错误日志保留15天，推送30天"},
+        {"id": "job_dragon_expire",  "name": "龙头过期标记",     "time": "04:05", "desc": "超过30天无人气龙头自动失效"},
+        {"id": "job_pre_market",     "name": "盘前简报",         "time": "08:30", "desc": "新闻抓取→LLM分析→推送题材预测"},
+        {"id": "job_call_auction",   "name": "竞价观察",         "time": "09:26", "desc": "竞价快照→LLM判断超预期标的"},
+        {"id": "job_monitor_loop",   "name": "盘中实时监控",     "time": "09:30-15:00", "desc": f"15秒轮询，点火异动+板块联动+AI自动交易"},
+        {"id": "job_post_market",    "name": "盘后深度复盘",     "time": "15:30", "desc": "LLM复盘+推荐标的+指数落库+盈亏推送"},
+        {"id": "job_holiday_summary","name": "假日消息汇总",     "time": "20:00", "desc": "假期最后一天汇总近期消息"},
+    ]
+    for j in all_jobs:
+        record = _job_last_run.get(j["id"])
+        if record:
+            j["last_run"] = record["last_run"]
+            j["ran_today"] = record.get("last_date") == today
+        else:
+            j["last_run"] = "-"
+            j["ran_today"] = False
+    return all_jobs
+
 
 def job_pre_market():
     """
     08:30 盘前简报定时任务。非交易日自动跳过。
     """
+    _record_job_run("job_pre_market", "盘前简报")
     if not is_trading_day():
         logger.info("今日非交易日，跳过盘前简报")
         return
@@ -48,6 +86,7 @@ def job_call_auction():
     """
     09:26 竞价观察与指令定时任务。非交易日自动跳过。
     """
+    _record_job_run("job_call_auction", "竞价观察")
     if not is_trading_day():
         logger.info("今日非交易日，跳过竞价观察")
         return
@@ -116,6 +155,7 @@ def job_post_market():
     """
     15:30 盘后复盘定时任务。非交易日自动跳过。
     """
+    _record_job_run("job_post_market", "盘后深度复盘")
     if not is_trading_day():
         logger.info("今日非交易日，跳过盘后复盘")
         return
@@ -246,98 +286,117 @@ def job_post_market():
             group="盘后复盘"
         )
 
-        # ---- 策略回测报告 ----
-        _generate_backtest_report(today_str)
+        # ---- 大盘指数落库 ----
+        from database.services import MarketIndexManager
+        MarketIndexManager.save_daily_index(today_str, spot_df)
+
+        # ---- 涨停池明细落库 ----
+        from database.services import ZtPoolManager
+        ZtPoolManager.save_daily_zt_pool(today_str, zt_df)
+
+        # ---- 板块强度落库 ----
+        from database.services import SectorStrengthManager
+        SectorStrengthManager.save_daily_sectors(today_str, zt_df)
+
+        # ---- 每日盈亏报告（同步收盘价 + 净值快照 + 推送） ----
+        _push_daily_pnl_report(today_str, spot_df)
 
     except Exception as e:
         logger.error(f"15:30 盘后复盘执行异常: {e}")
 
 
-def _generate_backtest_report(trade_date: str):
-    """盘后实盘回测报告：从 AI 自动交易的平仓记录中统计真实盈亏"""
-    from database.services import db_manager
-    from database.models import Holding
-    import datetime
+def _push_daily_pnl_report(trade_date: str, spot_df=None):
+    """盘后每日盈亏推送：同步收盘价 + 生成盈亏报告 + Bark 推送。"""
+    from database.services import HoldingManager
 
-    session = db_manager.get_session()
-    try:
-        closed = session.query(Holding).filter(
-            Holding.status == "CLOSED",
-            Holding.holding_type == "AI_AUTO",
-            Holding.sell_price > 0
-        ).order_by(Holding.updated_at.desc()).limit(200).all()
+    # 1. 用今日收盘价同步持仓
+    spot_map = {}
+    if spot_df is not None and not spot_df.empty:
+        for _, row in spot_df.iterrows():
+            code = str(row.get("code", ""))
+            price = float(row.get("price", 0))
+            if code and price > 0:
+                spot_map[code] = price
+    HoldingManager.sync_close_prices(spot_map)
 
-        if not closed:
-            session.close()
-            return
+    # 2. 生成报告
+    report = HoldingManager.get_daily_pnl_report()
+    if "error" in report:
+        logger.warning(f"每日盈亏报告生成失败: {report['error']}")
+        return
 
-        lines = ["📊 AI实盘回测报告", f"共 {len(closed)} 笔已平仓交易", ""]
+    active_count = report.get("active_positions", 0)
+    if active_count == 0 and report.get("today_closed_count", 0) == 0:
+        return
 
-        total_trades = 0
-        wins = 0
-        returns = []
-        stock_returns: Dict[str, List[float]] = {}
-        stock_names: Dict[str, str] = {}
+    def _s(v):
+        return f"+{v}" if v > 0 else str(v)
 
-        for h in closed:
-            if h.cost_price <= 0 or h.sell_price <= 0:
-                continue
-            ret = round((h.sell_price - h.cost_price) / h.cost_price * 100, 2)
-            total_trades += 1
-            if ret > 0:
-                wins += 1
-            returns.append(ret)
-            stock_returns.setdefault(h.code, []).append(ret)
-            stock_names[h.code] = h.name
+    # 大盘对比
+    from database.services import MarketIndexManager
+    idx = MarketIndexManager.get_latest()
 
-        if total_trades == 0:
-            session.close()
-            return
+    lines = [
+        f"📊 DragonPulse 每日盈亏报告 ({trade_date})",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"📈 今日盈亏: {_s(report['today_total_pnl'])} 元 ({_s(report['today_total_pnl_pct'])}%)",
+        f"   浮动: {_s(report['today_unrealized_pnl'])} 元",
+    ]
+    if idx and idx.get("sh_change_pct", 0) != 0:
+        vs_market = round(report['today_total_pnl_pct'] - idx['sh_change_pct'], 2)
+        lines.append(f"   上证: {_s(idx['sh_change_pct'])}% | 深证: {_s(idx.get('sz_change_pct', 0))}% | 创业板: {_s(idx.get('gem_change_pct', 0))}%")
+        lines.append(f"   vs大盘: {_s(vs_market)}% {'🏆 跑赢' if vs_market > 0 else '📉 跑输'}")
+    if report["today_closed_count"] > 0:
+        lines.append(f"   已实现: {_s(report['today_realized_pnl'])} 元 (平仓{report['today_closed_count']}笔)")
 
-        avg_ret = round(sum(returns) / len(returns), 2)
-        win_rate = round(wins / total_trades * 100, 2)
+    lines += [
+        "",
+        f"💰 累计总盈亏: {_s(report['cumulative_total_pnl'])} 元 ({_s(report['cumulative_total_pnl_pct'])}%)",
+        f"   已实现: {_s(report['total_realized_pnl'])} 元 ({report['total_closed_count']}笔, 胜率{report['total_closed_win_rate']}%)",
+        f"   浮动: {_s(report['total_unrealized_pnl'])} 元",
+        "",
+        f"📋 当前持仓 ({active_count}只) 盈{report['profit_count']}/亏{report['loss_count']}/平{report['flat_count']}:",
+    ]
 
-        cumulative = 1.0
-        peak = 1.0
-        max_dd = 0.0
-        for r in returns:
-            cumulative *= (1 + r / 100)
-            peak = max(peak, cumulative)
-            dd = (peak - cumulative) / peak * 100
-            max_dd = max(max_dd, dd)
-
-        lines.append(f"胜率: {win_rate}% | 均收益: {avg_ret}% | 最大回撤: {round(max_dd, 2)}%")
-        lines.append(f"总收益: {round((cumulative-1)*100, 2)}%")
-
-        # 个股排行
-        stock_avg = [(c, round(sum(v) / len(v), 2), len(v), stock_names.get(c, c))
-                     for c, v in stock_returns.items() if len(v) >= 1]
-        stock_avg.sort(key=lambda x: x[1], reverse=True)
-        if stock_avg:
-            lines.append("")
-            lines.append(f"━━━ 个股收益排行（{len(stock_avg)}只）━━━")
-            top5 = stock_avg[:5]
-            bottom5 = stock_avg[-5:] if len(stock_avg) >= 5 else []
-            lines.append("🏆 Top5:")
-            for c, ret, cnt, n in top5:
-                lines.append(f"  {n}({c}): +{ret}% ({cnt}次)")
-            if bottom5:
-                lines.append("💀 Bottom5:")
-                for c, ret, cnt, n in bottom5:
-                    lines.append(f"  {n}({c}): {ret}% ({cnt}次)")
-
-        session.close()
-        body = "\n".join(lines)
-        logger.info(f"AI实盘回测报告:\n{body}")
-        bark_notifier.send(
-            title="📊 AI实盘回测报告",
-            body=body,
-            group="回测报告",
-            level="passive"
+    for h in report.get("holdings", [])[:15]:
+        emoji = "🟢" if h["profit_pct"] > 0 else ("🔴" if h["profit_pct"] < 0 else "⚪")
+        tag = h["strategy"][:4] if h["strategy"] else ""
+        lines.append(
+            f"  {emoji} {h['name']}({h['code']}) "
+            f"{_s(h['profit_pct'])}% | 今日{_s(h['today_change_pct'])}% | {tag}"
         )
-    except Exception as e:
-        session.close()
-        logger.warning(f"实盘回测报告生成失败: {e}")
+
+    if active_count > 15:
+        lines.append(f"  ... 还有 {active_count - 15} 只持仓")
+
+    if report["today_closed_count"] > 0:
+        lines.append("")
+        lines.append(f"🔚 今日平仓 ({report['today_closed_count']}笔):")
+        for t in report.get("today_closed_trades", []):
+            emoji = "✅" if t["return_pct"] > 0 else "❌"
+            lines.append(f"  {emoji} {t['name']}({t['code']}) {_s(t['return_pct'])}% | {t.get('strategy', '')}")
+
+    body = "\n".join(lines)
+    logger.info(f"每日盈亏报告:\n{body}")
+
+    level = "passive"
+    if report["today_total_pnl"] < 0:
+        level = "active"
+    if report.get("cumulative_total_pnl_pct", 0) < -5:
+        level = "timeSensitive"
+
+    bark_notifier.send(
+        title=f"📊 每日盈亏 | {_s(report['today_total_pnl'])}元 ({_s(report['today_total_pnl_pct'])}%)",
+        body=body,
+        group="盈亏报告",
+        level=level
+    )
+
+    # 净值快照落库
+    from database.services import DailySnapshotManager
+    sh_pct = idx.get("sh_change_pct", 0) if idx else 0.0
+    DailySnapshotManager.save_snapshot(trade_date, report, sh_change_pct=sh_pct)
 
 
 def _parse_and_save_recommendations(trade_date: str, report_text: str):
@@ -571,6 +630,7 @@ def job_holiday_news_summary():
     节假日/周末最后一天 20:00 执行。
     汇总休市期间的重要新闻，让开盘前有充足的信息准备。
     """
+    _record_job_run("job_holiday_summary", "假日消息汇总")
     if not is_last_non_trading_day():
         logger.info("今日非假期最后一天，跳过假日消息汇总")
         return

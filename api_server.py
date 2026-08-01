@@ -379,148 +379,91 @@ def refresh_trade_calendar(x_api_key: Optional[str] = Header(None)):
     return {"code": 200, "msg": "交易日历已强制刷新"}
 
 
-@app.get("/backtest", summary="模拟回测",
-         description="用历史涨停池数据回测 AI 买卖策略。示例：/backtest?strategy=打板接力&hold_days=3",
+@app.get("/backtest", summary="模拟回测（历史模拟）",
+         description="用历史涨停池数据模拟 AI 买卖策略的盈亏。这不是真实成交统计，是'如果当时买了会怎样'的模拟。"
+                     "示例：/backtest?start=20260701&end=20260720",
          tags=["AkShare 数据"])
 def run_backtest(
     start: str = Query("20260701", description="起始日期 YYYYMMDD"),
     end: str = Query("20260730", description="结束日期 YYYYMMDD"),
-    strategy: str = Query("打板接力", description="策略：打板接力/低吸/全部"),
-    hold_days: int = Query(3, description="持仓天数"),
+    max_positions: int = Query(None, description="最大持仓数，默认取 settings.MAX_AI_POSITIONS"),
+    max_daily_buys: int = Query(None, description="每日最大买入，默认取 settings.MAX_DAILY_BUYS"),
 ):
-    from core.backtest import BacktestEngine
-    result = BacktestEngine.run(
+    from core.backtest import AIBacktestEngine
+    result = AIBacktestEngine.run(
         start_date=start, end_date=end,
-        strategy=strategy, hold_days=hold_days
+        max_positions=max_positions, max_daily_buys=max_daily_buys,
     )
     return {"code": 200, "data": result}
 
 
-@app.get("/monitor", response_class=HTMLResponse, summary="实时风控看板",
-         description="HTML 页面，每10秒自动刷新，展示持仓盈亏+市场风格+点火信号")
-def monitor_page():
-    """实时风控看板 HTML 页面"""
-    return """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="10">
-<title>DragonPulse 实时风控看板</title>
-<style>
-body{font-family:'Microsoft YaHei',sans-serif;background:#0a0e17;color:#e0e6ed;padding:10px;margin:0}
-h1{color:#00d4aa;font-size:18px;text-align:center;margin:5px 0}
-.card{background:#141b25;border-radius:8px;padding:12px;margin:8px 0;border-left:3px solid #00d4aa}
-.red{border-left-color:#ff4757}.yellow{border-left-color:#ffa502}.green{border-left-color:#2ed573}
-.row{display:flex;justify-content:space-between;align-items:center;margin:4px 0}
-.label{color:#8899aa;font-size:12px}.value{font-size:16px;font-weight:bold}
-.badge{font-size:11px;padding:2px 8px;border-radius:10px;background:#1a2235;color:#00d4aa}
-.badge-red{background:#3d1520;color:#ff4757}
-.badge-green{background:#153d20;color:#2ed573}
-.pnl-up{color:#ff4757}.pnl-down{color:#2ed573}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
-.live{animation:pulse 2s infinite;display:inline-block;width:8px;height:8px;background:#00d4aa;border-radius:50%;margin-right:4px}
-</style></head>
-<body>
-<h1><span class="live"></span>DragonPulse 实时风控看板</h1>
-<div id="app">加载中...</div>
-<script>
-async function load(){const r=await fetch('/dashboard');const d=(await r.json()).data;
-document.getElementById('app').innerHTML=`
-<div class="card ${d.market.style==='抱团'||d.market.style==='高潮'?'red':d.market.style==='共振'?'green':'yellow'}">
-  <div class="row"><span class="label">市场风格</span><span class="value">${d.market.style} → ${d.market.strategy}</span></div>
-  <div class="row"><span class="label">${d.market.reason}</span></div>
-  <div class="row"><span class="label">容量因子</span><span class="value">K=${d.liquidity.capacity_factor}</span></div>
-  <div class="row"><span class="label">此刻/昨日</span><span class="value">${d.liquidity.now_amount} / ${d.liquidity.baseline_yesterday}</span></div>
-</div>
-<div class="card">
-  <div class="row"><span class="label">情绪分</span><span class="value">${d.emotion.sentiment_index}<span style="font-size:10px;color:#8899aa"> 溢价${d.emotion.score_premium} 宽度${d.emotion.score_breadth} 高度${d.emotion.score_height} 承接${d.emotion.score_support}</span></span></div>
-  <div class="row"><span class="label">开盘溢价</span><span class="value">${d.emotion.premium_opening}</span></div>
-  <div class="row"><span class="label">即时溢价</span><span class="value">${d.emotion.premium_intraday}</span></div>
-  <div class="row"><span class="label">高开率 / 红盘率</span><span class="value">${d.emotion.high_open_rate} / ${d.emotion.red_rate}</span></div>
-</div>
-<div class="card">
-  <div class="row"><span class="label">涨跌分布</span><span class="value"><span style="color:#ff4757">${d.breadth.up_count}</span> / <span style="color:#2ed573">${d.breadth.down_count}</span> / ${d.breadth.flat_count}</span></div>
-  <div class="row"><span class="label">涨停 / 跌停</span><span class="value">${d.breadth.zt_count}<span class="badge">${d.breadth.zt_source}</span> / <span class="badge badge-red">${d.breadth.dt_count}</span></span></div>
-  <div class="row"><span class="label">炸板</span><span class="value">${d.breadth.zhaban_rate} (${d.breadth.zhaban_count}只)</span></div>
-  <div class="row"><span class="label">最高连板</span><span class="value">${d.breadth.height}板</span></div>
-</div>
-<div class="card green">
-  <div class="row"><span class="label">活跃持仓</span><span class="value">${d.holdings.active}只</span></div>
-  <div class="row"><span class="label">AI自动</span><span class="badge badge-green">${d.holdings.ai_auto}只</span></div>
-  <div class="row"><span class="label">手动</span><span class="badge">${d.holdings.manual}只</span></div>
-</div>
-<div class="card">
-  <div class="row"><span class="label" style="color:#00d4aa">定时任务</span></div>
-  <div class="row"><span class="label">04:00 日志清理</span><span class="badge">15天/30天</span></div>
-  <div class="row"><span class="label">04:05 龙头过期</span><span class="badge">>30天</span></div>
-  <div class="row"><span class="label">08:30 盘前简报</span><span class="badge">新闻→LLM</span></div>
-  <div class="row"><span class="label">09:26 竞价观察</span><span class="badge">竞价→LLM</span></div>
-  <div class="row"><span class="label">09:30-15:00 盘中监控</span><span class="badge">15s轮询</span></div>
-  <div class="row"><span class="label">15:30 盘后复盘+回测</span><span class="badge">LLM+推送</span></div>
-  <div class="row"><span class="label">20:00 假日汇总</span><span class="badge">假期最后一天</span></div>
-</div>
-<div style="text-align:center;color:#445566;font-size:11px;margin-top:10px">
-${d.updated?'每10秒自动刷新':'等待监控数据...'} | <a href="/docs" style="color:#445566">API文档</a> | <a href="/dashboard" style="color:#445566">JSON</a>
-</div>`}
-load();setInterval(load,10000);
-</script></body></html>"""
-
-
-@app.get("/dashboard", summary="情绪看板（手机端一站式概览）",
-         description="返回市场风格/溢价/涨跌停/情绪分/持仓等关键数据",
-         tags=["AkShare 数据"])
-def dashboard():
-    from scheduler.market_monitor import _current_market_style_global
+@app.get("/trades/stats", summary="真实成交统计",
+         description="查看数据库里 AI 真实买卖的盈亏统计。这不是模拟，是实盘成交记录。"
+                     "示例：/trades/stats?holding_type=AI_AUTO",
+         tags=["持仓管理"])
+def trade_statistics(
+    holding_type: str = Query(None, description="持仓类型：AI_AUTO / MANUAL，不传查全部"),
+):
     from database.services import HoldingManager
-    style = dict(_current_market_style_global)
-    holdings = HoldingManager.get_active_holdings()
-    ai_count = sum(1 for h in holdings if h.get("holding_type") == "AI_AUTO")
+    result = HoldingManager.get_trade_statistics(holding_type=holding_type or None)
+    return {"code": 200, "data": result}
 
-    return {
-        "code": 200,
-        "data": {
-            "market": {
-                "style": style.get("style", "未知"),
-                "strategy": style.get("priority_strategy", ""),
-                "reason": style.get("reason", ""),
-            },
-            "liquidity": {
-                "capacity_factor": style.get("capacity_factor", 0),
-                "now_amount": f"{style.get('now_amount_billion', 0):.0f}亿",
-                "baseline_yesterday": f"{style.get('baseline_ma20_billion', 0):.0f}亿",
-            },
-            "emotion": {
-                "sentiment_index": style.get("sentiment_index", 0),
-                "score_premium": style.get("score_premium", 0),
-                "score_breadth": style.get("score_breadth", 0),
-                "score_height": style.get("score_height", 0),
-                "score_support": style.get("score_support", 0),
-                "premium_opening": f"{style.get('premium_opening', 0)}%",
-                "premium_intraday": f"{style.get('premium_intraday', 0)}%",
-                "red_rate": f"{style.get('positive_ratio', 0)}%",
-                "high_open_rate": f"{style.get('high_open_ratio', 0)}%",
-            },
-            "breadth": {
-                "up_count": style.get("up_count", 0),
-                "down_count": style.get("down_count", 0),
-                "flat_count": style.get("flat_count", 0),
-                "limit_up_est": style.get("limit_up_est", 0),
-                "limit_down_est": style.get("limit_down_est", 0),
-                "zt_count": style.get("zt_count", 0),
-                "dt_count": style.get("dt_count", 0),
-                "zhaban_count": style.get("zhaban_count", 0),
-                "zhaban_rate": f"{style.get('zhaban_rate', 0)}%",
-                "height": style.get("height", 0),
-                "zt_source": style.get("zt_source", ""),
-            },
-            "holdings": {
-                "active": len(holdings),
-                "ai_auto": ai_count,
-                "manual": len(holdings) - ai_count,
-            },
-            "updated": style.get("style", "") != "",
-        }
-    }
+
+@app.get("/trades/equity-curve", summary="净值曲线",
+         description="获取每日净值快照，用于画资金曲线。示例：/trades/equity-curve?days=30",
+         tags=["持仓管理"])
+def equity_curve(days: int = Query(60, description="回溯天数")):
+    from database.services import DailySnapshotManager
+    result = DailySnapshotManager.get_equity_curve(days=days)
+    return {"code": 200, "data": result}
+
+
+@app.get("/data/zt-pool", summary="涨停池明细",
+         description="查询某日涨停池。示例：/data/zt-pool?date=20260801",
+         tags=["AkShare 数据"])
+def zt_pool_query(date: str = Query(None, description="日期 YYYYMMDD，默认取最新")):
+    from database.services import ZtPoolManager, db_manager
+    from database.models import DailyZtPool
+    session = db_manager.get_session()
+    try:
+        if date is None:
+            latest = session.query(DailyZtPool.trade_date).order_by(
+                DailyZtPool.trade_date.desc()
+            ).first()
+            date = latest[0] if latest else ""
+        records = session.query(DailyZtPool).filter(
+            DailyZtPool.trade_date == date
+        ).order_by(DailyZtPool.lbc.desc()).all()
+        return {"code": 200, "data": [{
+            "code": r.code, "name": r.name, "lbc": r.lbc,
+            "price": r.price, "change_pct": r.change_pct,
+            "industry": r.industry, "seal_amount": r.seal_amount,
+            "first_seal_time": r.first_seal_time,
+        } for r in records]}
+    finally:
+        session.close()
+
+
+@app.get("/data/hot-sectors", summary="热门板块",
+         description="查询某日板块强度排名。示例：/data/hot-sectors?date=20260801&top=10",
+         tags=["AkShare 数据"])
+def hot_sectors(date: str = Query(None, description="日期 YYYYMMDD，默认最新"),
+                top: int = Query(10, description="返回前N个")):
+    from database.services import SectorStrengthManager
+    result = SectorStrengthManager.get_hot_sectors(date_str=date, top_n=top)
+    return {"code": 200, "data": result}
+
+
+@app.get("/monitor", response_class=HTMLResponse, summary="系统综合看板",
+         description="HTML 页面，展示大盘/情绪/持仓/板块/龙头/系统状态")
+def monitor_page():
+    from dashboard import render_html
+    return render_html()
+
+
+def dashboard():
+    from dashboard import build_dashboard_data
+    return {"code": 200, "data": build_dashboard_data()}
 
 
 @app.get("/data/market-style", summary="盘中实时市场风格",

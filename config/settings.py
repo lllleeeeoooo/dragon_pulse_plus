@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = Field(default="https://api.deepseek.com/v1", description="LLM API Base URL")
     LLM_MODEL: str = Field(default="deepseek-chat", description="LLM 模型名称，例如 deepseek-chat, gpt-4o, claude-3-5-sonnet")
     LLM_TEMPERATURE: float = Field(default=0.3, description="生成随机性温度，短线量化分析建议 0.1 ~ 0.4")
-    LLM_TIMEOUT: int = Field(default=60, description="LLM 请求超时时间(秒)")
+    LLM_TIMEOUT: int = Field(default=180, description="LLM 请求超时时间(秒)")
     LLM_MAX_RETRIES: int = Field(default=3, description="LLM 请求失败重试次数")
     LLM_BACKUP_BASE_URL: str = Field(default="", description="备用 LLM API Base URL（主模型失败时自动切换）")
     LLM_BACKUP_MODEL: str = Field(default="", description="备用 LLM 模型名称")
@@ -48,18 +48,20 @@ class Settings(BaseSettings):
     BARK_ENABLED: bool = Field(default=True, description="是否启用 Bark 推送")
 
     # ==================== 盘中监控轮询配置 ====================
-    FUND_INFLOW_THRESHOLD: float = Field(default=5000.0, description="主力资金合力扫货阈值 (万元)")
+    FUND_INFLOW_MIN: float = Field(default=2000.0, description="主力资金扫货绝对底线 (万元)，小盘股兜底阈值")
+    FUND_INFLOW_CAP_RATIO: float = Field(default=0.0005, description="主力资金扫货流通市值比例，与 FUND_INFLOW_MIN 取较大值作为动态阈值")
     MONITOR_INTERVAL_SECONDS: int = Field(default=15, description="盘中实时快照轮询间隔(秒)")
     VOL_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动成交量相比过去5日均值的倍数门槛")
     PRICE_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动股价涨幅下限 (%)，低于此值不触发")
-    PRICE_BURST_MAX: float = Field(default=9.5, description="点火异动股价涨幅上限 (%)，已涨停(>=9.5%)的不算点火")
+    PRICE_BURST_MAX: float = Field(default=9.5, description="点火异动股价涨幅上限 (%) - 主板 10cm，已涨停的不算点火")
+    PRICE_BURST_MAX_20CM: float = Field(default=19.5, description="点火异动股价涨幅上限 (%) - 双创 20cm，已涨停的不算点火")
     FETCH_RETRY_COUNT: int = Field(default=3, description="数据抓取重试次数")
     FETCH_RETRY_DELAY: float = Field(default=2.0, description="数据抓取重试延迟(秒)")
 
     # ==================== 仓位管理配置 ====================
     MAX_AI_POSITIONS: int = Field(default=5, description="AI自动持仓最大数量，超出不再买入")
     MAX_DAILY_BUYS: int = Field(default=3, description="AI每日最大自动买入次数")
-    DAILY_LOSS_CIRCUIT_BREAKER: float = Field(default=-5.0, description="AI持仓当日总亏损熔断阈值(%)，触发后停止买入")
+    DAILY_LOSS_CIRCUIT_BREAKER: float = Field(default=-5.0, description="AI持仓当日平均亏损熔断阈值(%)，触发后停止买入")
     INDEX_DROP_CIRCUIT_BREAKER: float = Field(default=-2.0, description="大盘均涨幅跌破此值时触发系统级熔断，停止所有自动买入(%)")
 
     # ==================== 股票过滤配置 ====================
@@ -82,11 +84,11 @@ class Settings(BaseSettings):
     CORE_POOL_TOP_AMOUNT: int = Field(default=3, description="板块内选取的成交额 Top N 个股")
     CORE_POOL_TOP_MARKET_CAP: int = Field(default=5, description="板块内选取的总市值 Top N 个股")
     CORE_POOL_MIN_BETA: float = Field(default=0.8, description="中军相关性(Beta)判定阈值")
-    CORE_POOL_MIN_AMOUNT: float = Field(default=20.0, description="中军日成交额门槛 (亿元)")
+    CORE_POOL_MIN_AMOUNT: float = Field(default=12.0, description="中军日成交额门槛 (亿元)")
 
     # ==================== 板块联动监控配置 ====================
-    SECTOR_LINKAGE_MIN_COUNT: int = Field(default=2, description="板块涨停家数达到此值时触发联动预警")
-    SECTOR_LINKAGE_ACCEL_DELTA: int = Field(default=1, description="板块涨停家数较上轮增加此值时触发加速预警")
+    SECTOR_LINKAGE_MIN_COUNT: int = Field(default=3, description="板块涨停家数达到此值时触发联动预警")
+    SECTOR_LINKAGE_ACCEL_DELTA: int = Field(default=2, description="板块涨停家数较上轮增加此值时触发加速预警")
 
     SECOND_WAVE_RETREAT_MIN: float = Field(default=0.30, description="二波战法龙头回撤最小比例 (30%)")
     SECOND_WAVE_RETREAT_MAX: float = Field(default=0.50, description="二波战法龙头回撤最大比例 (50%)")

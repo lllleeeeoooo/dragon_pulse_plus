@@ -235,8 +235,9 @@ class StrategyAnalyzer:
         if index_change_pct < -0.5 and market_total_amount < 7e11 and change_pct > 0.0:
             tags.append("避险抱团")
 
-        # 5. 打板战法标签 [打板接力]
-        if change_pct >= 9.5:
+        # 5. 打板战法标签 [打板接力]（按板块区分涨停线）
+        limit_line = 19.5 if str(stock_code).startswith(("30", "688")) else 9.5
+        if change_pct >= limit_line:
             tags.append("打板接力")
 
         return tags if tags else ["观望/跟随"]

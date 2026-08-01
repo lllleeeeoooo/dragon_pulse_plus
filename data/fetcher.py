@@ -775,11 +775,12 @@ class DataFetcher:
 
             parts = []
 
-            # 涨停检测
-            if total_change >= 9.5:
+            # 涨停检测（按板块区分涨停线）
+            limit_line = 19.5 if str(code).startswith(("30", "688")) else 9.5
+            if total_change >= limit_line:
                 limit_idx = None
                 for i, chg in enumerate(changes):
-                    if float(chg) >= 9.5:
+                    if float(chg) >= limit_line:
                         limit_idx = i
                         break
                 if limit_idx is not None and limit_idx < len(times):

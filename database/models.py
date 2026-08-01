@@ -20,6 +20,7 @@ class Holding(Base):
     name = Column(String(32), nullable=False, comment="股票名称")
     cost_price = Column(Float, nullable=False, default=0.0, comment="买入成本价")
     current_price = Column(Float, default=0.0, comment="最新实时价格")
+    prev_close_price = Column(Float, default=0.0, comment="上一交易日收盘价，用于计算今日浮动盈亏")
     profit_rate = Column(Float, default=0.0, comment="实时收益率 (%) = (最新价 - 成本价) / 成本价 * 100")
     quantity = Column(Integer, nullable=False, default=100, comment="持仓数量")
     buy_date = Column(String(10), nullable=False, comment="买入日期 YYYY-MM-DD（注意：与其他表的 YYYYMMDD 格式不同）")
@@ -91,6 +92,91 @@ class HistoricDragon(Base):
     peak_price = Column(Float, nullable=False, comment="见顶最高价")
     board_name = Column(String(64), comment="所属主线题材板块")
     is_active = Column(Boolean, default=True, comment="是否处于二波观察期 (30天内)")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
+class MarketIndex(Base):
+    """
+    大盘指数日线数据表
+    每个交易日一行，存储上证/深证/创业板收盘价及涨跌幅。
+    用于大盘熔断基准、偏离度计算、盈亏对比。
+    """
+    __tablename__ = "market_index"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(String(10), nullable=False, unique=True, index=True, comment="交易日期 YYYYMMDD")
+    sh_close = Column(Float, default=0.0, comment="上证指数收盘价")
+    sh_change_pct = Column(Float, default=0.0, comment="上证指数涨跌幅(%)")
+    sz_close = Column(Float, default=0.0, comment="深证成指收盘价")
+    sz_change_pct = Column(Float, default=0.0, comment="深证成指涨跌幅(%)")
+    gem_close = Column(Float, default=0.0, comment="创业板指收盘价")
+    gem_change_pct = Column(Float, default=0.0, comment="创业板指涨跌幅(%)")
+    total_amount = Column(Float, default=0.0, comment="全市场成交额(亿元)")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
+class DailyEquitySnapshot(Base):
+    """
+    每日净值快照表
+    盘后保存当日总权益、浮动盈亏、已实现盈亏等，用于画资金曲线和绩效指标。
+    """
+    __tablename__ = "daily_equity_snapshot"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(String(10), nullable=False, unique=True, index=True, comment="交易日期 YYYYMMDD")
+    total_equity = Column(Float, default=0.0, comment="总权益(元)")
+    available_cash = Column(Float, default=0.0, comment="可用资金(元)")
+    position_value = Column(Float, default=0.0, comment="持仓市值(元)")
+    unrealized_pnl = Column(Float, default=0.0, comment="浮动盈亏(元)")
+    today_realized_pnl = Column(Float, default=0.0, comment="今日已实现盈亏(元)")
+    total_realized_pnl = Column(Float, default=0.0, comment="累计已实现盈亏(元)")
+    position_count = Column(Integer, default=0, comment="持仓数量")
+    today_pnl_pct = Column(Float, default=0.0, comment="今日收益率(%)")
+    cumulative_pnl_pct = Column(Float, default=0.0, comment="累计收益率(%)")
+    sh_change_pct = Column(Float, default=0.0, comment="当日上证涨跌幅(%)")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
+class DailyZtPool(Base):
+    """
+    每日涨停池明细表
+    保存每天涨停个股的关键字段，用于回溯板块启动、连板晋级率、龙头更替。
+    """
+    __tablename__ = "daily_zt_pool"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(String(10), nullable=False, index=True, comment="交易日期 YYYYMMDD")
+    code = Column(String(12), nullable=False, index=True, comment="股票代码")
+    name = Column(String(32), nullable=False, comment="股票名称")
+    price = Column(Float, default=0.0, comment="封板价")
+    change_pct = Column(Float, default=0.0, comment="涨跌幅(%)")
+    lbc = Column(Integer, default=1, comment="连板数")
+    seal_amount = Column(Float, default=0.0, comment="封单金额(元)")
+    first_seal_time = Column(String(16), comment="首次封板时间 HH:MM:SS")
+    open_count = Column(Integer, default=0, comment="炸板次数")
+    industry = Column(String(64), comment="所属行业/板块")
+    amount = Column(Float, default=0.0, comment="成交额(元)")
+    turnover_rate = Column(Float, default=0.0, comment="换手率(%)")
+    circ_market_cap = Column(Float, default=0.0, comment="流通市值(元)")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
+class SectorStrength(Base):
+    """
+    每日板块强度表
+    统计每个行业/概念板块的涨停家数、占比、加速情况，用于板块轮动分析。
+    """
+    __tablename__ = "sector_strength"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(String(10), nullable=False, index=True, comment="交易日期 YYYYMMDD")
+    sector_name = Column(String(64), nullable=False, comment="板块名称")
+    zt_count = Column(Integer, default=0, comment="涨停家数")
+    prev_zt_count = Column(Integer, default=0, comment="上日涨停家数")
+    acceleration = Column(Integer, default=0, comment="加速：今日-上日")
+    total_stocks = Column(Integer, default=0, comment="板块成分股总数")
+    zt_ratio_pct = Column(Float, default=0.0, comment="涨停占比(%)")
+    top_stocks = Column(String(256), comment="领涨标的,逗号分隔 code:name")
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
@@ -275,6 +361,7 @@ class DatabaseManager:
         _ensure_column(self.engine, "holdings", "profit_rate", "FLOAT DEFAULT 0.0")
         _ensure_column(self.engine, "holdings", "holding_type", "VARCHAR(16) DEFAULT 'MANUAL'")
         _ensure_column(self.engine, "holdings", "sell_price", "FLOAT DEFAULT 0.0")
+        _ensure_column(self.engine, "holdings", "prev_close_price", "FLOAT DEFAULT 0.0")
         _ensure_column(self.engine, "daily_sentiment", "total_amount", "FLOAT DEFAULT 0.0")
 
     def get_session(self) -> Session:

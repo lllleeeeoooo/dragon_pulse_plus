@@ -15,8 +15,12 @@ from database.services import HoldingManager, RecommendationManager
 
 logger = logging.getLogger(__name__)
 
-# 模块级全局变量，供 API 端点实时查询当前市场风格
+# 模块级全局变量，供 API 端点实时查询
 _current_market_style_global: Dict[str, str] = {}
+_monitor_running: bool = False
+_last_monitor_cycle: str = ""
+_circuit_breaker_alerted: bool = False
+_index_breaker_alerted: bool = False
 
 
 class MarketMonitor:
@@ -348,14 +352,18 @@ class MarketMonitor:
         # 更新缓存
         self._prev_seal_amounts = current_seals
 
-    def _check_fund_inflow_alert(self, hot_codes: list = None):
+    def _check_fund_inflow_alert(self, hot_codes: list = None, cap_map: dict = None):
         """
         大单抱团监控（修复 #3+#4）：对点火异动个股逐只查询主力资金流向。
         新版 akshare 的 stock_individual_fund_flow 需要指定个股代码，
         因此仅对当前已触发的点火标的做资金校验。
+
+        阈值按流通市值动态分级：max(FUND_INFLOW_MIN, 流通市值 * FUND_INFLOW_CAP_RATIO)
+        小盘股 ≈2000万起，大盘股随市值递增，避免一刀切。
         """
         if not hot_codes:
             return
+        cap_map = cap_map or {}
 
         for code in hot_codes[:3]:  # 最多查 3 只，避免 API 调用过频
             try:
@@ -370,8 +378,23 @@ class MarketMonitor:
                 close = float(latest.get("close") or latest.get("收盘价") or 0)
                 name = str(latest.get("name") or latest.get("名称") or code)
 
-                if main_inflow > settings.FUND_INFLOW_THRESHOLD * 1e4:  # 阈值单位万元→元
-                    logger.info(f"主力合力扫货: {name}({code}) 主力净流入 {main_inflow/1e8:.2f}亿")
+                # 按流通市值计算动态阈值（单位统一为元）
+                circ_cap = float(cap_map.get(str(code), 0))
+                if circ_cap > 0:
+                    dynamic_threshold = max(
+                        settings.FUND_INFLOW_MIN * 1e4,        # 绝对底线 万元→元
+                        circ_cap * settings.FUND_INFLOW_CAP_RATIO  # 流通市值比例
+                    )
+                else:
+                    # 市值缺失时退守绝对阈值
+                    dynamic_threshold = settings.FUND_INFLOW_MIN * 1e4
+
+                if main_inflow > dynamic_threshold:
+                    cap_desc = f" 流通市值:{circ_cap/1e8:.0f}亿" if circ_cap > 0 else ""
+                    logger.info(f"主力合力扫货: {name}({code}) 主力净流入 {main_inflow/1e8:.2f}亿 "
+                                f"(阈值 {dynamic_threshold/1e8:.2f}亿{cap_desc})")
+            except Exception as e:
+                logger.debug(f"查询 {code} 资金流向失败: {e}")
             except Exception as e:
                 logger.debug(f"查询 {code} 资金流向失败: {e}")
 
@@ -766,8 +789,10 @@ class MarketMonitor:
         total_profit = sum(h.get("profit_rate", 0) for h in ai_holdings)
         avg_profit = total_profit / len(ai_holdings)
         if avg_profit <= settings.DAILY_LOSS_CIRCUIT_BREAKER:
+            global _circuit_breaker_alerted
             if not getattr(self, '_circuit_breaker_alerted', False):
                 self._circuit_breaker_alerted = True
+                _circuit_breaker_alerted = True
                 logger.warning(f"AI持仓亏损熔断：平均收益率 {avg_profit:.2f}% <= {settings.DAILY_LOSS_CIRCUIT_BREAKER}%，停止自动买入")
                 bark_notifier.send(
                     title="🛑 [亏损熔断] AI自动买入已暂停",
@@ -802,7 +827,9 @@ class MarketMonitor:
         盘中轮询主循环。交易时段每 15 秒检测，非交易时空转等待。
         is_trading_time() 只是一个时间比对，空转时 CPU 开销可忽略。
         """
+        global _monitor_running, _last_monitor_cycle
         self.is_running = True
+        _monitor_running = True
         logger.info(f"启动盘中实时轮询监控引擎 (轮询间隔: {settings.MONITOR_INTERVAL_SECONDS}秒)...")
 
         while self.is_running:
@@ -818,6 +845,7 @@ class MarketMonitor:
                     continue
                 elif self.is_trading_time():
                     self._check_realtime_market()
+                    _last_monitor_cycle = datetime.datetime.now().strftime("%H:%M:%S")
                 else:
                     # 非交易时间清缓存
                     self._zt_pool_cache = None
@@ -881,7 +909,9 @@ class MarketMonitor:
         market_avg_change = float(spot_df["change_pct"].mean()) if not spot_df.empty else 0.0
         index_breaker_triggered = market_avg_change <= settings.INDEX_DROP_CIRCUIT_BREAKER
         if index_breaker_triggered and not getattr(self, '_index_breaker_alerted', False):
+            global _index_breaker_alerted
             self._index_breaker_alerted = True
+            _index_breaker_alerted = True
             logger.warning(f"大盘熔断: 全市场均涨幅 {market_avg_change:.2f}% <= {settings.INDEX_DROP_CIRCUIT_BREAKER}%，停止自动买入")
             bark_notifier.send(
                 title="🛑 [大盘熔断] 系统性风险",
@@ -908,13 +938,22 @@ class MarketMonitor:
         price_range = spot_df["high"].astype(float) - spot_df["low"].astype(float)
         rally_strength = (spot_df["price"].astype(float) - spot_df["open"].astype(float)) / price_range.replace(0, 1)
 
+        # 按板块区分涨停线：主板 10cm vs 双创 20cm（科创板已在源头过滤，此处主要区分创业板 300）
+        is_main_board = spot_df["code"].astype(str).str.match(r"^(60|00)")
+        spot_df["_limit_max"] = settings.PRICE_BURST_MAX  # 主板 10cm
+        spot_df.loc[~is_main_board, "_limit_max"] = settings.PRICE_BURST_MAX_20CM  # 双创 20cm
+        # 逼近封板区间 = 涨停线的 80%~100%
+        spot_df["_near_limit_min"] = spot_df["_limit_max"] * 0.84   # e.g. 9.5*0.84≈8.0 / 19.5*0.84≈16.4
+        spot_df["_near_limit_max"] = spot_df["_limit_max"]
+
         spot_df["_signal_burst"] = (
             (spot_df["volume_ratio"] >= settings.VOL_BURST_THRESHOLD) &
             (spot_df["change_pct"] >= settings.PRICE_BURST_THRESHOLD) &
-            (spot_df["change_pct"] < settings.PRICE_BURST_MAX)
+            (spot_df["change_pct"] < spot_df["_limit_max"])
         )
         spot_df["_signal_near_limit"] = (
-            (spot_df["change_pct"] >= 8.0) & (spot_df["change_pct"] <= 9.5) &
+            (spot_df["change_pct"] >= spot_df["_near_limit_min"]) &
+            (spot_df["change_pct"] <= spot_df["_near_limit_max"]) &
             (spot_df["volume_ratio"] > 5)
         )
         spot_df["_signal_low_open_rally"] = (
@@ -1130,8 +1169,15 @@ class MarketMonitor:
                 self._alerted_burst_codes.add(code)
                 burst_codes_for_fund.append(code)
 
-            # 4.5 大单抱团监控：对命中标的验证主力资金
-            self._check_fund_inflow_alert(burst_codes_for_fund[:3])
+            # 4.5 大单抱团监控：对命中标的验证主力资金（含流通市值分级阈值）
+            cap_map = {}
+            if not spot_df.empty and "circ_market_cap" in spot_df.columns:
+                for _, srow in spot_df.iterrows():
+                    c = str(srow.get("code", ""))
+                    cap = float(srow.get("circ_market_cap", 0))
+                    if c and cap > 0:
+                        cap_map[c] = cap
+            self._check_fund_inflow_alert(burst_codes_for_fund[:3], cap_map)
 
         # 5. 全市场高位连板股"炸板"监控（基于真实涨停池对比）
         self._check_zhaban_alert(spot_df)
@@ -1290,7 +1336,7 @@ class MarketMonitor:
     def _check_zhaban_alert(self, spot_df: pd.DataFrame):
         """
         基于涨停池缓存检测真正的炸板：
-        今日曾封板（在涨停池中）的标的，若当前快照中涨幅已回落至 < 9.5% 且放量，
+        今日曾封板（在涨停池中）的标的，若当前快照中涨幅已回落至 < 7% 且放量，
         说明该股已炸板，发出预警。
         """
         zt_pool = self._zt_pool_cache

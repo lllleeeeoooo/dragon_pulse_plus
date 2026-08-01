@@ -1,6 +1,6 @@
 import logging
 from typing import List, Dict, Any, Optional
-from database.models import DatabaseManager, Holding, Recommendation, DailySentiment, HistoricDragon, PushLog, LLMLog, ErrorLog, TradeCalendar, SystemLog
+from database.models import DatabaseManager, Holding, Recommendation, DailySentiment, HistoricDragon, MarketIndex, DailyEquitySnapshot, DailyZtPool, SectorStrength, PushLog, LLMLog, ErrorLog, TradeCalendar, SystemLog
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +168,270 @@ class HoldingManager:
         except Exception as e:
             session.rollback()
             logger.warning(f"重置 was_limit_up_today 失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_trade_statistics(holding_type: Optional[str] = None) -> Dict[str, Any]:
+        """
+        统计已平仓交易的盈亏，按策略/持仓类型分组。
+        这是 AI 真实买卖的成交报告，不是模拟回测。
+
+        :param holding_type: 可选，筛选持仓类型 (AI_AUTO / MANUAL)，不传则统计全部
+        """
+        session = db_manager.get_session()
+        try:
+            query = session.query(Holding).filter(Holding.status == "CLOSED")
+            if holding_type:
+                query = query.filter(Holding.holding_type == holding_type)
+
+            trades = query.all()
+            if not trades:
+                return {"total_trades": 0, "message": "暂无已平仓交易记录"}
+
+            records = []
+            for h in trades:
+                # 计算实际盈亏：用 cost_price 和 sell_price
+                if h.cost_price > 0 and h.sell_price > 0:
+                    realized_pnl = round((h.sell_price - h.cost_price) / h.cost_price * 100, 2)
+                else:
+                    realized_pnl = 0.0
+
+                records.append({
+                    "code": h.code,
+                    "name": h.name,
+                    "buy_date": h.buy_date,
+                    "cost_price": h.cost_price,
+                    "sell_price": h.sell_price,
+                    "return_pct": realized_pnl,
+                    "quantity": h.quantity,
+                    "strategy": h.buy_strategy or "",
+                    "type": h.holding_type or "",
+                })
+
+            total = len(records)
+            wins = sum(1 for r in records if r["return_pct"] > 0)
+            returns = [r["return_pct"] for r in records]
+
+            # 按策略分组
+            by_strategy: dict = {}
+            for r in records:
+                s = r["strategy"] or "未知"
+                by_strategy.setdefault(s, []).append(r["return_pct"])
+
+            strategy_stats = {}
+            for s, rets in by_strategy.items():
+                strategy_stats[s] = {
+                    "trades": len(rets),
+                    "win_rate_pct": round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1),
+                    "avg_return_pct": round(sum(rets) / len(rets), 2),
+                    "total_return_pct": round(sum(rets), 2),
+                }
+
+            # 按类型分组
+            by_type: dict = {}
+            for r in records:
+                t = r["type"] or "未知"
+                by_type.setdefault(t, []).append(r["return_pct"])
+
+            type_stats = {}
+            for t, rets in by_type.items():
+                type_stats[t] = {
+                    "trades": len(rets),
+                    "win_rate_pct": round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1),
+                    "avg_return_pct": round(sum(rets) / len(rets), 2),
+                }
+
+            # 最近交易
+            recent = sorted(records, key=lambda x: x["buy_date"], reverse=True)[:20]
+
+            logger.info(
+                f"成交统计: {total}笔 胜率{round(wins/total*100,1)}% "
+                f"均收益{round(sum(returns)/len(returns),2)}%"
+            )
+
+            return {
+                "total_trades": total,
+                "win_rate_pct": round(wins / total * 100, 1),
+                "avg_return_pct": round(sum(returns) / len(returns), 2),
+                "max_return_pct": round(max(returns), 2),
+                "min_return_pct": round(min(returns), 2),
+                "total_return_pct": round(sum(returns), 2),
+                "by_strategy": strategy_stats,
+                "by_type": type_stats,
+                "recent_trades": recent,
+            }
+        except Exception as e:
+            logger.error(f"获取成交统计失败: {e}")
+            return {"error": str(e)}
+        finally:
+            session.close()
+
+    @staticmethod
+    def sync_close_prices(spot_map: Dict[str, float]):
+        """
+        盘后用当日收盘价更新所有活跃持仓的 current_price。
+        spot_map: {code: close_price} 来自当日快照或历史数据。
+        同时将旧的 current_price 保存为 prev_close_price（用于次日计算今日涨跌）。
+        """
+        if not spot_map:
+            return
+        session = db_manager.get_session()
+        try:
+            holdings = session.query(Holding).filter(Holding.status == "HOLDING").all()
+            updated = 0
+            for h in holdings:
+                close_px = spot_map.get(h.code, 0)
+                if close_px > 0:
+                    h.prev_close_price = h.current_price if h.current_price > 0 else close_px
+                    h.current_price = close_px
+                    if h.cost_price > 0:
+                        h.profit_rate = round((close_px - h.cost_price) / h.cost_price * 100, 2)
+                    updated += 1
+            if updated:
+                session.commit()
+                logger.info(f"盘后同步 {updated} 只持仓收盘价，prev_close 已保存")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"同步收盘价失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_daily_pnl_report() -> Dict[str, Any]:
+        """
+        生成每日盈亏报告，包含：
+        - 今日盈亏（浮动变化 + 今日平仓已实现）
+        - 累计总盈亏（全部已实现 + 当前浮动）
+        - 当前持仓明细
+        用于盘后 15:30 推送。
+        """
+        import datetime as _dt
+        session = db_manager.get_session()
+        try:
+            today_str = _dt.datetime.now().strftime("%Y-%m-%d")
+
+            # ----- 当前持仓（浮动盈亏）-----
+            active = session.query(Holding).filter(Holding.status == "HOLDING").all()
+            holdings_detail = []
+            total_unrealized_pnl = 0.0
+            total_today_pnl = 0.0
+
+            for h in active:
+                if h.cost_price > 0:
+                    unrealized = (h.current_price - h.cost_price) / h.cost_price * 100 if h.current_price > 0 else 0.0
+                    # 今日涨跌 = (当前价 - 昨收) / 昨收
+                    today_change = 0.0
+                    if h.prev_close_price > 0 and h.current_price > 0:
+                        today_change = (h.current_price - h.prev_close_price) / h.prev_close_price * 100
+                else:
+                    unrealized = 0.0
+                    today_change = 0.0
+
+                pnl_amount = (h.current_price - h.cost_price) * h.quantity if h.current_price > 0 and h.cost_price > 0 else 0.0
+                today_amount = (h.current_price - h.prev_close_price) * h.quantity if h.current_price > 0 and h.prev_close_price > 0 else 0.0
+
+                total_unrealized_pnl += pnl_amount
+                total_today_pnl += today_amount
+
+                holdings_detail.append({
+                    "code": h.code,
+                    "name": h.name,
+                    "cost_price": h.cost_price,
+                    "current_price": h.current_price,
+                    "prev_close": h.prev_close_price,
+                    "profit_pct": round(unrealized, 2),
+                    "today_change_pct": round(today_change, 2),
+                    "pnl_amount": round(pnl_amount, 2),
+                    "today_amount": round(today_amount, 2),
+                    "quantity": h.quantity,
+                    "buy_date": h.buy_date,
+                    "strategy": h.buy_strategy or "",
+                    "type": h.holding_type or "",
+                })
+
+            # 按浮动盈亏排序
+            holdings_detail.sort(key=lambda x: x["profit_pct"], reverse=True)
+
+            # ----- 今日平仓（已实现盈亏）-----
+            today_closed = session.query(Holding).filter(
+                Holding.status == "CLOSED",
+                Holding.updated_at >= today_str
+            ).all()
+
+            today_realized_pnl = 0.0
+            today_closed_detail = []
+            for h in today_closed:
+                if h.cost_price > 0 and h.sell_price > 0:
+                    realized = (h.sell_price - h.cost_price) / h.cost_price * 100
+                    amount = (h.sell_price - h.cost_price) * h.quantity
+                else:
+                    realized = 0.0
+                    amount = 0.0
+                today_realized_pnl += amount
+                today_closed_detail.append({
+                    "code": h.code,
+                    "name": h.name,
+                    "return_pct": round(realized, 2),
+                    "amount": round(amount, 2),
+                    "strategy": h.buy_strategy or "",
+                })
+
+            # ----- 全部已实现盈亏（累计）-----
+            all_closed = session.query(Holding).filter(Holding.status == "CLOSED").all()
+            total_realized_pnl = 0.0
+            total_closed_count = len(all_closed)
+            closed_wins = 0
+            for h in all_closed:
+                if h.cost_price > 0 and h.sell_price > 0:
+                    amount = (h.sell_price - h.cost_price) * h.quantity
+                    total_realized_pnl += amount
+                    if h.sell_price > h.cost_price:
+                        closed_wins += 1
+
+            # ----- 汇总 -----
+            today_total_pnl = today_realized_pnl + total_today_pnl
+            cumulative_total_pnl = total_realized_pnl + total_unrealized_pnl
+            active_count = len(active)
+            today_closed_count = len(today_closed)
+
+            # 计算增减百分比（相对总成本）
+            total_cost = sum(h.cost_price * h.quantity for h in active if h.cost_price > 0)
+            total_cost += sum(h.cost_price * h.quantity for h in all_closed if h.cost_price > 0)
+            total_pnl_pct = round(cumulative_total_pnl / total_cost * 100, 2) if total_cost > 0 else 0.0
+            today_pnl_pct = round(today_total_pnl / total_cost * 100, 2) if total_cost > 0 else 0.0
+
+            # 活跃持仓中盈利/亏损数量
+            profit_count = sum(1 for h in holdings_detail if h["profit_pct"] > 0)
+            loss_count = sum(1 for h in holdings_detail if h["profit_pct"] < 0)
+            flat_count = active_count - profit_count - loss_count
+
+            return {
+                "date": today_str,
+                "active_positions": active_count,
+                "profit_count": profit_count,
+                "loss_count": loss_count,
+                "flat_count": flat_count,
+                # 今日
+                "today_total_pnl": round(today_total_pnl, 2),
+                "today_total_pnl_pct": today_pnl_pct,
+                "today_unrealized_pnl": round(total_today_pnl, 2),
+                "today_realized_pnl": round(today_realized_pnl, 2),
+                "today_closed_count": today_closed_count,
+                "today_closed_trades": today_closed_detail,
+                # 累计
+                "cumulative_total_pnl": round(cumulative_total_pnl, 2),
+                "cumulative_total_pnl_pct": total_pnl_pct,
+                "total_realized_pnl": round(total_realized_pnl, 2),
+                "total_unrealized_pnl": round(total_unrealized_pnl, 2),
+                "total_closed_count": total_closed_count,
+                "total_closed_win_rate": round(closed_wins / total_closed_count * 100, 1) if total_closed_count > 0 else 0,
+                # 明细
+                "holdings": holdings_detail,
+            }
+        except Exception as e:
+            logger.error(f"生成每日盈亏报告失败: {e}")
+            return {"error": str(e)}
         finally:
             session.close()
 
@@ -540,6 +804,367 @@ class ErrorLogManager:
                 }
                 for l in logs
             ]
+        finally:
+            session.close()
+
+
+class MarketIndexManager:
+    """大盘指数日线数据管理"""
+
+    @staticmethod
+    def save_daily_index(trade_date: str, spot_df=None):
+        """
+        保存当日大盘指数数据。
+        优先从 akshare 获取真实指数，失败则从全市场快照估算。
+        """
+        import numpy as np
+
+        session = db_manager.get_session()
+        try:
+            # 检查是否已存在
+            existing = session.query(MarketIndex).filter(
+                MarketIndex.trade_date == trade_date
+            ).first()
+            if existing:
+                return
+
+            sh_close, sh_change = MarketIndexManager._fetch_index("sh000001")
+            sz_close, sz_change = MarketIndexManager._fetch_index("sz399001")
+            gem_close, gem_change = MarketIndexManager._fetch_index("sz399006")
+
+            total_amt = 0.0
+            if spot_df is not None and not spot_df.empty and "amount" in spot_df.columns:
+                total_amt = round(float(spot_df["amount"].sum()) / 1e8, 2)
+
+            record = MarketIndex(
+                trade_date=trade_date,
+                sh_close=sh_close,
+                sh_change_pct=sh_change,
+                sz_close=sz_close,
+                sz_change_pct=sz_change,
+                gem_close=gem_close,
+                gem_change_pct=gem_change,
+                total_amount=total_amt,
+            )
+            session.add(record)
+            session.commit()
+            logger.info(
+                f"大盘指数已保存: 上证{sh_close}({sh_change:+.2f}%) "
+                f"深证{sz_close}({sz_change:+.2f}%) 创业板{gem_close}({gem_change:+.2f}%)"
+            )
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"保存大盘指数失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def _fetch_index(symbol: str) -> tuple:
+        """获取单个指数最新收盘价和涨跌幅，失败返回 (0, 0)"""
+        try:
+            import akshare as ak
+            df = ak.stock_zh_index_daily(symbol=symbol)
+            if df is not None and not df.empty:
+                close = float(pd.to_numeric(df["close"].iloc[-1]))
+                # 计算涨跌幅：相对于前一日收盘
+                if len(df) >= 2:
+                    prev = float(pd.to_numeric(df["close"].iloc[-2]))
+                    change = round((close - prev) / prev * 100, 2) if prev > 0 else 0.0
+                else:
+                    change = 0.0
+                return round(close, 2), change
+        except Exception:
+            pass
+        return 0.0, 0.0
+
+    @staticmethod
+    def get_latest() -> Optional[Dict[str, Any]]:
+        """获取最新一条指数数据"""
+        from database.models import MarketIndex
+        session = db_manager.get_session()
+        try:
+            record = session.query(MarketIndex).order_by(
+                MarketIndex.trade_date.desc()
+            ).first()
+            if record:
+                return {
+                    "trade_date": record.trade_date,
+                    "sh_close": record.sh_close,
+                    "sh_change_pct": record.sh_change_pct,
+                    "sz_close": record.sz_close,
+                    "sz_change_pct": record.sz_change_pct,
+                    "gem_close": record.gem_close,
+                    "gem_change_pct": record.gem_change_pct,
+                    "total_amount": record.total_amount,
+                }
+            return None
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_recent(days: int = 5) -> List[Dict[str, Any]]:
+        """获取最近 N 个交易日的大盘指数"""
+        from database.models import MarketIndex
+        session = db_manager.get_session()
+        try:
+            records = session.query(MarketIndex).order_by(
+                MarketIndex.trade_date.desc()
+            ).limit(days).all()
+            return [{
+                "trade_date": r.trade_date,
+                "sh_close": r.sh_close,
+                "sh_change_pct": r.sh_change_pct,
+                "sz_close": r.sz_close,
+                "sz_change_pct": r.sz_change_pct,
+                "gem_close": r.gem_close,
+                "gem_change_pct": r.gem_change_pct,
+                "total_amount": r.total_amount,
+            } for r in records]
+        finally:
+            session.close()
+
+
+class DailySnapshotManager:
+    """每日净值快照与绩效跟踪"""
+
+    @staticmethod
+    def save_snapshot(trade_date: str, pnl_report: dict, sh_change_pct: float = 0.0):
+        """从每日盈亏报告提取关键指标落库"""
+        from database.models import DailyEquitySnapshot
+        session = db_manager.get_session()
+        try:
+            existing = session.query(DailyEquitySnapshot).filter(
+                DailyEquitySnapshot.trade_date == trade_date
+            ).first()
+            if existing:
+                return
+
+            total_equity = 1_000_000 + pnl_report.get("cumulative_total_pnl", 0)
+            snapshot = DailyEquitySnapshot(
+                trade_date=trade_date,
+                total_equity=round(total_equity, 2),
+                available_cash=round(total_equity - pnl_report.get("total_unrealized_pnl", 0), 2),
+                position_value=round(total_equity - (total_equity - pnl_report.get("total_unrealized_pnl", 0)), 2),
+                unrealized_pnl=pnl_report.get("total_unrealized_pnl", 0),
+                today_realized_pnl=pnl_report.get("today_realized_pnl", 0),
+                total_realized_pnl=pnl_report.get("total_realized_pnl", 0),
+                position_count=pnl_report.get("active_positions", 0),
+                today_pnl_pct=pnl_report.get("today_total_pnl_pct", 0),
+                cumulative_pnl_pct=pnl_report.get("cumulative_total_pnl_pct", 0),
+                sh_change_pct=sh_change_pct,
+            )
+            session.add(snapshot)
+            session.commit()
+            logger.info(f"净值快照已保存: 权益={total_equity:.0f} 持仓{snapshot.position_count}只")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"保存净值快照失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_equity_curve(days: int = 60) -> List[Dict[str, Any]]:
+        """获取净值曲线（最近 N 天）"""
+        from database.models import DailyEquitySnapshot
+        session = db_manager.get_session()
+        try:
+            records = session.query(DailyEquitySnapshot).order_by(
+                DailyEquitySnapshot.trade_date.asc()
+            ).limit(days).all() if days <= 60 else session.query(DailyEquitySnapshot).order_by(
+                DailyEquitySnapshot.trade_date.asc()
+            ).all()
+            return [{
+                "date": r.trade_date,
+                "equity": r.total_equity,
+                "pnl_pct": r.today_pnl_pct,
+                "cumulative_pct": r.cumulative_pnl_pct,
+                "sh_pct": r.sh_change_pct,
+                "positions": r.position_count,
+            } for r in records]
+        finally:
+            session.close()
+
+
+class ZtPoolManager:
+    """涨停池明细管理"""
+
+    @staticmethod
+    def save_daily_zt_pool(trade_date: str, zt_df):
+        """保存当日涨停池明细，幂等（已有当天数据则跳过）"""
+        from database.models import DailyZtPool
+        if zt_df is None or zt_df.empty:
+            return
+        session = db_manager.get_session()
+        try:
+            existing = session.query(DailyZtPool).filter(
+                DailyZtPool.trade_date == trade_date
+            ).first()
+            if existing:
+                return
+
+            count = 0
+            for _, row in zt_df.iterrows():
+                zt = DailyZtPool(
+                    trade_date=trade_date,
+                    code=str(row.get("code", "")),
+                    name=str(row.get("name", "")),
+                    price=float(row.get("price", 0)),
+                    change_pct=float(row.get("change_pct", 0)),
+                    lbc=int(row.get("lbc", 1)) if "lbc" in row.index else 1,
+                    seal_amount=float(row.get("seal_amount", 0)),
+                    first_seal_time=str(row.get("first_seal_time", "")) if "first_seal_time" in row.index else "",
+                    open_count=int(row.get("open_count", 0)) if "open_count" in row.index else 0,
+                    industry=str(row.get("industry", "")) if "industry" in row.index else "",
+                    amount=float(row.get("amount", 0)),
+                    turnover_rate=float(row.get("turnover_rate", 0)) if "turnover_rate" in row.index else 0,
+                    circ_market_cap=float(row.get("circ_market_cap", 0)) if "circ_market_cap" in row.index else 0,
+                )
+                session.add(zt)
+                count += 1
+
+            session.commit()
+            logger.info(f"涨停池明细已保存: {trade_date} {count}只涨停")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"保存涨停池明细失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_industry_zt_trend(industry: str, days: int = 20) -> List[Dict[str, Any]]:
+        """查询某行业最近 N 天的涨停数量趋势"""
+        from database.models import DailyZtPool
+        session = db_manager.get_session()
+        try:
+            from sqlalchemy import func
+            records = session.query(
+                DailyZtPool.trade_date,
+                func.count(DailyZtPool.id).label("zt_count"),
+                func.max(DailyZtPool.lbc).label("max_lbc"),
+            ).filter(
+                DailyZtPool.industry == industry
+            ).group_by(DailyZtPool.trade_date).order_by(
+                DailyZtPool.trade_date.desc()
+            ).limit(days).all()
+            return [{"date": r.trade_date, "zt_count": r.zt_count, "max_lbc": r.max_lbc} for r in records]
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_top_dragons(limit: int = 10) -> List[Dict[str, Any]]:
+        """获取最新交易日的涨停龙头（按连板数降序）"""
+        from database.models import DailyZtPool
+        session = db_manager.get_session()
+        try:
+            latest_date = session.query(DailyZtPool.trade_date).order_by(
+                DailyZtPool.trade_date.desc()
+            ).first()
+            if not latest_date:
+                return []
+            records = session.query(DailyZtPool).filter(
+                DailyZtPool.trade_date == latest_date[0]
+            ).order_by(DailyZtPool.lbc.desc()).limit(limit).all()
+            return [{"code": r.code, "name": r.name, "lbc": r.lbc,
+                     "industry": r.industry or "", "price": r.price,
+                     "change_pct": r.change_pct,
+                     "_date": latest_date[0]} for r in records]
+        finally:
+            session.close()
+
+
+class SectorStrengthManager:
+    """板块强度管理"""
+
+    @staticmethod
+    def save_daily_sectors(trade_date: str, zt_df):
+        """从涨停池按行业聚合，计算板块强度落库"""
+        from database.models import SectorStrength
+        if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
+            return
+        session = db_manager.get_session()
+        try:
+            existing = session.query(SectorStrength).filter(
+                SectorStrength.trade_date == trade_date
+            ).first()
+            if existing:
+                return
+
+            # 按行业分组统计
+            industry_groups = zt_df.groupby(zt_df["industry"].astype(str))
+            count = 0
+            for sector, group in industry_groups:
+                if not sector or sector == "nan":
+                    continue
+                zt_count = len(group)
+                if zt_count < 2:  # 少于 2 只涨停的板块不存
+                    continue
+
+                # 领涨标的
+                top_codes = group.sort_values("lbc", ascending=False).head(5) if "lbc" in group.columns else group.head(3)
+                top_list = [f"{str(r['code'])}:{str(r['name'])}" for _, r in top_codes.iterrows()]
+
+                # 上日同板块涨停数
+                prev_count = SectorStrengthManager._get_prev_zt_count(
+                    session, trade_date, sector
+                )
+
+                ss = SectorStrength(
+                    trade_date=trade_date,
+                    sector_name=sector,
+                    zt_count=zt_count,
+                    prev_zt_count=prev_count,
+                    acceleration=zt_count - prev_count,
+                    total_stocks=0,
+                    zt_ratio_pct=0.0,
+                    top_stocks=",".join(top_list[:5]),
+                )
+                session.add(ss)
+                count += 1
+
+            session.commit()
+            logger.info(f"板块强度已保存: {trade_date} {count}个活跃板块")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"保存板块强度失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def _get_prev_zt_count(session, trade_date: str, sector: str) -> int:
+        """查询同板块上日涨停数"""
+        from database.models import SectorStrength, DailyZtPool
+        # 先从 sector_strength 表查
+        from sqlalchemy import desc
+        prev = session.query(SectorStrength).filter(
+            SectorStrength.sector_name == sector,
+            SectorStrength.trade_date < trade_date,
+        ).order_by(desc(SectorStrength.trade_date)).first()
+        if prev:
+            return prev.zt_count
+        return 0
+
+    @staticmethod
+    def get_hot_sectors(date_str: str = None, top_n: int = 10) -> List[Dict[str, Any]]:
+        """查询某日热门板块，默认最新交易日"""
+        from database.models import SectorStrength
+        session = db_manager.get_session()
+        try:
+            if date_str is None:
+                latest = session.query(SectorStrength.trade_date).order_by(
+                    SectorStrength.trade_date.desc()
+                ).first()
+                date_str = latest[0] if latest else ""
+            records = session.query(SectorStrength).filter(
+                SectorStrength.trade_date == date_str
+            ).order_by(SectorStrength.zt_count.desc()).limit(top_n).all()
+            return [{
+                "sector": r.sector_name,
+                "zt_count": r.zt_count,
+                "prev_count": r.prev_zt_count,
+                "accel": r.acceleration,
+                "top_stocks": r.top_stocks,
+                "_date": date_str,
+            } for r in records]
         finally:
             session.close()
 
