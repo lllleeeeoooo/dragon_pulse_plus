@@ -429,6 +429,9 @@ class DataFetcher:
             "市盈率-动态": "pe_ttm", "市净率": "pb",
             "总市值": "total_market_cap", "流通市值": "circ_market_cap",
         })
+        # 东财成交量单位为"手"，统一转换为"股"（与新浪一致）
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0) * 100
         return df
 
     _cached_total_amount: float = 0.0

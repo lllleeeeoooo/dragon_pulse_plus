@@ -28,7 +28,8 @@ class HoldingMonitor:
         was_limit_up_today: bool,
         market_max_lbc: int = 5,
         market_zhaban_rate: float = 20.0,
-        holding_days: int = 0
+        holding_days: int = 0,
+        buy_strategy: str = ""
     ) -> List[Dict[str, Any]]:
         """
         检查单只持仓股票是否触卖出/减仓/止损信号
@@ -48,20 +49,32 @@ class HoldingMonitor:
             return signals  # 绝对止损直接返回，不再检查其他规则
 
         # 规则 1：断板必卖 (针对短线龙头/连板股)
-        if was_limit_up_today and not is_limit_up:
+        # 条件：曾封板 + 当前未封板 + 价格已跌破分时均线（排除正常的炸板回封过程）
+        if was_limit_up_today and not is_limit_up and current_price < avg_vwap_price:
             signals.append({
                 "type": "断板必卖",
                 "level": "CRITICAL",
-                "reason": f"标的 {stock_name}({stock_code}) 今日曾封涨停但当前炸板断板，符合龙头断板必卖原则，建议规避跌停风险立刻减仓/清仓。"
+                "reason": f"标的 {stock_name}({stock_code}) 今日曾封涨停但炸板后跌破分时均线({avg_vwap_price:.2f})，回封概率低，建议立刻减仓/清仓。"
             })
 
-        # 规则 2：破位止损 (跌破分时均线且跌破5日线)
-        if current_price < avg_vwap_price and ma5_price > 0 and current_price < ma5_price:
-            signals.append({
-                "type": "破位止损",
-                "level": "HIGH",
-                "reason": f"标的 {stock_name}({stock_code}) 当前现价({current_price}) 已破分时均线({avg_vwap_price}) 且跌破5日均线({ma5_price})，建议及时止损/止盈。"
-            })
+        # 规则 2：破位止损 (按策略区分灵敏度)
+        # 打板/接力股：跌破VWAP即触发（短线资金不容忍水下运行）
+        # 低吸/中军股：需跌破MA5才触发（日内VWAP波动大，MA5更可靠）
+        is_relay_strategy = any(k in buy_strategy for k in ("打板", "接力", "AI自动"))
+        if is_relay_strategy:
+            if current_price < avg_vwap_price:
+                signals.append({
+                    "type": "破位止损",
+                    "level": "HIGH",
+                    "reason": f"标的 {stock_name}({stock_code}) 打板/接力策略，现价({current_price})跌破分时均线({avg_vwap_price:.2f})，建议止损。"
+                })
+        else:
+            if ma5_price > 0 and current_price < ma5_price:
+                signals.append({
+                    "type": "破位止损",
+                    "level": "HIGH",
+                    "reason": f"标的 {stock_name}({stock_code}) 低吸策略，现价({current_price})跌破5日均线({ma5_price:.2f})，建议止损。"
+                })
 
         # 规则 3：情绪到顶预警 (市场环境风控，阈值可通过 settings 配置)
         if market_max_lbc >= settings.EMOTION_TOP_MAX_LBC and market_zhaban_rate > settings.EMOTION_TOP_ZHABAN_RATE:
@@ -77,6 +90,20 @@ class HoldingMonitor:
                 "type": "时间止损",
                 "level": "WARNING",
                 "reason": f"标的 {stock_name}({stock_code}) 已持仓 {holding_days} 天且仍亏损 {profit_pct}%，短线资金效率低下，建议换股。"
+            })
+
+        # 规则 5：止盈提醒 (盈利较大时逢高落袋)
+        if profit_pct >= settings.TAKE_PROFIT_CRITICAL_PCT:
+            signals.append({
+                "type": "逢高止盈",
+                "level": "HIGH",
+                "reason": f"标的 {stock_name}({stock_code}) 盈利已达 {profit_pct}%（超过{settings.TAKE_PROFIT_CRITICAL_PCT}%强止盈线），短线应锁定利润，逢高分批卖出！"
+            })
+        elif profit_pct >= settings.TAKE_PROFIT_WARN_PCT:
+            signals.append({
+                "type": "止盈提醒",
+                "level": "WARNING",
+                "reason": f"标的 {stock_name}({stock_code}) 盈利已达 {profit_pct}%（超过{settings.TAKE_PROFIT_WARN_PCT}%），建议设置移动止盈或逢高减仓。"
             })
 
         return signals

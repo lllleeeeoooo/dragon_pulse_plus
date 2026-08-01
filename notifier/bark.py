@@ -53,7 +53,10 @@ class BarkNotifier:
     """
     Bark 消息推送封装类。
     超长内容自动分批推送，末尾 JSON 块自动去除。
+    内置频率限制：每分钟最多推送 MAX_PER_MINUTE 条，防止极端行情下刷屏。
     """
+
+    MAX_PER_MINUTE = 8
 
     def __init__(
         self,
@@ -68,6 +71,7 @@ class BarkNotifier:
         self.group = group or settings.BARK_GROUP
         self.sound = sound or settings.BARK_SOUND
         self.enabled = enabled if enabled is not None else settings.BARK_ENABLED
+        self._send_timestamps: List[float] = []
 
     def _persist_log(self, title: str, body: str, group: str, level: str,
                      sound: str, success: bool, error_msg: str = ""):
@@ -139,7 +143,18 @@ class BarkNotifier:
     ) -> bool:
         """
         发送 Bark 消息通知。超长内容自动分批，末尾 JSON 块自动去除。
+        内置频率限制防止刷屏。
         """
+        import time as _time
+
+        # 频率限制：清理超过60秒的时间戳，检查是否超限
+        now = _time.time()
+        self._send_timestamps = [t for t in self._send_timestamps if now - t < 60]
+        if len(self._send_timestamps) >= self.MAX_PER_MINUTE:
+            logger.warning(f"[Bark 频率限制] 每分钟已推送{self.MAX_PER_MINUTE}条，跳过: {title[:30]}")
+            self._persist_log(title, body, group or self.group, level, sound or self.sound, False, "频率限制跳过")
+            return False
+        self._send_timestamps.append(now)
         resolved_group = group or self.group
         resolved_sound = sound or self.sound
 

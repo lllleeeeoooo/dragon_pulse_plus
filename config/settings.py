@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     # ==================== 止损配置 ====================
     ABSOLUTE_STOP_LOSS_PCT: float = Field(default=-7.0, description="绝对止损线(%)，亏损超过此值无条件触发卖出")
     TIME_STOP_LOSS_DAYS: int = Field(default=3, description="时间止损天数，持仓超过N天且未盈利则触发警告")
+    TAKE_PROFIT_WARN_PCT: float = Field(default=15.0, description="止盈提醒线(%)，盈利超过此值触发WARNING")
+    TAKE_PROFIT_CRITICAL_PCT: float = Field(default=20.0, description="强止盈线(%)，盈利超过此值且从高点回落则触发CRITICAL")
 
     # ==================== Bark 推送配置 ====================
     BARK_TOKEN: str = Field(default="", description="Bark 推送 Device Key")
@@ -58,6 +60,7 @@ class Settings(BaseSettings):
     MAX_AI_POSITIONS: int = Field(default=5, description="AI自动持仓最大数量，超出不再买入")
     MAX_DAILY_BUYS: int = Field(default=3, description="AI每日最大自动买入次数")
     DAILY_LOSS_CIRCUIT_BREAKER: float = Field(default=-5.0, description="AI持仓当日总亏损熔断阈值(%)，触发后停止买入")
+    INDEX_DROP_CIRCUIT_BREAKER: float = Field(default=-2.0, description="大盘均涨幅跌破此值时触发系统级熔断，停止所有自动买入(%)")
 
     # ==================== 股票过滤配置 ====================
     EXCLUDE_STAR_MARKET: bool = Field(default=True, description="是否排除科创板股票 (688开头)")

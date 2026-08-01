@@ -62,6 +62,9 @@ class MarketMonitor:
         # 情绪周期：每日加载一次昨日周期阶段
         self._cycle_phase: str = ""
         self._cycle_stance: Dict[str, Any] = {}
+        # 竞价监控：09:15-09:25采集数据
+        self._auction_snapshots: List[Dict[str, Any]] = []
+        self._auction_summary_sent: bool = False
 
     def _reset_daily_state(self):
         """新交易日重置所有去重集合，输出盘前启动日志"""
@@ -84,6 +87,10 @@ class MarketMonitor:
             self._alerted_sector_names.clear()
             self._current_sector_counts.clear()
             self._llm_alert_calls_today = 0
+            self._auction_snapshots.clear()
+            self._auction_summary_sent = False
+            self._index_breaker_alerted = False
+            self._promotion_rate_cache = None
             HoldingManager.reset_all_limit_up_flags()
             RecommendationManager.expire_old_recommendations(before_date=today)
             # 加载昨日情绪周期阶段
@@ -148,8 +155,10 @@ class MarketMonitor:
             "breadth": zt_count - dt_count, "yield_rate": premium_data.get("intraday_premium", 0),
             "seal_force_ratio": 0, "yidong_bravery": 50,
         }
-        score_premium = min(max((emotion["yield_rate"] + 3) * 12.5, 0), 100)
-        score_height = min(market_max_lbc * 12, 100)       # 9板≈满分
+        _p = emotion["yield_rate"]
+        score_premium = max(min((_p + 3) * (100 / 7), 100), 0) if _p < 0 else max(min(50 + _p * (50 / 4), 100), 50)
+        _hm = {0: 0, 1: 15, 2: 30, 3: 50, 4: 65, 5: 78, 6: 88, 7: 95}
+        score_height = _hm.get(market_max_lbc, 100) if market_max_lbc <= 7 else 100
         score_breadth = max(min(((zt_count - dt_count) + 40) * 1.0, 100), 0)  # 涨停多→高分
         score_support = max(100 - market_zhaban_rate * 2.5, 0)
         emotion["sentiment_index"] = round(
@@ -206,6 +215,14 @@ class MarketMonitor:
         a_end = datetime.time(15, 0)
 
         return (m_start <= current_time <= m_end) or (a_start <= current_time <= a_end)
+
+    def is_auction_time(self) -> bool:
+        """判断是否在集合竞价观察窗口 (09:15-09:25)"""
+        now = datetime.datetime.now()
+        if now.weekday() >= 5:
+            return False
+        current_time = now.time()
+        return datetime.time(9, 15) <= current_time <= datetime.time(9, 25)
 
     def _refresh_pool_cache(self):
         """刷新涨停池/炸板池缓存（每 60 秒一次），同时检测封单衰减"""
@@ -474,10 +491,11 @@ class MarketMonitor:
             "_premium_source": self._premium_cache.get("source", ""),
         }
 
-        # 情绪分公式 (动态权重)
-        # 溢价占40% + 宽度占40% + 高度占20%
-        score_premium = min(max((premium + 3) * 12.5, 0), 100)  # -3%→0分, +3%→75分
-        score_height = min(market_max_lbc * 12, 100)       # 9板≈满分
+        # 情绪分公式 (动态权重, 0%溢价=50分中性锚点)
+        _p2 = premium
+        score_premium = max(min((_p2 + 3) * (100 / 7), 100), 0) if _p2 < 0 else max(min(50 + _p2 * (50 / 4), 100), 50)
+        _hm2 = {0: 0, 1: 15, 2: 30, 3: 50, 4: 65, 5: 78, 6: 88, 7: 95}
+        score_height = _hm2.get(market_max_lbc, 100) if market_max_lbc <= 7 else 100
         score_breadth = max(min(((zt_count - dt_count) + 40) * 1.0, 100), 0)  # 涨停多→高分
         score_support = max(100 - market_zhaban_rate * 2.5, 0)
         emotion["sentiment_index"] = round(
@@ -545,7 +563,102 @@ class MarketMonitor:
         # 情绪周期阶段
         style["cycle_phase"] = self._cycle_phase or "未知"
         style["cycle_stance"] = self._cycle_stance.get("stance", "未知")
+        # 连板晋级率（每日首次计算后缓存）
+        if getattr(self, '_promotion_rate_cache', None) is None:
+            self._promotion_rate_cache = self._compute_promotion_rate()
+        style["promotion_rate"] = self._promotion_rate_cache
         return style
+
+    def _check_auction_phase(self):
+        """
+        集合竞价窗口（09:15-09:25）监控：
+        每30秒采集一次全市场快照，追踪竞价量能趋势。
+        09:25时生成竞价预判摘要并推送。
+        """
+        now = datetime.datetime.now()
+
+        try:
+            spot_df = DataFetcher.get_realtime_spot()
+            if spot_df.empty:
+                return
+
+            # 采集竞价快照摘要
+            high_open = spot_df[spot_df["change_pct"] >= 5.0] if "change_pct" in spot_df.columns else pd.DataFrame()
+            low_open = spot_df[spot_df["change_pct"] <= -5.0] if "change_pct" in spot_df.columns else pd.DataFrame()
+
+            total_amount = float(spot_df["amount"].sum()) if "amount" in spot_df.columns else 0
+            avg_change = float(spot_df["change_pct"].mean()) if "change_pct" in spot_df.columns else 0
+
+            snapshot = {
+                "time": now.strftime("%H:%M:%S"),
+                "total_amount_yi": round(total_amount / 1e8, 1),
+                "high_open_count": len(high_open),
+                "low_open_count": len(low_open),
+                "avg_change": round(avg_change, 2),
+            }
+            self._auction_snapshots.append(snapshot)
+            logger.debug(f"竞价采集 {snapshot['time']}: 高开{snapshot['high_open_count']}只 低开{snapshot['low_open_count']}只 均涨{snapshot['avg_change']}%")
+
+            # 09:24-09:25推送竞价预判（只发一次）
+            if now.minute >= 24 and not self._auction_summary_sent:
+                self._auction_summary_sent = True
+                self._send_auction_summary(spot_df)
+
+        except Exception as e:
+            logger.warning(f"竞价监控异常: {e}")
+
+    def _send_auction_summary(self, spot_df: pd.DataFrame):
+        """生成并推送竞价预判摘要"""
+        snapshots = self._auction_snapshots
+        if not snapshots:
+            return
+
+        # 量能趋势：对比首次和末次采集的成交额
+        first_amt = snapshots[0]["total_amount_yi"]
+        last_amt = snapshots[-1]["total_amount_yi"]
+        amt_trend = "放量" if last_amt > first_amt * 1.5 else ("缩量" if last_amt < first_amt * 0.7 else "平稳")
+
+        # 高开股趋势
+        first_high = snapshots[0]["high_open_count"]
+        last_high = snapshots[-1]["high_open_count"]
+        high_trend = f"{first_high}→{last_high}只"
+
+        # 均涨幅变化
+        first_avg = snapshots[0]["avg_change"]
+        last_avg = snapshots[-1]["avg_change"]
+
+        # 找出竞价涨幅最高的标的（潜在龙头）
+        top_stocks = ""
+        if not spot_df.empty and "change_pct" in spot_df.columns:
+            top = spot_df.nlargest(5, "change_pct")
+            top_lines = []
+            for _, r in top.iterrows():
+                top_lines.append(f"{r.get('name','')}({r.get('code','')}) +{r.get('change_pct',0):.1f}%")
+            top_stocks = " / ".join(top_lines)
+
+        # 情绪预判
+        if last_avg >= 1.0 and last_high >= 20:
+            mood = "偏强，关注强势股能否维持高开"
+        elif last_avg <= -0.5 or snapshots[-1]["low_open_count"] >= 20:
+            mood = "偏弱，注意低开风险，谨慎参与"
+        else:
+            mood = "中性震荡，等待09:30方向确认"
+
+        body = (
+            f"竞价量能: {amt_trend}({first_amt}→{last_amt}亿)\n"
+            f"高开>5%: {high_trend}\n"
+            f"均涨幅: {first_avg}%→{last_avg}%\n"
+            f"情绪预判: {mood}\n"
+            f"竞价龙头: {top_stocks}"
+        )
+
+        logger.info(f"竞价预判摘要: {body}")
+        bark_notifier.send(
+            title=f"📊 [竞价预判] {'偏强' if last_avg >= 0.5 else '偏弱' if last_avg <= -0.3 else '中性'}",
+            body=body,
+            group="竞价指令",
+            level="timeSensitive"
+        )
 
     def _load_cycle_phase(self):
         """每日加载一次前一交易日的情绪周期阶段"""
@@ -563,6 +676,88 @@ class MarketMonitor:
             logger.warning(f"加载情绪周期失败: {e}")
             self._cycle_phase = ""
             self._cycle_stance = {"allow_auto_buy": True, "only_recommended": False, "stance": "未知"}
+
+    def _compute_promotion_rate(self) -> float:
+        """
+        计算连板晋级率：昨日连板>=2的股票中，今日仍在涨停池的比例。
+        反映市场"接力赚钱效应"强弱。每日首次刷新池时计算一次。
+        """
+        try:
+            from core.trade_calendar import get_previous_trading_day
+            yesterday = get_previous_trading_day()
+            yesterday_zt = DataFetcher.get_zt_pool(date_str=yesterday)
+            today_zt = self._zt_pool_cache
+
+            if yesterday_zt is None or yesterday_zt.empty or "lbc" not in yesterday_zt.columns:
+                return -1.0
+            if today_zt is None or today_zt.empty:
+                return 0.0
+
+            # 昨日连板>=2的股票
+            relay_stocks = yesterday_zt[yesterday_zt["lbc"].astype(int) >= 2]
+            if relay_stocks.empty:
+                return -1.0
+
+            relay_codes = set(relay_stocks["code"].astype(str))
+            today_codes = set(today_zt["code"].astype(str))
+            promoted = relay_codes & today_codes
+
+            rate = round(len(promoted) / len(relay_codes) * 100, 1)
+            return rate
+        except Exception as e:
+            logger.debug(f"计算晋级率失败: {e}")
+            return -1.0
+
+    @staticmethod
+    def _check_open_requirement(open_change_pct: float, requirement: str) -> bool:
+        """
+        验证开盘涨幅是否满足推荐标的的 open_requirement。
+        解析格式如 "+3%~+6%", "高开>3%", "平开或低开" 等。
+        """
+        import re
+        req = requirement.strip()
+        if not req:
+            return True
+
+        # 匹配 "+3%~+6%" 或 "-1%~+2%" 格式
+        range_match = re.search(r'([+-]?\d+\.?\d*)%?\s*[~～至到]\s*([+-]?\d+\.?\d*)%?', req)
+        if range_match:
+            low = float(range_match.group(1))
+            high = float(range_match.group(2))
+            return low <= open_change_pct <= high
+
+        # 匹配 ">3%" 或 ">=2%" 格式
+        gt_match = re.search(r'[>≥]\s*([+-]?\d+\.?\d*)%?', req)
+        if gt_match:
+            threshold = float(gt_match.group(1))
+            return open_change_pct >= threshold
+
+        # 匹配 "高开" 关键词
+        if "高开" in req:
+            return open_change_pct >= 2.0
+
+        # 匹配 "平开" 或 "低开"
+        if "平开" in req or "低开" in req:
+            return open_change_pct <= 1.5
+
+        # 无法解析的条件，放行
+        return True
+
+    def _is_bad_intraday_pattern(self, code: str) -> bool:
+        """
+        检测个股分时形态是否不利于买入。
+        冲高回落/放量滞涨/天地板 → 返回True（不宜买入）。
+        为避免API频繁调用，仅在成交额>5亿的标的上检测。
+        """
+        try:
+            patterns = DataFetcher.detect_intraday_patterns(code)
+            bad_patterns = {"冲高回落", "放量滞涨", "天地板", "尾盘砸盘"}
+            if bad_patterns & set(patterns):
+                logger.debug(f"{code} 分时形态不佳: {patterns}，跳过买入")
+                return True
+        except Exception:
+            pass
+        return False
 
     def _is_daily_loss_breaker_triggered(self, ai_holdings: list) -> bool:
         """检查AI持仓当日总亏损是否触发熔断"""
@@ -616,7 +811,12 @@ class MarketMonitor:
                     time.sleep(300)  # 非交易日5分钟检查一次，不浪费API
                     continue
 
-                if self.is_trading_time():
+                if self.is_auction_time():
+                    self._reset_daily_state()
+                    self._check_auction_phase()
+                    time.sleep(30)  # 竞价期间30秒采集一次
+                    continue
+                elif self.is_trading_time():
                     self._check_realtime_market()
                 else:
                     # 非交易时间清缓存
@@ -676,6 +876,19 @@ class MarketMonitor:
                 level="timeSensitive" if market_style["style"] in ("抱团", "高潮") else "active"
             )
             self._last_logged_style = market_style["style"]
+
+        # 2.8 大盘级熔断检查：全市场均涨幅跌破阈值时停止所有买入
+        market_avg_change = float(spot_df["change_pct"].mean()) if not spot_df.empty else 0.0
+        index_breaker_triggered = market_avg_change <= settings.INDEX_DROP_CIRCUIT_BREAKER
+        if index_breaker_triggered and not getattr(self, '_index_breaker_alerted', False):
+            self._index_breaker_alerted = True
+            logger.warning(f"大盘熔断: 全市场均涨幅 {market_avg_change:.2f}% <= {settings.INDEX_DROP_CIRCUIT_BREAKER}%，停止自动买入")
+            bark_notifier.send(
+                title="🛑 [大盘熔断] 系统性风险",
+                body=f"全市场均涨幅 {market_avg_change:.2f}%，触发大盘熔断阈值({settings.INDEX_DROP_CIRCUIT_BREAKER}%)。已停止所有自动买入，建议逢高减仓。",
+                group="风控提醒",
+                level="timeSensitive"
+            )
 
         # 3. 从数据库读取当前持仓与待观察推荐标的
         active_holdings = HoldingManager.get_active_holdings()
@@ -767,6 +980,15 @@ class MarketMonitor:
                 pre_close = float(row.get("pre_close", price))
                 is_one_word_board = (price >= pre_close * 1.095) and (float(row.get("low", price)) == price)
 
+                # 推荐标的竞价条件验证：检查开盘涨幅是否满足 open_requirement
+                rec_condition_met = True
+                if is_recommended:
+                    rec_info = next((r for r in pending_recs if r["code"] == code), None)
+                    if rec_info and rec_info.get("open_requirement"):
+                        open_req = rec_info["open_requirement"]
+                        open_change = round((float(row.get("open", price)) - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0
+                        rec_condition_met = self._check_open_requirement(open_change, open_req)
+
                 # 高质量信号 = 逼近封板 / 低开猛拉 / 点火异动(高质量)
                 # 高质量信号判定跟随市场风格
                 if priority_strategy == "打板接力":
@@ -789,7 +1011,9 @@ class MarketMonitor:
                 cycle_only_rec = self._cycle_stance.get("only_recommended", False)
                 if cycle_only_rec and not is_recommended:
                     cycle_allow = False
-                should_buy = cycle_allow and (is_recommended or is_high_signal) and not is_one_word_board
+                should_buy = cycle_allow and not index_breaker_triggered and (
+                    (is_recommended and rec_condition_met) or is_high_signal
+                ) and not is_one_word_board
                 buy_reason = ""
                 if should_buy and code not in self._auto_bought_codes:
                     # 仓位管理检查
@@ -800,6 +1024,8 @@ class MarketMonitor:
                         pass  # 超出当日最大买入次数，跳过
                     elif self._is_daily_loss_breaker_triggered(ai_holdings):
                         pass  # 当日总亏损熔断，跳过
+                    elif self._is_bad_intraday_pattern(code):
+                        pass  # 分时形态不佳（冲高回落/放量滞涨），跳过
                     elif not any(h["code"] == code for h in ai_holdings):
                         self._auto_bought_codes.add(code)
                         buy_reason = "复盘推荐" if is_recommended else signal_label
@@ -983,16 +1209,11 @@ class MarketMonitor:
                 ma_data = self._get_ma_prices(code)
                 ma5_price = ma_data.get("ma5") or (curr_price * 0.97)
 
-                # VWAP = 成交额 / 成交量
-                # 新浪源：成交量(股)，直接 amount/volume
-                # 东财源：成交量(手)，需 amount/(volume*100)；兜底用 OHLC 均值
+                # VWAP = 成交额 / 成交量（volume已统一为"股"）
                 raw_vol = float(row.get("volume", 0))
                 raw_amt = float(row.get("amount", 0))
                 if raw_vol > 0 and raw_amt > 0:
                     vwap = raw_amt / raw_vol
-                    # 如果 VWAP 远超合理价格（东财源手→股未转换），除以100修正
-                    if vwap > curr_price * 50:
-                        vwap = vwap / 100
                 else:
                     vwap = (float(row.get("open", curr_price)) + curr_price +
                             float(row.get("high", curr_price)) +
@@ -1019,7 +1240,8 @@ class MarketMonitor:
                     was_limit_up_today=holding.get("was_limit_up_today", False),
                     market_max_lbc=market_max_lbc if market_max_lbc > 0 else 5,
                     market_zhaban_rate=market_zhaban_rate if market_zhaban_rate > 0 else 20.0,
-                    holding_days=holding_days
+                    holding_days=holding_days,
+                    buy_strategy=holding.get("buy_strategy", "")
                 )
 
                 for sig in signals:

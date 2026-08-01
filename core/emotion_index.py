@@ -60,17 +60,28 @@ class EmotionVector:
                 logger.warning(f"计算封单力度失败: {e}")
 
         # 5. 承接/炸板率 (Support)
-        total_seal_attempts = zt_count + zhaban_count
-        zhaban_rate = round((zhaban_count / total_seal_attempts * 100), 2) if total_seal_attempts > 0 else 0.0
+        # 真炸板 = 炸板池中不在涨停池的股票（扣除炸板后回封成功的）
+        true_zhaban = zhaban_count
+        if zt_df is not None and not zt_df.empty and "code" in zt_df.columns and \
+           zhaban_df is not None and not zhaban_df.empty and "code" in zhaban_df.columns:
+            zt_codes = set(zt_df["code"].astype(str))
+            zhaban_codes = set(zhaban_df["code"].astype(str))
+            true_zhaban = len(zhaban_codes - zt_codes)
+        total_seal_attempts = zt_count + true_zhaban
+        zhaban_rate = round((true_zhaban / total_seal_attempts * 100), 2) if total_seal_attempts > 0 else 0.0
 
         # 6. 破规胆量维度 (YidongBravery)
         yidong_bravery = float(yidong_stocks_next_day_promoted_rate)
 
         # 7. 综合情绪指数得分 (0 ~ 100分)
         # 权重设定：反馈 25%, 破规胆量 20%, 宽度 20%, 高度 15%, 承接 10%, 力度 10%
-        score_height = min(height * 12, 100)
+        # height得分：分段线性，低板敏感高板平缓
+        # 1板=15, 2板=30, 3板=50, 4板=65, 5板=78, 6板=88, 7板=95, 8板+=100
+        _height_map = {0: 0, 1: 15, 2: 30, 3: 50, 4: 65, 5: 78, 6: 88, 7: 95}
+        score_height = _height_map.get(height, 100) if height <= 7 else 100
         score_breadth = max(min((breadth + 40) * 1.0, 100), 0)
-        score_yield = max(min((yield_rate + 3) * 12.5, 100), 0)
+        # yield得分：以0%为中性锚点(50分), -3%=0分, +4%=100分
+        score_yield = max(min((yield_rate + 3) * (100 / 7), 100), 0) if yield_rate < 0 else max(min(50 + yield_rate * (50 / 4), 100), 50)
         score_support = max(100 - zhaban_rate * 2.5, 0)
         score_force = min(seal_force_ratio * 500, 100)
         score_bravery = min(max(yidong_bravery, 0), 100)
@@ -105,8 +116,11 @@ class EmotionVector:
         盘中快速情绪分计算（与 _classify_intraday_style 和 _log_startup_report 共用）。
         """
         from config.settings import settings
-        score_premium = min(max((premium + 3) * 12.5, 0), 100)
-        score_height = min(height * 12, 100)
+        # yield得分：0%=50分(中性锚点)
+        score_premium = max(min((premium + 3) * (100 / 7), 100), 0) if premium < 0 else max(min(50 + premium * (50 / 4), 100), 50)
+        # height得分：分段线性
+        _hm = {0: 0, 1: 15, 2: 30, 3: 50, 4: 65, 5: 78, 6: 88, 7: 95}
+        score_height = _hm.get(height, 100) if height <= 7 else 100
         score_breadth = max(min(((zt_count - dt_count) + 40) * 1.0, 100), 0)
         score_support = max(100 - zhaban_rate * 2.5, 0)
         return round(
