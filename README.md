@@ -73,7 +73,7 @@
 
 | 战法名称 | 适用情绪阶段 | 核心量化逻辑与筛选规则 |
 |---|---|---|
-| **低吸战法** | 题材中期波动 | 必须是 **动态中军池成员** (成交>20亿，Beta>0.8)，缩量回踩 10日/20日均线，分时止跌时低吸。 |
+| **低吸战法** | 题材中期波动 | 必须是 **动态中军池成员** (成交>12亿，Beta>0.8)，缩量回踩 10日/20日均线，分时止跌时低吸。 |
 | **打板战法** | 启动期与发酵期 | 启动期打**首板与1进2**抢先手；发酵期打**板块龙一、龙二**拿次日高溢价。 |
 | **二波战法** | 退潮后的修复期 | **只做近30天内的人气总龙头** ($\ge 4$ 连板)，股价从最高点**回撤 30%~50%**，换手 5-10 天后止跌出现反包大阳线。 |
 | **抱团战法** | 存量博弈/缩量阴跌 | 全市场成交额极度萎缩 ($<7000$ 亿)，指数阴跌，资金避险躲入特立独行、流动性极佳的红利或超级妖股。 |
@@ -218,7 +218,7 @@
 
 ## 七、数据库结构设计 (SQLite)
 
-系统使用本地 `dragon_pulse.db` 存储 4 张核心数据表：
+系统使用本地 `dragon_pulse.db` 存储 13 张核心数据表：
 
 ### 1. `holdings`（持仓管理表）
 - `id`: 主键
@@ -253,6 +253,39 @@
 - `peak_date` / `peak_price`: 第一波见顶日期 / 价格 (用于计算 30%-50% 二波回撤)
 - `is_active`: 是否处于二波观察期 (30天内)
 
+### 5. `market_index`（大盘指数日线表）
+- `trade_date`: 交易日期 (唯一)
+- `sh_close` / `sh_change_pct`: 上证指数收盘价 / 涨跌幅
+- `sz_close` / `sz_change_pct`: 深证成指收盘价 / 涨跌幅
+- `gem_close` / `gem_change_pct`: 创业板指收盘价 / 涨跌幅
+- `total_amount`: 全市场成交额(亿元)
+
+### 6. `daily_equity_snapshot`（每日净值快照表）
+- `trade_date`: 交易日期 (唯一)
+- `total_equity` / `position_value` / `available_cash`: 总权益 / 持仓市值 / 可用资金
+- `unrealized_pnl` / `today_realized_pnl` / `total_realized_pnl`: 浮动盈亏 / 今日已实现 / 累计已实现
+- `today_pnl_pct` / `cumulative_pnl_pct`: 今日收益率 / 累计收益率
+- `sh_change_pct`: 当日上证涨跌幅（对比基准）
+
+### 7. `daily_zt_pool`（每日涨停池明细表）
+- `trade_date` / `code` / `name`: 交易日期 / 股票代码 / 名称
+- `lbc`: 连板数
+- `seal_amount` / `first_seal_time` / `open_count`: 封单金额 / 首封时间 / 炸板次数
+- `industry`: 所属行业
+- `amount` / `turnover_rate` / `circ_market_cap`: 成交额 / 换手率 / 流通市值
+
+### 8. `sector_strength`（每日板块强度表）
+- `trade_date` / `sector_name`: 交易日期 / 板块名称
+- `zt_count` / `prev_zt_count` / `acceleration`: 涨停数 / 上日数 / 加速值
+- `top_stocks`: 领涨标的
+
+### 9-13. 日志与辅助表
+- `push_logs`: Bark 推送通知日志
+- `llm_logs`: LLM 调用全记录（prompt/response/tokens）
+- `error_logs`: 系统错误/警告日志
+- `system_logs`: 系统运行日志
+- `trade_calendar`: 交易日历缓存
+
 ---
 
 ## 八、Web 服务地址
@@ -261,7 +294,7 @@
 
 | 页面 | 地址 | 说明 |
 |---|---|---|
-| **实时风控看板** | `http://127.0.0.1:8000/monitor` | HTML 页面，10秒自动刷新，展示市场风格/溢价/涨跌停/持仓/情绪分 |
+| **系统综合看板** | `http://127.0.0.1:8000/monitor` | 大盘指数/市场风格/情绪分/持仓明细/板块轮动/涨停龙头/净值曲线/定时任务 |
 | **API 交互文档** | `http://127.0.0.1:8000/docs` | FastAPI Swagger UI，所有接口可直接在线调试 |
 | **情绪看板 JSON** | `http://127.0.0.1:8000/dashboard` | 结构化 JSON 数据，供程序调用 |
 | **API 文档 (ReDoc)** | `http://127.0.0.1:8000/redoc` | 备选 API 文档样式 |
@@ -299,7 +332,7 @@ LLM_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
 LLM_TEMPERATURE=0.3
-LLM_TIMEOUT=60
+LLM_TIMEOUT=180
 LLM_MAX_RETRIES=3
 LLM_BACKUP_BASE_URL=                 # 备用LLM (主模型全部失败时自动切换)
 LLM_BACKUP_MODEL=
@@ -338,13 +371,19 @@ GEM_3D_DEV_LIMIT=30.0
 REGULATORY_10D_LIMIT=100.0
 
 # ==================== 7. 策略引擎参数 ====================
-CORE_POOL_MIN_AMOUNT=20.0            # 中军池成交额门槛(亿)
+CORE_POOL_MIN_AMOUNT=12.0            # 中军池成交额门槛(亿)
 SECOND_WAVE_RETREAT_MIN=0.30         # 二波回撤最小
 SECOND_WAVE_RETREAT_MAX=0.50         # 二波回撤最大
-SECTOR_LINKAGE_MIN_COUNT=2           # 板块联动涨停下限
-SECTOR_LINKAGE_ACCEL_DELTA=1         # 板块联动加速增量
+SECTOR_LINKAGE_MIN_COUNT=3           # 板块联动涨停下限
+SECTOR_LINKAGE_ACCEL_DELTA=2         # 板块联动加速增量
 
-# ==================== 8. 盘中情绪分权重 ====================
+# ==================== 8. 点火异动（按板块区分涨停线） ====================
+PRICE_BURST_MAX=9.5                  # 主板10cm涨停线
+PRICE_BURST_MAX_20CM=19.5            # 双创20cm涨停线
+FUND_INFLOW_MIN=2000.0               # 主力资金绝对底线(万元)
+FUND_INFLOW_CAP_RATIO=0.0005         # 主力资金流通市值比例
+
+# ==================== 9. 盘中情绪分权重 ====================
 PREMIUM_WEIGHT=0.36                  # 溢价权重
 BREADTH_WEIGHT=0.29                  # 宽度权重
 HEIGHT_WEIGHT=0.21                   # 高度权重
@@ -370,8 +409,7 @@ cp .env.example .env
 
 ### 3. 运行单元测试
 ```bash
-python -m unittest tests/test_core.py
-python -m unittest tests/test_database.py
+python -m pytest tests/ -v
 ```
 
 ### 4. 启动系统
@@ -412,12 +450,23 @@ dragon_pulse_plus/
 │   ├── holding_monitor.py   # 持仓风控卖出条件检测 (6规则)
 │   ├── regulatory_yidong.py # 交易所监管异动红线计算
 │   └── trade_calendar.py    # A股交易日历工具 (交易日判断/前一交易日查询)
-├── data/                    # 数据采集与清洗
-│   ├── fetcher.py           # AkShare 行情/涨跌停/连板/龙虎榜封装 (含防封重试与板块过滤)
+├── data/                    # 数据采集与清洗（mixin模式拆分）
+│   ├── core.py              # 重试装饰器、多源降级工具函数
+│   ├── fetcher.py           # DataFetcher 主类（22行壳 + 3个mixin）
+│   ├── fetcher_spot.py      # 实时行情 + 溢价 + 流动性基线
+│   ├── fetcher_pool.py      # 涨跌停池 + 龙虎榜 + 板块 + 资金流向
+│   ├── fetcher_history.py   # 历史K线 + 分时数据 + 形态检测
 │   └── news_fetcher.py      # 财联社新闻电报与同花顺热搜榜抓取
-├── database/                # SQLite 数据库模型与 ORM 服务
-│   ├── models.py            # SQLAlchemy 4 张核心表模型定义
-│   └── services.py          # 持仓、推荐标的、情绪向量增删改查服务
+├── database/                # SQLite 数据库模型与 ORM 服务（按领域拆分）
+│   ├── models.py            # SQLAlchemy 13 张核心表模型定义
+│   ├── connection.py        # DatabaseManager 单例
+│   ├── holdings.py          # 持仓管理服务
+│   ├── recommendations.py   # 推荐标的服务
+│   ├── sentiment.py         # 情绪向量服务
+│   ├── market_data.py       # 指数/净值/涨停池/板块强度服务
+│   ├── calendar.py          # 交易日历服务
+│   ├── logs.py              # 推送/LLM/错误日志服务
+│   └── ...
 ├── llm/                     # LLM 大模型决策引擎
 │   ├── client.py            # 统一 OpenAI/DeepSeek/Claude 客户端
 │   ├── post_market.py       # 盘后深度复盘生成器
@@ -426,10 +475,21 @@ dragon_pulse_plus/
 │   └── sell_advisor.py      # 盘中异动与卖出提示润色器
 ├── notifier/                # 消息推送模块
 │   └── bark.py              # Bark 消息推送封装
-├── scheduler/               # 时间线调度与盘中轮询
-│   ├── daily_runner.py      # 08:30 / 09:26 / 15:30 定时任务触发器
-│   └── market_monitor.py    # 盘中 15s 轮询监控与 AI 自动持仓流转引擎
-└── tests/                   # 单元测试集
-    ├── test_core.py         # 核心量化算法单元测试
-    └── test_database.py     # 数据库 CRUD 单元测试
+├── scheduler/               # 时间线调度与盘中轮询（按功能拆分）
+│   ├── market_monitor.py    # 盘中 15s 轮询监控引擎（38行壳 + 4个mixin）
+│   ├── pre_market.py        # 08:30 盘前简报任务
+│   ├── auction.py           # 09:26 竞价观察任务
+│   ├── post_market.py       # 15:30 盘后复盘任务
+│   ├── reporting.py         # 每日盈亏报告推送
+│   ├── holiday.py           # 假日消息汇总
+│   └── helpers.py           # 推荐解析、龙头填充等辅助函数
+├── dashboard/               # 系统看板模块
+│   ├── data.py              # 看板数据聚合层
+│   └── templates.py         # 看板 HTML 渲染（模块化板块函数）
+└── tests/                   # 单元测试集 (43个)
+    ├── test_core.py         # 核心量化算法
+    ├── test_database.py     # 数据库 CRUD
+    ├── test_config.py       # 配置校验 + 阈值逻辑
+    ├── test_monitor.py      # 持仓监控卖出信号全覆盖
+    └── test_strategies.py   # 战法标签 + 板块区分
 ```

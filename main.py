@@ -50,10 +50,10 @@ def main():
     logger.info(f"盘中轮询间隔: {settings.MONITOR_INTERVAL_SECONDS} 秒")
     logger.info(f"情绪到顶预警阈值: 连板>={settings.EMOTION_TOP_MAX_LBC}板 & 炸板率>{settings.EMOTION_TOP_ZHABAN_RATE}%")
 
-    # 0. 启动时同步交易日历，确保后续任务不会在假期触发
-    from database.services import TradeCalendarManager
+    # 0. 启动时同步交易日历 + 建表，确保后续任务不会在假期触发
+    from database import TradeCalendarManager
     TradeCalendarManager.sync_calendar()
-    logger.info("交易日历已同步。")
+    logger.info("交易日历已同步，数据库表结构已就绪。")
 
     # 1. 初始化 APScheduler 定时任务
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
@@ -99,7 +99,7 @@ def main():
     )
 
     # 04:00 日志保留清理
-    from database.services import LogRetentionCleaner
+    from database import LogRetentionCleaner
     def _cleanup_with_track():
         from scheduler.daily_runner import _record_job_run
         _record_job_run("job_log_cleanup", "日志清理")
@@ -117,7 +117,7 @@ def main():
     def _expire_dragons():
         from scheduler.daily_runner import _record_job_run
         _record_job_run("job_dragon_expire", "龙头过期标记")
-        from database.services import db_manager
+        from database import db_manager
         from database.models import HistoricDragon
         import datetime
         session = db_manager.get_session()
@@ -149,11 +149,12 @@ def main():
     logger.info("定时任务调度器已启动：")
     logger.info("  04:00  日志清理（系统/LLM/错误 15天，推送 30天）")
     logger.info("  04:05  龙头过期标记（>30天自动失效）")
-    logger.info("  08:30  盘前简报（新闻+热搜→LLM 预测板块）")
-    logger.info("  09:26  竞价观察（竞价快照→LLM 买卖指令）")
-    logger.info("  09:30  盘中实时监控（15秒轮询，自动买卖+风控）")
-    logger.info("  15:30  盘后复盘+回测报告（情绪→风格→LLM复盘→策略回测→推送）")
+    logger.info("  08:30  盘前简报（新闻+热搜→LLM 预测板块→Bark 推送）")
+    logger.info("  09:26  竞价观察（竞价快照+推荐标的→LLM 买卖指令→Bark 推送）")
+    logger.info("  09:30  盘中实时监控（15秒轮询，点火异动+板块联动+AI自动交易）")
+    logger.info("  15:30  盘后深度复盘（情绪→风格→LLM复盘→指数/涨停池/板块落库→盈亏报告推送）")
     logger.info("  20:00  假日消息汇总（假期最后一天推送）")
+    logger.info("Web 服务: http://127.0.0.1:8000 | 看板: /monitor | API文档: /docs")
 
     # 2. 在后台异步启动持仓管理 FastAPI API Web 服务 (端口 8000)
     import threading

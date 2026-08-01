@@ -1,0 +1,281 @@
+import datetime
+import logging
+from typing import Dict, Any, List, Optional
+import pandas as pd
+
+from config.settings import settings
+from data.fetcher import DataFetcher
+from data.news_fetcher import NewsFetcher
+from llm.client import llm_client
+from notifier.bark import bark_notifier
+from core.trade_calendar import is_trading_day, is_last_non_trading_day
+
+logger = logging.getLogger(__name__)
+
+_cached_pre_market_report: str = ""
+_job_last_run: Dict[str, Dict[str, Any]] = {}
+
+def _record_job_run(job_id: str, job_name: str):
+    """记录定时任务执行时间"""
+    now = datetime.datetime.now()
+    _job_last_run[job_id] = {
+        "name": job_name,
+        "last_run": now.strftime("%H:%M:%S"),
+        "last_date": now.strftime("%Y%m%d"),
+        "today": now.strftime("%Y%m%d"),
+    }
+
+
+def _get_job_status() -> List[Dict[str, Any]]:
+    """获取所有定时任务的状态列表"""
+    today = datetime.datetime.now().strftime("%Y%m%d")
+    all_jobs = [
+        {"id": "job_log_cleanup",    "name": "日志清理",         "time": "04:00", "desc": "系统/LLM/错误日志保留15天，推送30天"},
+        {"id": "job_dragon_expire",  "name": "龙头过期标记",     "time": "04:05", "desc": "超过30天无人气龙头自动失效"},
+        {"id": "job_pre_market",     "name": "盘前简报",         "time": "08:30", "desc": "新闻抓取→LLM分析→推送题材预测"},
+        {"id": "job_call_auction",   "name": "竞价观察",         "time": "09:26", "desc": "竞价快照→LLM判断超预期标的"},
+        {"id": "job_monitor_loop",   "name": "盘中实时监控",     "time": "09:30-15:00", "desc": f"15秒轮询，点火异动+板块联动+AI自动交易"},
+        {"id": "job_post_market",    "name": "盘后深度复盘",     "time": "15:30", "desc": "LLM复盘+推荐标的+指数落库+盈亏推送"},
+        {"id": "job_holiday_summary","name": "假日消息汇总",     "time": "20:00", "desc": "假期最后一天汇总近期消息"},
+    ]
+    for j in all_jobs:
+        record = _job_last_run.get(j["id"])
+        if record:
+            j["last_run"] = record["last_run"]
+            j["ran_today"] = record.get("last_date") == today
+        else:
+            j["last_run"] = "-"
+            j["ran_today"] = False
+    return all_jobs
+
+
+def _parse_and_save_recommendations(trade_date: str, report_text: str):
+    """
+    从 LLM 复盘报告中提取推荐标的并落库到 recommendations 表。
+    优先级：1) 结构化 JSON 块（Prompt 要求 LLM 输出）2) 正则兜底匹配
+    """
+    import re
+    import json
+    items = []
+
+    json_parsed = False  # 标记是否成功解析了 JSON（包括空数组）
+
+    # 优先取 ```json ... ``` 代码块
+    json_block = re.search(r'```json\s*(.*?)\s*```', report_text, re.DOTALL)
+    json_text = None
+    if json_block:
+        json_text = json_block.group(1)
+        # 手动提取最外层 {} 避免非贪婪匹配被嵌套对象截断
+        start = json_text.find("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(json_text)):
+                if json_text[i] == "{":
+                    depth += 1
+                elif json_text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        json_text = json_text[start:i + 1]
+                        break
+    if not json_text:
+        json_text = ""  # 无法提取
+
+    if json_text:
+        try:
+            data = json.loads(json_text)
+            json_parsed = True
+            recs = data.get("recommendations", [])
+            for r in recs:
+                code = str(r.get("code", "")).strip()
+                if not code or len(code) != 6 or not code.isdigit():
+                    continue
+                items.append({
+                    "code": code,
+                    "name": str(r.get("name", "")),
+                    "strategy_type": str(r.get("strategy_type", "AI复盘推荐")),
+                    "open_requirement": str(r.get("open_requirement", "")),
+                    "auction_vol_ratio": str(r.get("auction_vol_ratio", "")),
+                    "buy_condition": str(r.get("buy_condition", "")),
+                    "sell_condition": str(r.get("sell_condition", ""))
+                })
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON 推荐解析失败，回退到正则匹配: {e}")
+
+    # 正则兜底仅当 JSON 解析完全失败时启用，空数组说明 AI 明确判定不应买入
+    if not items and not json_parsed:
+        stock_pattern = re.compile(r'[一-鿿]{2,8}\s*[（(]\s*(\d{6})\s*[）)]')
+        found = stock_pattern.findall(report_text)
+        seen = set()
+        for code in found:
+            if code in seen:
+                continue
+            seen.add(code)
+            name = DataFetcher.get_stock_name(code)
+            items.append({
+                "code": code,
+                "name": name,
+                "strategy_type": "AI复盘推荐",
+                "open_requirement": "",
+                "auction_vol_ratio": "",
+                "buy_condition": "",
+                "sell_condition": ""
+            })
+            if len(items) >= 5:
+                break
+
+    if items:
+        RecommendationManager.add_recommendations(trade_date, items)
+        logger.info(f"从复盘报告中解析并落库 {len(items)} 个推荐标的: "
+                    f"{', '.join(i['name'] + '(' + i['code'] + ')' for i in items)}")
+    else:
+        reason = "AI判定不推荐" if json_parsed else "未检测到推荐标的代码"
+        logger.info(f"复盘报告推荐标的: {reason}，跳过入库")
+
+
+
+
+def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame = None):
+    """
+    LLM 复盘打分：让 LLM 评估昨日推荐标的今日的实际表现，形成闭环反馈。
+    评分存入 recommendations 表的 sell_condition 字段（复用为评分备注）。
+    """
+    from core.trade_calendar import get_previous_trading_day
+    yesterday = get_previous_trading_day(
+        datetime.datetime.strptime(trade_date, "%Y%m%d").date()
+    )
+    pending = RecommendationManager.get_pending_recommendations(trade_date=yesterday)
+    if not pending or spot_df is None or spot_df.empty:
+        return
+
+    # 拼昨日推荐 + 今日表现的评估 Prompt
+    lines = ["评估昨日推荐标的今日表现："]
+    for r in pending:
+        code = r["code"]
+        match = spot_df[spot_df["code"].astype(str) == str(code)]
+        if not match.empty:
+            row = match.iloc[0]
+            lines.append(
+                f"- {r['name']}({code}) [{r['strategy_type']}]: "
+                f"今日涨幅 {row.get('change_pct', 0)}%, 现价 {row.get('price', 0)}元"
+            )
+        else:
+            lines.append(f"- {r['name']}({code}) [{r['strategy_type']}]: 未找到今日数据")
+    eval_text = "\n".join(lines)
+
+    try:
+        score_prompt = "你是短线交易复盘专家。请用一句话评估昨日推荐标的今天的表现（不超过50字），并给出胜率评分（0-100）。"
+        evaluation = llm_client.generate(
+            system_prompt=score_prompt,
+            user_prompt=eval_text,
+            module="recommendation_eval"
+        )
+        logger.info(f"昨日推荐复盘评估: {evaluation}")
+    except Exception as e:
+        logger.warning(f"LLM 复盘打分失败: {e}")
+
+
+
+
+def _compute_yidong_bravery(today_str: str, today_zt_df) -> float:
+    """
+    计算"破规胆量"维度：昨日高位连板(>=3板)的股票中，今日仍在涨停池的比例。
+    这反映资金在监管压力下继续做多的勇气。
+    无数据时返回默认50%（中性）。
+    """
+    try:
+        from core.trade_calendar import get_previous_trading_day
+        yesterday = get_previous_trading_day(
+            datetime.datetime.strptime(today_str, "%Y%m%d").date()
+        )
+        yesterday_zt = DataFetcher.get_zt_pool(date_str=yesterday)
+        if yesterday_zt is None or yesterday_zt.empty or "lbc" not in yesterday_zt.columns:
+            return 50.0
+        if today_zt_df is None or today_zt_df.empty:
+            return 50.0
+
+        # 昨日连板>=3的高位股
+        high_lbc = yesterday_zt[yesterday_zt["lbc"].astype(int) >= 3]
+        if high_lbc.empty:
+            return 50.0
+
+        high_codes = set(high_lbc["code"].astype(str))
+        today_zt_codes = set(today_zt_df["code"].astype(str))
+
+        # 今日仍在涨停池 = 晋级成功
+        promoted = high_codes & today_zt_codes
+        rate = len(promoted) / len(high_codes) * 100
+        logger.info(f"破规胆量: 昨日高位{len(high_codes)}只, 今日晋级{len(promoted)}只, 胆量{rate:.1f}%")
+        return round(rate, 1)
+    except Exception as e:
+        logger.warning(f"计算破规胆量失败: {e}")
+        return 50.0
+
+
+
+
+def _auto_populate_dragons(trade_date: str, zt_df):
+    """
+    将当日连板 >= 3 的高标自动写入 HistoricDragon 表，
+    供二波战法在过去 30 天内溯源人气总龙头。
+
+    去重规则：同一 code 只保留一条活跃记录，新数据的连板数更高时更新峰值。
+    """
+    if zt_df is None or zt_df.empty or "lbc" not in zt_df.columns:
+        return
+    try:
+        from database.services import db_manager
+        from database.models import HistoricDragon
+        import datetime
+        session = db_manager.get_session()
+        try:
+            # 30 天前的龙头标记为失效
+            cutoff = (datetime.datetime.strptime(trade_date, "%Y%m%d") -
+                      datetime.timedelta(days=30)).strftime("%Y%m%d")
+            session.query(HistoricDragon).filter(
+                HistoricDragon.peak_date < cutoff
+            ).update({"is_active": False}, synchronize_session="fetch")
+
+            highs = zt_df[zt_df["lbc"].astype(int) >= 3]
+            updated_count = 0
+            for _, row in highs.iterrows():
+                code = str(row.get("code", ""))
+                lbc = int(row.get("lbc", 3))
+                name = str(row.get("name", ""))
+                peak_price = float(row.get("price", 0))
+                industry = str(row.get("industry", "")) if "industry" in row.index else ""
+
+                existing = session.query(HistoricDragon).filter(
+                    HistoricDragon.code == code,
+                    HistoricDragon.is_active == True
+                ).first()
+
+                if existing:
+                    # 同一只股票已在表中：连板数更高时更新峰值
+                    if lbc > existing.max_lbc:
+                        existing.max_lbc = lbc
+                        existing.peak_date = trade_date
+                        existing.peak_price = peak_price
+                        existing.name = name
+                        existing.board_name = industry or existing.board_name
+                        existing.is_active = True
+                        updated_count += 1
+                    else:
+                        # 连板数持平或更低，只刷新 active 状态
+                        existing.is_active = True
+                else:
+                    # 新龙头
+                    session.add(HistoricDragon(
+                        code=code, name=name, max_lbc=lbc,
+                        peak_date=trade_date, peak_price=peak_price,
+                        board_name=industry, is_active=True
+                    ))
+                    updated_count += 1
+            session.commit()
+            logger.info(f"历史龙头表已更新，新增/更新 {updated_count} 只高标，失效旧记录")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"历史龙头表自动填充失败: {e}")
+        finally:
+            session.close()
+    except Exception as e:
+        logger.warning(f"历史龙头表自动填充异常: {e}")
