@@ -142,6 +142,17 @@ class MarketStyle:
                 "capacity_factor": round(k, 2),
             }
 
+        # 补充：中等活跃市场（涨停未达低吸门槛但情绪可做，height不足打板）
+        # 适用场景：涨停20~40家 + 情绪>=45 + height 3~4，修复期中段
+        zt_mid_min = int(20 * k)
+        if zt_count >= zt_mid_min and sentiment_index >= 45 and height <= 4:
+            return {
+                "style": "低吸",
+                "reason": f"涨停{zt_count}家+情绪{sentiment_index}分+最高{height}板，修复期中段，精选低吸标的",
+                "priority_strategy": "中军回踩",
+                "capacity_factor": round(k, 2),
+            }
+
         # 高标+涨停超上限 → 一致性过强，明日分歧概率大
         if height >= 5 and zt_count > zt_daban_max:
             if sentiment_index >= 70:

@@ -69,9 +69,9 @@ class EmotionVector:
         # 7. 综合情绪指数得分 (0 ~ 100分)
         # 权重设定：反馈 25%, 破规胆量 20%, 宽度 20%, 高度 15%, 承接 10%, 力度 10%
         score_height = min(height * 12, 100)
-        score_breadth = max(min((breadth + 30) * 1.25, 100), 0)
+        score_breadth = max(min((breadth + 40) * 1.0, 100), 0)
         score_yield = max(min((yield_rate + 3) * 12.5, 100), 0)
-        score_support = max(100 - zhaban_rate * 2, 0)
+        score_support = max(100 - zhaban_rate * 2.5, 0)
         score_force = min(seal_force_ratio * 500, 100)
         score_bravery = min(max(yidong_bravery, 0), 100)
 
@@ -107,8 +107,8 @@ class EmotionVector:
         from config.settings import settings
         score_premium = min(max((premium + 3) * 12.5, 0), 100)
         score_height = min(height * 12, 100)
-        score_breadth = max(min(((zt_count - dt_count) + 30) * 1.25, 100), 0)
-        score_support = max(100 - zhaban_rate * 2, 20) * 0.5  # 下限10分
+        score_breadth = max(min(((zt_count - dt_count) + 40) * 1.0, 100), 0)
+        score_support = max(100 - zhaban_rate * 2.5, 0)
         return round(
             score_premium * settings.PREMIUM_WEIGHT +
             score_breadth * settings.BREADTH_WEIGHT +

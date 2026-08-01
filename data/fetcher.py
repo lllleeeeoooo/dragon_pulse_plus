@@ -233,14 +233,31 @@ class DataFetcher:
             now = datetime.datetime.now()
         current_minutes = now.hour * 60 + now.minute
         market_open = 9 * 60 + 30  # 570 min
+        lunch_start = 11 * 60 + 30  # 690 min
+        lunch_end = 13 * 60  # 780 min
 
         if current_minutes < market_open:
             return {"estimated": 0, "ratio": 0, "now_amount": 0, "message": "未开盘"}
 
-        minutes_elapsed = current_minutes - market_open
-        # 午休扣除 11:30~13:00 (90 min)
-        if current_minutes > 11 * 60 + 30:
-            minutes_elapsed -= 90
+        # 午休期间：上午盘已结束，占全天60%
+        if lunch_start <= current_minutes < lunch_end:
+            now_amount = spot_total_amount / 1e8
+            ratio = 0.60
+            estimated = now_amount / ratio
+            if estimated > 30000:
+                estimated = 30000
+            return {
+                "estimated": round(estimated, 0),
+                "ratio": round(ratio, 2),
+                "now_amount": round(now_amount, 0),
+            }
+
+        # 计算有效交易分钟数（扣除午休90分钟）
+        if current_minutes >= lunch_end:
+            minutes_elapsed = current_minutes - market_open - 90
+        else:
+            minutes_elapsed = current_minutes - market_open
+
         if minutes_elapsed < 0:
             minutes_elapsed = 0
 

@@ -41,3 +41,17 @@ def is_last_non_trading_day(date: Optional[datetime.date] = None) -> bool:
     d = date or datetime.date.today()
     tomorrow = d + datetime.timedelta(days=1)
     return (not is_trading_day(d)) and is_trading_day(tomorrow)
+
+
+def get_previous_trading_day(date: Optional[datetime.date] = None) -> str:
+    """
+    获取指定日期的前一个交易日 (YYYYMMDD格式)。
+    最多向前回溯10天（覆盖国庆等长假）。
+    """
+    d = date or datetime.date.today()
+    for i in range(1, 16):
+        prev = d - datetime.timedelta(days=i)
+        if is_trading_day(prev):
+            return prev.strftime("%Y%m%d")
+    # 回溯15天仍找不到，降级返回前一自然日
+    return (d - datetime.timedelta(days=1)).strftime("%Y%m%d")

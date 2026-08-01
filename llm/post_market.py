@@ -167,10 +167,12 @@ class PostMarketAnalyzer:
                 yesterday_zt_avg_premium=yesterday_zt_yield
             )
 
-        # 2. 从数据库检索昨日推荐标的进行胜率复盘（修复 #4：按日期过滤+全市场匹配）
+        # 2. 从数据库检索昨日推荐标的进行胜率复盘（按日期过滤+全市场匹配）
+        from core.trade_calendar import get_previous_trading_day
         import datetime
-        yesterday = (datetime.datetime.strptime(trade_date, "%Y%m%d") -
-                      datetime.timedelta(days=1)).strftime("%Y%m%d")
+        yesterday = get_previous_trading_day(
+            datetime.datetime.strptime(trade_date, "%Y%m%d").date()
+        )
         history_recs = RecommendationManager.get_pending_recommendations(trade_date=yesterday)
         history_review_lines = []
         # 优先用全市场快照，其次用 Top 20

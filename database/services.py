@@ -153,6 +153,24 @@ class HoldingManager:
         finally:
             session.close()
 
+    @staticmethod
+    def reset_all_limit_up_flags():
+        """新交易日重置所有活跃持仓的 was_limit_up_today 标志"""
+        session = db_manager.get_session()
+        try:
+            updated = session.query(Holding).filter(
+                Holding.status == "HOLDING",
+                Holding.was_limit_up_today == True
+            ).update({"was_limit_up_today": False}, synchronize_session="fetch")
+            if updated:
+                session.commit()
+                logger.info(f"新交易日重置 {updated} 只持仓的 was_limit_up_today 标志")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"重置 was_limit_up_today 失败: {e}")
+        finally:
+            session.close()
+
 
 class RecommendationManager:
     """
@@ -211,6 +229,24 @@ class RecommendationManager:
         finally:
             session.close()
 
+    @staticmethod
+    def expire_old_recommendations(before_date: str):
+        """将指定日期之前的 PENDING 推荐标记为 EXPIRED"""
+        session = db_manager.get_session()
+        try:
+            updated = session.query(Recommendation).filter(
+                Recommendation.status == "PENDING",
+                Recommendation.trade_date < before_date
+            ).update({"status": "EXPIRED"}, synchronize_session="fetch")
+            if updated:
+                session.commit()
+                logger.info(f"已过期 {updated} 条旧推荐标的 (早于 {before_date})")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"过期旧推荐失败: {e}")
+        finally:
+            session.close()
+
 
 class SentimentManager:
     """
@@ -246,6 +282,36 @@ class SentimentManager:
         except Exception as e:
             session.rollback()
             logger.error(f"保存每日情绪数据失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_recent_sentiments(days_lookback: int = 5) -> List[Dict[str, Any]]:
+        """查询最近N个交易日的情绪记录，按日期降序排列（最新的在前）"""
+        import datetime
+        session = db_manager.get_session()
+        try:
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=days_lookback + 10)).strftime("%Y%m%d")
+            records = session.query(DailySentiment).filter(
+                DailySentiment.trade_date >= cutoff
+            ).order_by(DailySentiment.trade_date.desc()).limit(days_lookback).all()
+            return [
+                {
+                    "trade_date": r.trade_date,
+                    "height": r.height,
+                    "breadth": r.breadth,
+                    "zt_count": r.zt_count,
+                    "dt_count": r.dt_count,
+                    "zhaban_count": r.zhaban_count,
+                    "yield_rate": r.yield_rate,
+                    "seal_force_ratio": r.seal_force_ratio,
+                    "zhaban_rate": r.zhaban_rate,
+                    "sentiment_index": r.sentiment_index,
+                    "cycle_stage": r.cycle_stage or "",
+                    "total_amount": r.total_amount,
+                }
+                for r in records
+            ]
         finally:
             session.close()
 

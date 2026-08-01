@@ -52,6 +52,16 @@ class MarketMonitor:
         # 昨日涨停溢价缓存，每 2 分钟刷新
         self._premium_cache: Dict[str, Any] = {}
         self._premium_cache_time: float = 0.0
+        # 封单衰减监控：记录上一轮涨停池封单金额 {code: seal_amount}
+        self._prev_seal_amounts: Dict[str, float] = {}
+        self._alerted_seal_decay_codes: set = set()
+        # 板块联动监控：跟踪每个行业涨停家数变化
+        self._prev_sector_counts: Dict[str, int] = {}
+        self._alerted_sector_names: set = set()
+        self._current_sector_counts: Dict[str, int] = {}
+        # 情绪周期：每日加载一次昨日周期阶段
+        self._cycle_phase: str = ""
+        self._cycle_stance: Dict[str, Any] = {}
 
     def _reset_daily_state(self):
         """新交易日重置所有去重集合，输出盘前启动日志"""
@@ -67,6 +77,17 @@ class MarketMonitor:
             self._alert_date = today
             self._ma_cache.clear()
             self._startup_logged = False  # 允许下一天输出启动日志
+            self._circuit_breaker_alerted = False
+            self._prev_seal_amounts.clear()
+            self._alerted_seal_decay_codes.clear()
+            self._prev_sector_counts.clear()
+            self._alerted_sector_names.clear()
+            self._current_sector_counts.clear()
+            self._llm_alert_calls_today = 0
+            HoldingManager.reset_all_limit_up_flags()
+            RecommendationManager.expire_old_recommendations(before_date=today)
+            # 加载昨日情绪周期阶段
+            self._load_cycle_phase()
             logger.info(f"新交易日 {today}，去重状态已重置")
 
     def _log_startup_report(self, spot_df: pd.DataFrame):
@@ -129,8 +150,8 @@ class MarketMonitor:
         }
         score_premium = min(max((emotion["yield_rate"] + 3) * 12.5, 0), 100)
         score_height = min(market_max_lbc * 12, 100)       # 9板≈满分
-        score_breadth = max(min(((zt_count - dt_count) + 30) * 1.25, 100), 0)  # 涨停多→高分
-        score_support = max(100 - market_zhaban_rate * 2, 20) * 0.5  # 下限10分，防炸板池重叠导致清零
+        score_breadth = max(min(((zt_count - dt_count) + 40) * 1.0, 100), 0)  # 涨停多→高分
+        score_support = max(100 - market_zhaban_rate * 2.5, 0)
         emotion["sentiment_index"] = round(
             score_premium * settings.PREMIUM_WEIGHT + score_breadth * settings.BREADTH_WEIGHT +
             score_height * settings.HEIGHT_WEIGHT + score_support * settings.SUPPORT_WEIGHT, 1)
@@ -187,7 +208,7 @@ class MarketMonitor:
         return (m_start <= current_time <= m_end) or (a_start <= current_time <= a_end)
 
     def _refresh_pool_cache(self):
-        """刷新涨停池/炸板池缓存（每 60 秒一次）"""
+        """刷新涨停池/炸板池缓存（每 60 秒一次），同时检测封单衰减"""
         now = time.time()
         if now - self._pool_cache_time < self._pool_cache_interval:
             return  # 缓存未过期
@@ -196,9 +217,119 @@ class MarketMonitor:
             self._zt_pool_cache = DataFetcher.get_zt_pool(date_str=today_str)
             self._zhaban_pool_cache = DataFetcher.get_zhaban_pool(date_str=today_str)
             self._pool_cache_time = now
+
+            # 封单衰减检测
+            self._check_seal_decay()
+            # 板块联动检测
+            self._check_sector_linkage()
+
             logger.debug("涨停/炸板池缓存已刷新")
         except Exception as e:
             logger.warning(f"刷新涨停/炸板池缓存失败: {e}")
+
+    def _check_sector_linkage(self):
+        """
+        板块联动监控：检测涨停池中同板块涨停家数的加速变化。
+        当某板块涨停家数从1→2或更高时，触发联动预警。
+        """
+        zt_df = self._zt_pool_cache
+        if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
+            return
+
+        # 按行业分组计数
+        sectors = zt_df["industry"].dropna().astype(str)
+        sectors = sectors[sectors.str.len() > 0]
+        current_counts = sectors.value_counts().to_dict()
+        self._current_sector_counts = current_counts
+
+        # 与上一轮对比
+        for sector, count in current_counts.items():
+            if sector in self._alerted_sector_names:
+                continue
+
+            prev_count = self._prev_sector_counts.get(sector, 0)
+            delta = count - prev_count
+
+            # 触发条件：达到最小涨停家数 且 较上轮有增量
+            should_alert = (
+                count >= settings.SECTOR_LINKAGE_MIN_COUNT and
+                delta >= settings.SECTOR_LINKAGE_ACCEL_DELTA
+            )
+
+            if should_alert:
+                self._alerted_sector_names.add(sector)
+                # 提取该板块涨停的股票信息
+                sector_stocks = zt_df[zt_df["industry"].astype(str) == sector]
+                stock_details = []
+                for _, row in sector_stocks.iterrows():
+                    name = str(row.get("name", ""))
+                    code = str(row.get("code", ""))
+                    lbc = int(row.get("lbc", 1))
+                    tag = f"{lbc}板" if lbc >= 2 else "首板"
+                    stock_details.append(f"{name}({code}){tag}")
+
+                stocks_text = " / ".join(stock_details[:6])
+                logger.info(f"板块联动预警: [{sector}] 涨停{count}家(+{delta}) -> {stocks_text}")
+                bark_notifier.send(
+                    title=f"🔗 [板块联动] {sector} {count}家涨停",
+                    body=(
+                        f"板块【{sector}】涨停加速至{count}家(较上轮+{delta})！\n"
+                        f"成分: {stocks_text}\n"
+                        f"关注该板块内未涨停的核心标的补涨机会。"
+                    ),
+                    group="板块联动",
+                    level="timeSensitive" if count >= 3 else "active"
+                )
+
+        # 更新缓存
+        self._prev_sector_counts = current_counts
+
+    def _check_seal_decay(self):
+        """
+        封单衰减监控：对比前后两轮涨停池封单金额。
+        若某只持仓股的封单缩减超过70%，发出预警。
+        """
+        zt_df = self._zt_pool_cache
+        if zt_df is None or zt_df.empty or "seal_amount" not in zt_df.columns:
+            return
+
+        # 构建当前封单映射
+        current_seals: Dict[str, float] = {}
+        for _, row in zt_df.iterrows():
+            code = str(row.get("code", ""))
+            seal = float(pd.to_numeric(row.get("seal_amount", 0), errors="coerce") or 0)
+            if code and seal > 0:
+                current_seals[code] = seal
+
+        # 有前一轮数据时做对比
+        if self._prev_seal_amounts:
+            active_holdings = HoldingManager.get_active_holdings()
+            holding_codes = {h["code"] for h in active_holdings}
+
+            for code, prev_seal in self._prev_seal_amounts.items():
+                if code in self._alerted_seal_decay_codes:
+                    continue
+                if code not in holding_codes:
+                    continue
+                curr_seal = current_seals.get(code, 0)
+                if prev_seal > 0 and curr_seal > 0:
+                    decay_ratio = (prev_seal - curr_seal) / prev_seal
+                    if decay_ratio >= 0.7:
+                        name = ""
+                        match = zt_df[zt_df["code"].astype(str) == code]
+                        if not match.empty:
+                            name = str(match.iloc[0].get("name", code))
+                        self._alerted_seal_decay_codes.add(code)
+                        logger.warning(f"封单衰减预警: {name}({code}) 封单从{prev_seal/1e8:.1f}亿缩至{curr_seal/1e8:.1f}亿，衰减{decay_ratio*100:.0f}%")
+                        bark_notifier.send(
+                            title=f"⚠️ [封单衰减] {name}({code})",
+                            body=f"封单从 {prev_seal/1e8:.1f}亿 缩至 {curr_seal/1e8:.1f}亿（衰减{decay_ratio*100:.0f}%），炸板风险急剧上升，建议减仓！",
+                            group="卖出提醒",
+                            level="timeSensitive"
+                        )
+
+        # 更新缓存
+        self._prev_seal_amounts = current_seals
 
     def _check_fund_inflow_alert(self, hot_codes: list = None):
         """
@@ -347,8 +478,8 @@ class MarketMonitor:
         # 溢价占40% + 宽度占40% + 高度占20%
         score_premium = min(max((premium + 3) * 12.5, 0), 100)  # -3%→0分, +3%→75分
         score_height = min(market_max_lbc * 12, 100)       # 9板≈满分
-        score_breadth = max(min(((zt_count - dt_count) + 30) * 1.25, 100), 0)  # 涨停多→高分
-        score_support = max(100 - market_zhaban_rate * 2, 20) * 0.5  # 下限10分，防炸板池重叠导致清零
+        score_breadth = max(min(((zt_count - dt_count) + 40) * 1.0, 100), 0)  # 涨停多→高分
+        score_support = max(100 - market_zhaban_rate * 2.5, 0)
         emotion["sentiment_index"] = round(
             score_premium * settings.PREMIUM_WEIGHT +
             score_breadth * settings.BREADTH_WEIGHT +
@@ -407,7 +538,50 @@ class MarketMonitor:
         style["high_open_ratio"] = self._premium_cache.get("high_open_ratio", 0)
         style["positive_ratio"] = self._premium_cache.get("positive_ratio", 0)
         style["premium_source"] = emotion["_premium_source"]
+        # 板块联动数据（Top5活跃板块）
+        if self._current_sector_counts:
+            top_sectors = sorted(self._current_sector_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            style["top_sectors"] = [{"name": s[0], "zt_count": s[1]} for s in top_sectors]
+        # 情绪周期阶段
+        style["cycle_phase"] = self._cycle_phase or "未知"
+        style["cycle_stance"] = self._cycle_stance.get("stance", "未知")
         return style
+
+    def _load_cycle_phase(self):
+        """每日加载一次前一交易日的情绪周期阶段"""
+        try:
+            from database.services import SentimentManager
+            from core.cycle_machine import EmotionCycleMachine
+            recent = SentimentManager.get_recent_sentiments(days_lookback=1)
+            if recent:
+                self._cycle_phase = recent[0].get("cycle_stage", "")
+            else:
+                self._cycle_phase = ""
+            self._cycle_stance = EmotionCycleMachine.get_trading_stance(self._cycle_phase or "冰点")
+            logger.info(f"情绪周期: {self._cycle_phase or '无历史'} -> 操作: {self._cycle_stance.get('stance', '未知')}")
+        except Exception as e:
+            logger.warning(f"加载情绪周期失败: {e}")
+            self._cycle_phase = ""
+            self._cycle_stance = {"allow_auto_buy": True, "only_recommended": False, "stance": "未知"}
+
+    def _is_daily_loss_breaker_triggered(self, ai_holdings: list) -> bool:
+        """检查AI持仓当日总亏损是否触发熔断"""
+        if not ai_holdings:
+            return False
+        total_profit = sum(h.get("profit_rate", 0) for h in ai_holdings)
+        avg_profit = total_profit / len(ai_holdings)
+        if avg_profit <= settings.DAILY_LOSS_CIRCUIT_BREAKER:
+            if not getattr(self, '_circuit_breaker_alerted', False):
+                self._circuit_breaker_alerted = True
+                logger.warning(f"AI持仓亏损熔断：平均收益率 {avg_profit:.2f}% <= {settings.DAILY_LOSS_CIRCUIT_BREAKER}%，停止自动买入")
+                bark_notifier.send(
+                    title="🛑 [亏损熔断] AI自动买入已暂停",
+                    body=f"AI持仓平均亏损 {avg_profit:.2f}% 触发熔断阈值({settings.DAILY_LOSS_CIRCUIT_BREAKER}%)，今日不再自动买入。",
+                    group="风控提醒",
+                    level="timeSensitive"
+                )
+            return True
+        return False
 
     def _get_ma_prices(self, code: str) -> Dict[str, Any]:
         """获取个股的关键均线价格，按交易日缓存（MA5/MA10/MA20 盘中不变）"""
@@ -505,7 +679,8 @@ class MarketMonitor:
 
         # 3. 从数据库读取当前持仓与待观察推荐标的
         active_holdings = HoldingManager.get_active_holdings()
-        pending_recs = RecommendationManager.get_pending_recommendations()
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        pending_recs = RecommendationManager.get_pending_recommendations(trade_date=today_str)
         pending_codes = {r["code"] for r in pending_recs}
 
         # 4. 扫描全市场抢筹信号（四种类型）
@@ -609,11 +784,23 @@ class MarketMonitor:
                     )
 
                 # 自动买入: 推荐标的 或 符合当前风格的高质量信号，且非一字板
-                should_buy = (is_recommended or is_high_signal) and not is_one_word_board
+                # 情绪周期约束：冰点/退潮期不自动买入，启动期只买推荐标的
+                cycle_allow = self._cycle_stance.get("allow_auto_buy", True)
+                cycle_only_rec = self._cycle_stance.get("only_recommended", False)
+                if cycle_only_rec and not is_recommended:
+                    cycle_allow = False
+                should_buy = cycle_allow and (is_recommended or is_high_signal) and not is_one_word_board
                 buy_reason = ""
                 if should_buy and code not in self._auto_bought_codes:
+                    # 仓位管理检查
                     ai_holdings = HoldingManager.get_active_holdings(holding_type="AI_AUTO")
-                    if not any(h["code"] == code for h in ai_holdings):
+                    if len(ai_holdings) >= settings.MAX_AI_POSITIONS:
+                        pass  # 超出最大持仓数，跳过
+                    elif len(self._auto_bought_codes) >= settings.MAX_DAILY_BUYS:
+                        pass  # 超出当日最大买入次数，跳过
+                    elif self._is_daily_loss_breaker_triggered(ai_holdings):
+                        pass  # 当日总亏损熔断，跳过
+                    elif not any(h["code"] == code for h in ai_holdings):
                         self._auto_bought_codes.add(code)
                         buy_reason = "复盘推荐" if is_recommended else signal_label
                         HoldingManager.add_holding(
@@ -636,6 +823,16 @@ class MarketMonitor:
 
                 # 判断是否属于动态中军池（成交额 >= 20亿 即为大容量标的）
                 is_core = amt_billion >= settings.CORE_POOL_MIN_AMOUNT
+
+                # 从涨停池获取该股所在板块的实时涨停家数
+                stock_industry = ""
+                zt_df = self._zt_pool_cache
+                if zt_df is not None and not zt_df.empty and "industry" in zt_df.columns:
+                    match = zt_df[zt_df["code"].astype(str) == code]
+                    if not match.empty:
+                        stock_industry = str(match.iloc[0].get("industry", ""))
+                sector_count = self._current_sector_counts.get(stock_industry, 1) if stock_industry else 1
+
                 tags = StrategyAnalyzer.identify_tags(
                     stock_code=code,
                     stock_name=name,
@@ -644,7 +841,7 @@ class MarketMonitor:
                     is_in_core_pool=is_core,
                     market_total_amount=total_amt,
                     index_change_pct=index_pct,
-                    sector_active_count=3  # 盘中无板块数据，默认 3 作为活跃线
+                    sector_active_count=sector_count
                 )
 
                 # 质量过滤：推荐标的或高质量信号才推送
@@ -676,16 +873,27 @@ class MarketMonitor:
                 if row["_signal_amplitude"]:
                     detail += f", 振幅:{float(row['amplitude']):.1f}%"
 
-                alert_msg = DynamicSellAdvisor.format_alert_message(
-                    trigger_type=trigger_title,
-                    stock_code=code,
-                    stock_name=name,
-                    current_price=price,
-                    change_pct=change_pct,
-                    volume_ratio=vol_ratio,
-                    strategy_tag=",".join(tags),
-                    detail_info=detail
-                )
+                # LLM润色：非观望风格且当日调用未超限时才调用，否则用规则化文案
+                llm_call_limit = 10
+                llm_calls_today = getattr(self, '_llm_alert_calls_today', 0)
+                if market_style["style"] != "观望" and llm_calls_today < llm_call_limit:
+                    alert_msg = DynamicSellAdvisor.format_alert_message(
+                        trigger_type=trigger_title,
+                        stock_code=code,
+                        stock_name=name,
+                        current_price=price,
+                        change_pct=change_pct,
+                        volume_ratio=vol_ratio,
+                        strategy_tag=",".join(tags),
+                        detail_info=detail
+                    )
+                    self._llm_alert_calls_today = llm_calls_today + 1
+                else:
+                    alert_msg = (
+                        f"【{trigger_title}】{name}({code})\n"
+                        f"现价:{price}元 (+{change_pct}%) {detail}\n"
+                        f"标签:[{','.join(tags)}]"
+                    )
 
                 bark_notifier.send(
                     title=f"{emoji} {trigger_title} {name}({code}) +{change_pct}%",
@@ -760,7 +968,8 @@ class MarketMonitor:
             if not stock_data.empty:
                 row = stock_data.iloc[0]
                 curr_price = float(row["price"])
-                is_zt = float(row["change_pct"]) >= 9.8
+                curr_change_pct = float(row["change_pct"])
+                is_zt = MarketMonitor._is_limit_up(code, curr_change_pct)
 
                 # 实时计算并更新持仓最新价格与收益率 (%)
                 HoldingManager.update_holding_profit_rate(code, curr_price)
@@ -789,6 +998,16 @@ class MarketMonitor:
                             float(row.get("high", curr_price)) +
                             float(row.get("low", curr_price))) / 4.0
 
+                # 计算持仓天数
+                buy_date_str = holding.get("buy_date", "")
+                holding_days = 0
+                if buy_date_str:
+                    try:
+                        buy_dt = datetime.datetime.strptime(buy_date_str, "%Y-%m-%d")
+                        holding_days = (datetime.datetime.now() - buy_dt).days
+                    except ValueError:
+                        pass
+
                 signals = HoldingMonitor.check_sell_signals(
                     stock_code=code,
                     stock_name=holding.get("name", code),
@@ -799,7 +1018,8 @@ class MarketMonitor:
                     is_limit_up=is_zt,
                     was_limit_up_today=holding.get("was_limit_up_today", False),
                     market_max_lbc=market_max_lbc if market_max_lbc > 0 else 5,
-                    market_zhaban_rate=market_zhaban_rate if market_zhaban_rate > 0 else 20.0
+                    market_zhaban_rate=market_zhaban_rate if market_zhaban_rate > 0 else 20.0,
+                    holding_days=holding_days
                 )
 
                 for sig in signals:
@@ -816,14 +1036,14 @@ class MarketMonitor:
                     if sig["level"] in ("CRITICAL", "HIGH"):
                         # 判断是否跌停
 
-                        if MarketMonitor._is_limit_down(code, change_pct):
+                        if MarketMonitor._is_limit_down(code, curr_change_pct):
                             # 跌停板封死，暂不平仓，等破板
                             self._pending_sell_codes.add(code)
                             if code not in self._alerted_sell_signals.get("__dt_pending__", set()):
                                 self._alerted_sell_signals.setdefault("__dt_pending__", set()).add(code)
                                 bark_notifier.send(
                                     title=f"🔒 [跌停锁定] {holding.get('name')}({code})",
-                                    body=f"触发 {sig['type']} 但当前跌停({change_pct}%)，暂不平仓，等破跌停板后自动卖出。",
+                                    body=f"触发 {sig['type']} 但当前跌停({curr_change_pct}%)，暂不平仓，等破跌停板后自动卖出。",
                                     group="卖出提醒",
                                     level="timeSensitive"
                                 )

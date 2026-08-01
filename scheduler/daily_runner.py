@@ -56,7 +56,8 @@ def job_call_auction():
     try:
         today = datetime.datetime.now()
         today_str = today.strftime("%Y%m%d")
-        yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y%m%d")
+        from core.trade_calendar import get_previous_trading_day
+        yesterday_str = get_previous_trading_day(today.date())
 
         # ---- 1. 昨日 LLM 复盘推荐标的 ----
         pending_recs = RecommendationManager.get_pending_recommendations(trade_date=today_str)
@@ -138,10 +139,15 @@ def job_post_market():
         # 获取真实溢价和成交额，替换默认值
         premium_data = DataFetcher.get_yesterday_zt_premium()
         total_amount = float(spot_df["amount"].sum()) if not spot_df.empty else 8e11
+
+        # 计算"破规胆量"：昨日连板>=3且3日偏离度接近红线的股票中，今日仍涨停的比例
+        yidong_bravery = _compute_yidong_bravery(today_str, zt_df)
+
         emotion_res = EmotionVector.calculate(
             zt_df=zt_df, zhaban_df=zhaban_df, dt_df=dt_df,
             total_market_amount=total_amount,
-            yesterday_zt_avg_premium=premium_data.get("intraday_premium", 1.5)
+            yesterday_zt_avg_premium=premium_data.get("intraday_premium", 1.5),
+            yidong_stocks_next_day_promoted_rate=yidong_bravery
         )
         total_amount_billion = total_amount / 1e8
         bl = DataFetcher.get_adaptive_baseline()
@@ -149,19 +155,38 @@ def job_post_market():
         market_style = MarketStyle.classify(emotion_res,
                                             market_amount=total_amount_billion,
                                             baseline=baseline)
-        cycle_stage = market_style.get("style", "未判定")
+
+        # 情绪周期状态机：基于前一交易日的周期状态和今日数据判定当前所处阶段
+        from core.cycle_machine import EmotionCycleMachine
+        recent_sentiments = SentimentManager.get_recent_sentiments(days_lookback=3)
+        yesterday_phase = recent_sentiments[0]["cycle_stage"] if recent_sentiments else "冰点"
+        cycle_result = EmotionCycleMachine.determine_phase(emotion_res, yesterday_phase)
+        cycle_stage = cycle_result["phase"]
+        cycle_reason = cycle_result["reason"]
+
         style_reason = market_style.get("reason", "")
         k_factor = market_style.get("capacity_factor", 1.0)
         logger.info(
-            f"盘后风格判定: [{cycle_stage}] {style_reason} | "
-            f"K={k_factor:.2f}(今日{total_amount:.0f}亿/均{baseline:.0f}亿) | "
+            f"盘后周期判定: [{cycle_stage}] {cycle_reason} | "
+            f"风格:{market_style.get('style')} K={k_factor:.2f}(今日{total_amount:.0f}亿/均{baseline:.0f}亿) | "
             f"涨停{emotion_res['zt_count']}/跌停{emotion_res['dt_count']}/"
             f"溢价{emotion_res['yield_rate']}%/情绪{emotion_res['sentiment_index']}"
         )
 
+        # 周期转换时发送 Bark 通知
+        if cycle_result["transition"]:
+            stance = EmotionCycleMachine.get_trading_stance(cycle_stage)
+            bark_notifier.send(
+                title=f"🔄 [周期转换] {cycle_result['yesterday']} → {cycle_stage}",
+                body=f"{cycle_reason}\n操作建议: {stance['stance']} - {stance['desc']}",
+                group="情绪周期",
+                level="timeSensitive"
+            )
+
         # 生成深度复盘分析（传入风格判定供 LLM 参考）
         style_info = (
-            f"风格={cycle_stage} K={k_factor:.2f}(今日{total_amount:.0f}亿/均{baseline:.0f}亿) "
+            f"周期={cycle_stage}({cycle_reason}) "
+            f"风格={market_style.get('style')} K={k_factor:.2f}(今日{total_amount:.0f}亿/均{baseline:.0f}亿) "
             f"推荐战法={market_style.get('priority_strategy', '')} {style_reason}"
         )
         review_report = ""
@@ -403,9 +428,10 @@ def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame =
     LLM 复盘打分：让 LLM 评估昨日推荐标的今日的实际表现，形成闭环反馈。
     评分存入 recommendations 表的 sell_condition 字段（复用为评分备注）。
     """
-    import datetime
-    yesterday = (datetime.datetime.strptime(trade_date, "%Y%m%d") -
-                 datetime.timedelta(days=1)).strftime("%Y%m%d")
+    from core.trade_calendar import get_previous_trading_day
+    yesterday = get_previous_trading_day(
+        datetime.datetime.strptime(trade_date, "%Y%m%d").date()
+    )
     pending = RecommendationManager.get_pending_recommendations(trade_date=yesterday)
     if not pending or spot_df is None or spot_df.empty:
         return
@@ -435,6 +461,41 @@ def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame =
         logger.info(f"昨日推荐复盘评估: {evaluation}")
     except Exception as e:
         logger.warning(f"LLM 复盘打分失败: {e}")
+
+
+def _compute_yidong_bravery(today_str: str, today_zt_df) -> float:
+    """
+    计算"破规胆量"维度：昨日高位连板(>=3板)的股票中，今日仍在涨停池的比例。
+    这反映资金在监管压力下继续做多的勇气。
+    无数据时返回默认50%（中性）。
+    """
+    try:
+        from core.trade_calendar import get_previous_trading_day
+        yesterday = get_previous_trading_day(
+            datetime.datetime.strptime(today_str, "%Y%m%d").date()
+        )
+        yesterday_zt = DataFetcher.get_zt_pool(date_str=yesterday)
+        if yesterday_zt is None or yesterday_zt.empty or "lbc" not in yesterday_zt.columns:
+            return 50.0
+        if today_zt_df is None or today_zt_df.empty:
+            return 50.0
+
+        # 昨日连板>=3的高位股
+        high_lbc = yesterday_zt[yesterday_zt["lbc"].astype(int) >= 3]
+        if high_lbc.empty:
+            return 50.0
+
+        high_codes = set(high_lbc["code"].astype(str))
+        today_zt_codes = set(today_zt_df["code"].astype(str))
+
+        # 今日仍在涨停池 = 晋级成功
+        promoted = high_codes & today_zt_codes
+        rate = len(promoted) / len(high_codes) * 100
+        logger.info(f"破规胆量: 昨日高位{len(high_codes)}只, 今日晋级{len(promoted)}只, 胆量{rate:.1f}%")
+        return round(rate, 1)
+    except Exception as e:
+        logger.warning(f"计算破规胆量失败: {e}")
+        return 50.0
 
 
 def _auto_populate_dragons(trade_date: str, zt_df):

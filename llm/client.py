@@ -61,6 +61,7 @@ class LLMClient:
 
         logger.info(f"发送 LLM 请求 [{self.model}] 模块: {module}")
 
+        last_error = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 response = self.client.chat.completions.create(
@@ -77,13 +78,14 @@ class LLMClient:
                                       tokens, True, "")
                 return content.strip()
             except Exception as e:
+                last_error = e
                 logger.warning(f"LLM 请求失败 (第 {attempt}/{self.max_retries} 次): {e}")
                 if attempt == self.max_retries:
-                    logger.error("LLM 请求已达最大重试次数，抛出异常。")
+                    logger.error("LLM 请求已达最大重试次数，尝试备用模型...")
                     self._persist_llm_log(module, system_prompt, user_prompt, "",
                                           0, False, str(e)[:200])
-                    raise e
-                time.sleep(2.0)
+                else:
+                    time.sleep(2.0)
 
         # 主模型全部失败 → 尝试备用模型
         if settings.LLM_BACKUP_BASE_URL and settings.LLM_BACKUP_MODEL:

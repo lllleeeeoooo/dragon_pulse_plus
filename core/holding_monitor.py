@@ -27,7 +27,8 @@ class HoldingMonitor:
         is_limit_up: bool,
         was_limit_up_today: bool,
         market_max_lbc: int = 5,
-        market_zhaban_rate: float = 20.0
+        market_zhaban_rate: float = 20.0,
+        holding_days: int = 0
     ) -> List[Dict[str, Any]]:
         """
         检查单只持仓股票是否触卖出/减仓/止损信号
@@ -36,6 +37,15 @@ class HoldingMonitor:
 
         # 变动百分比
         profit_pct = round(((current_price - cost_price) / cost_price) * 100, 2) if cost_price > 0 else 0.0
+
+        # 规则 0：绝对止损（最高优先级，无条件触发）
+        if profit_pct <= settings.ABSOLUTE_STOP_LOSS_PCT:
+            signals.append({
+                "type": "绝对止损",
+                "level": "CRITICAL",
+                "reason": f"标的 {stock_name}({stock_code}) 亏损已达 {profit_pct}%，触及绝对止损线({settings.ABSOLUTE_STOP_LOSS_PCT}%)，无条件止损离场！"
+            })
+            return signals  # 绝对止损直接返回，不再检查其他规则
 
         # 规则 1：断板必卖 (针对短线龙头/连板股)
         if was_limit_up_today and not is_limit_up:
@@ -59,6 +69,14 @@ class HoldingMonitor:
                 "type": "情绪到顶预警",
                 "level": "WARNING",
                 "reason": f"全市场最高连板已达 {market_max_lbc} 板极值且炸板率高达 {market_zhaban_rate}%，市场处于高潮末端/退潮期，建议逢高落袋为安。"
+            })
+
+        # 规则 4：时间止损 (持仓超过N天且未盈利)
+        if holding_days >= settings.TIME_STOP_LOSS_DAYS and profit_pct <= 0:
+            signals.append({
+                "type": "时间止损",
+                "level": "WARNING",
+                "reason": f"标的 {stock_name}({stock_code}) 已持仓 {holding_days} 天且仍亏损 {profit_pct}%，短线资金效率低下，建议换股。"
             })
 
         return signals

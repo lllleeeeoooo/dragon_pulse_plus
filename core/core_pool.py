@@ -10,29 +10,28 @@ logger = logging.getLogger(__name__)
 
 class ActiveCorePool:
     """
-    动态中军池与板块核心标的维护类
-    解决“硬编码无法定义谁是中军”的痛点：
-    - 每日选取板块内成交额 Top 3 且总市值 Top 5 的个股
-    - 计算个股走势与所属板块/行业指数的皮尔逊相关系数 Beta (Correlation > 0.8)
-    - 过滤出日成交额 > 20 亿的股票标记为“动态中军”
+    Dynamic core pool maintenance.
+    Selects top volume and market cap stocks from a sector as core leaders.
+
+    Beta correlation requires board_index_series (sector index history).
+    Currently akshare does not provide a convenient API for this,
+    so filtering is based on volume + market cap dimensions.
+    Enable real Beta filtering by passing board_index_series when available.
     """
 
     @staticmethod
     def calculate_beta(stock_prices: pd.Series, index_prices: pd.Series) -> float:
-        """
-        计算个股与板块指数走势的皮尔逊相关系数 (Correlation)
-        """
+        """Calculate Pearson correlation between stock and sector index."""
         if len(stock_prices) < 5 or len(index_prices) < 5:
             return 0.0
         try:
-            # 确保对齐
             df = pd.DataFrame({"stock": stock_prices, "index": index_prices}).dropna()
             if len(df) < 5:
                 return 0.0
             corr = df["stock"].corr(df["index"])
             return float(corr) if not np.isnan(corr) else 0.0
         except Exception as e:
-            logger.warning(f"计算相关系数 Beta 失败: {e}")
+            logger.warning(f"Beta calculation failed: {e}")
             return 0.0
 
     @classmethod
@@ -42,43 +41,48 @@ class ActiveCorePool:
         board_index_series: Optional[pd.Series] = None
     ) -> List[Dict[str, Any]]:
         """
-        从板块成分股中筛选核心“动态中军”
-        :param board_cons_df: 板块成分股 DataFrame (必须包含: code, name, amount, total_market_cap)
+        Filter core leaders from sector constituents.
+        :param board_cons_df: DataFrame with columns: code, name, amount
+        :param board_index_series: Optional sector index close price series for Beta filtering
         """
         if board_cons_df is None or board_cons_df.empty:
             return []
 
         df = board_cons_df.copy()
 
-        # 数值转换
-        df["amount_billion"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0) / 1e8  # 转换为亿元
-        df["market_cap_billion"] = pd.to_numeric(df["total_market_cap"], errors="coerce").fillna(0) / 1e8
+        df["amount_billion"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0) / 1e8
+        df["market_cap_billion"] = pd.to_numeric(
+            df.get("total_market_cap", pd.Series(dtype=float)), errors="coerce"
+        ).fillna(0) / 1e8
 
-        # 条件 1: 成交额门槛 >= CORE_POOL_MIN_AMOUNT (如 20 亿)
         amount_filtered = df[df["amount_billion"] >= settings.CORE_POOL_MIN_AMOUNT]
 
         if amount_filtered.empty:
-            # 若无20亿以上，退而求其次选前3名成交额
             amount_filtered = df.sort_values(by="amount_billion", ascending=False).head(settings.CORE_POOL_TOP_AMOUNT)
 
-        # 排序：成交额Top3 & 市值Top5
-        top_amount_codes = set(df.sort_values(by="amount_billion", ascending=False).head(settings.CORE_POOL_TOP_AMOUNT)["code"])
-        top_cap_codes = set(df.sort_values(by="market_cap_billion", ascending=False).head(settings.CORE_POOL_TOP_MARKET_CAP)["code"])
+        top_amount_codes = set(
+            df.sort_values(by="amount_billion", ascending=False).head(settings.CORE_POOL_TOP_AMOUNT)["code"]
+        )
+        top_cap_codes = set(
+            df.sort_values(by="market_cap_billion", ascending=False).head(settings.CORE_POOL_TOP_MARKET_CAP)["code"]
+        )
 
-        # 核心候选股：大成交（新版 akshare 板块成分股不含总市值，兼容处理）
         core_candidates = amount_filtered[
-            amount_filtered["code"].isin(top_amount_codes |
-                                         (top_cap_codes if df["market_cap_billion"].sum() > 0 else top_amount_codes))
+            amount_filtered["code"].isin(
+                top_amount_codes | (top_cap_codes if df["market_cap_billion"].sum() > 0 else top_amount_codes)
+            )
         ]
 
         results = []
         for _, row in core_candidates.iterrows():
-            # Beta 相关系数：有指数序列时真实计算，否则使用默认值（后续可接板块指数数据）
-            beta = 0.85  # 默认值
+            beta = None
             if board_index_series is not None:
                 hist_prices = row.get("history_prices")
                 if hist_prices is not None:
-                    beta = cls.calculate_beta(pd.Series(hist_prices), board_index_series) or 0.85
+                    beta = cls.calculate_beta(pd.Series(hist_prices), board_index_series)
+
+            if beta is not None and beta < settings.CORE_POOL_MIN_BETA:
+                continue
 
             results.append({
                 "code": str(row.get("code")),
@@ -87,7 +91,7 @@ class ActiveCorePool:
                 "change_pct": float(row.get("change_pct", 0.0)),
                 "amount_billion": round(float(row["amount_billion"]), 2),
                 "market_cap_billion": round(float(row["market_cap_billion"]), 2),
-                "beta": round(beta, 2),
+                "beta": round(beta, 2) if beta is not None else None,
                 "is_active_core": True
             })
 

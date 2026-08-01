@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     EMOTION_TOP_MAX_LBC: int = Field(default=8, description="全市场连板高度触发情绪到顶预警的最低板数")
     EMOTION_TOP_ZHABAN_RATE: float = Field(default=35.0, description="全市场炸板率触发情绪到顶预警的最低百分比(%)")
 
+    # ==================== 止损配置 ====================
+    ABSOLUTE_STOP_LOSS_PCT: float = Field(default=-7.0, description="绝对止损线(%)，亏损超过此值无条件触发卖出")
+    TIME_STOP_LOSS_DAYS: int = Field(default=3, description="时间止损天数，持仓超过N天且未盈利则触发警告")
+
     # ==================== Bark 推送配置 ====================
     BARK_TOKEN: str = Field(default="", description="Bark 推送 Device Key")
     BARK_SERVER_URL: str = Field(default="https://api.day.app", description="Bark 服务器地址，默认官方 api.day.app")
@@ -49,6 +53,11 @@ class Settings(BaseSettings):
     PRICE_BURST_MAX: float = Field(default=9.5, description="点火异动股价涨幅上限 (%)，已涨停(>=9.5%)的不算点火")
     FETCH_RETRY_COUNT: int = Field(default=3, description="数据抓取重试次数")
     FETCH_RETRY_DELAY: float = Field(default=2.0, description="数据抓取重试延迟(秒)")
+
+    # ==================== 仓位管理配置 ====================
+    MAX_AI_POSITIONS: int = Field(default=5, description="AI自动持仓最大数量，超出不再买入")
+    MAX_DAILY_BUYS: int = Field(default=3, description="AI每日最大自动买入次数")
+    DAILY_LOSS_CIRCUIT_BREAKER: float = Field(default=-5.0, description="AI持仓当日总亏损熔断阈值(%)，触发后停止买入")
 
     # ==================== 股票过滤配置 ====================
     EXCLUDE_STAR_MARKET: bool = Field(default=True, description="是否排除科创板股票 (688开头)")
@@ -72,6 +81,10 @@ class Settings(BaseSettings):
     CORE_POOL_MIN_BETA: float = Field(default=0.8, description="中军相关性(Beta)判定阈值")
     CORE_POOL_MIN_AMOUNT: float = Field(default=20.0, description="中军日成交额门槛 (亿元)")
 
+    # ==================== 板块联动监控配置 ====================
+    SECTOR_LINKAGE_MIN_COUNT: int = Field(default=2, description="板块涨停家数达到此值时触发联动预警")
+    SECTOR_LINKAGE_ACCEL_DELTA: int = Field(default=1, description="板块涨停家数较上轮增加此值时触发加速预警")
+
     SECOND_WAVE_RETREAT_MIN: float = Field(default=0.30, description="二波战法龙头回撤最小比例 (30%)")
     SECOND_WAVE_RETREAT_MAX: float = Field(default=0.50, description="二波战法龙头回撤最大比例 (50%)")
     SECOND_WAVE_LOOKBACK_DAYS: int = Field(default=30, description="二波战法追溯人气龙头的天数")
@@ -80,10 +93,20 @@ class Settings(BaseSettings):
     CAPACITY_K_MIN: float = Field(default=0.7, description="容量因子 K 下限（流动性枯竭）")
     CAPACITY_K_MAX: float = Field(default=1.5, description="容量因子 K 上限（流动性泛滥）")
     PREMIUM_PANIC_THRESHOLD: float = Field(default=-2.5, description="溢价崩塌阈值(%)，低于此值触发抱团避险")
-    PREMIUM_WEIGHT: float = Field(default=0.40, description="溢价在盘中情绪分中的权重")
-    BREADTH_WEIGHT: float = Field(default=0.25, description="宽度在盘中情绪分中的权重")
-    HEIGHT_WEIGHT: float = Field(default=0.20, description="高度在盘中情绪分中的权重")
-    SUPPORT_WEIGHT: float = Field(default=0.15, description="承接在盘中情绪分中的权重")
+    # 盘中情绪分权重（盘后6维去掉力度/破规胆量后按比例归一化: 25/70, 20/70, 15/70, 10/70）
+    PREMIUM_WEIGHT: float = Field(default=0.36, description="溢价在盘中情绪分中的权重")
+    BREADTH_WEIGHT: float = Field(default=0.29, description="宽度在盘中情绪分中的权重")
+    HEIGHT_WEIGHT: float = Field(default=0.21, description="高度在盘中情绪分中的权重")
+    SUPPORT_WEIGHT: float = Field(default=0.14, description="承接在盘中情绪分中的权重")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        weight_sum = self.PREMIUM_WEIGHT + self.BREADTH_WEIGHT + self.HEIGHT_WEIGHT + self.SUPPORT_WEIGHT
+        if abs(weight_sum - 1.0) > 0.05:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"盘中情绪权重之和为 {weight_sum:.2f}，偏离1.0超过5%，请检查配置"
+            )
 
 
 # 全局单例配置实例
