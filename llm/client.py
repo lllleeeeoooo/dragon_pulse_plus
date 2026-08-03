@@ -13,8 +13,27 @@ logger = logging.getLogger(__name__)
 class LLMClient:
     """
     统一 LLM API 调用客户端
-    兼容 DeepSeek / OpenAI / Claude 及任何兼容 OpenAI 协议的大模型服务
-    支持自动重试、超时与结构化响应处理
+    ========================
+
+    兼容所有 OpenAI 协议的大模型服务（DeepSeek / OpenAI / Claude / Moonshot 等）。
+    全局单例 llm_client 在模块底部创建，整个系统共享同一个客户端实例。
+
+    核心流程 (generate 方法):
+    ┌─────────────┐    失败重试(最多N次)    全部失败
+    │ 主模型调用   │ ─────────────────────→ ──────────→ 备用模型
+    │ (LLM_MODEL)  │                          │         (LLM_BACKUP_*)
+    └──────┬──────┘                          │              │
+           │ 成功                             │ 成功         │ 失败
+           ▼                                  ▼              ▼
+      返回内容 + 落库                    返回内容 + 落库   返回 ""
+
+    每次调用自动记录到 llm_logs 表：
+    - module: 调用来源（pre_market/call_auction/post_market/sell_advisor）
+    - system_prompt / user_prompt: 完整提示词
+    - response: LLM 回复全文
+    - tokens_used: Token 消耗量
+    - success: 成功/失败
+    - error_msg: 失败原因（含 fallback: 前缀标识备用模型）
     """
 
     def __init__(
@@ -49,8 +68,21 @@ class LLMClient:
         module: str = "unknown"
     ) -> str:
         """
-        同步生成文本响应。每次调用自动落库记录。
-        :param module: 调用模块标识 (pre_market/call_auction/post_market/sell_advisor)
+        同步生成 LLM 文本响应（系统唯一的 LLM 调用入口）。
+
+        执行逻辑：
+        1. 组装 system + user 消息
+        2. 主模型调用（最多 self.max_retries 次，每次失败间隔 2 秒）
+        3. 每次调用（成功/失败）自动写入 llm_logs 表
+        4. 主模型全部失败后，自动降级到备用模型（LLM_BACKUP_*）
+        5. 备用模型也失败则返回空字符串 ""
+
+        :param system_prompt: 系统提示词（角色设定、输出格式要求）
+        :param user_prompt:   用户提示词（具体问题、数据上下文）
+        :param temperature:   覆盖默认温度，None 则用 settings.LLM_TEMPERATURE
+        :param module:        调用模块标识，用于日志分组
+                              pre_market / call_auction / post_market / sell_advisor
+        :return: LLM 响应文本，失败时返回空字符串 ""
         """
         temp = temperature if temperature is not None else self.temperature
 
@@ -117,7 +149,10 @@ class LLMClient:
 
     def _persist_llm_log(self, module: str, system_prompt: str, user_prompt: str,
                          response: str, tokens: int, success: bool, error_msg: str):
-        """内部方法：LLM 调用记录落库，静默失败不影响主流程"""
+        """
+        将每次 LLM 调用的完整上下文写入 llm_logs 表。
+        刻意捕获所有异常——落库失败绝不能影响主业务流程。
+        """
         try:
             from database.services import LLMLogManager
             LLMLogManager.add_log(
@@ -135,4 +170,6 @@ class LLMClient:
 
 
 # 全局 LLM 单例客户端
+# 所有模块通过 `from llm.client import llm_client` 引用此实例
+# 启动时自动读取 .env 中的 LLM_* 配置初始化
 llm_client = LLMClient()

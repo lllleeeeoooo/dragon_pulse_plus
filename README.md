@@ -218,7 +218,7 @@
 
 ## 七、数据库结构设计 (SQLite)
 
-系统使用本地 `dragon_pulse.db` 存储 13 张核心数据表：
+系统使用本地 `dragon_pulse.db` 存储 14 张核心数据表：
 
 ### 1. `holdings`（持仓管理表）
 - `id`: 主键
@@ -285,6 +285,13 @@
 - `error_logs`: 系统错误/警告日志
 - `system_logs`: 系统运行日志
 - `trade_calendar`: 交易日历缓存
+
+### 14. `investigation_records`（立案调查/违规处罚记录表）
+- `code` / `name`: 股票代码 / 名称
+- `event_type`: 事件类型（立案调查/违规处罚/监管警示/问询函/通报批评/纪律处分）
+- `event_content`: 事件详细内容（公告原文）
+- `announce_date` / `detected_date`: 公告日期 / 系统检测日期
+- `is_active`: 是否仍处于风险状态
 
 ---
 

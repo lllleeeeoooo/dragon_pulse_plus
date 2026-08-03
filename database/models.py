@@ -180,6 +180,25 @@ class SectorStrength(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
+class InvestigationRecord(Base):
+    """
+    立案调查记录表
+    存储证监会/交易所立案调查、违规处罚、监管警示等风险事件。
+    每日从东方财富个股风险提示接口同步，用于源头过滤和风险预警。
+    """
+    __tablename__ = "investigation_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(12), nullable=False, index=True, comment="股票代码")
+    name = Column(String(32), nullable=False, comment="股票名称")
+    event_type = Column(String(32), nullable=False, comment="事件类型：立案调查/违规处罚/监管警示/问询函等")
+    event_content = Column(Text, comment="事件详细内容")
+    announce_date = Column(String(10), nullable=False, index=True, comment="公告日期 YYYYMMDD")
+    detected_date = Column(String(10), nullable=False, comment="系统检测日期 YYYYMMDD")
+    is_active = Column(Boolean, default=True, comment="是否仍处于调查/风险状态")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
 class PushLog(Base):
     """
     推送通知日志表

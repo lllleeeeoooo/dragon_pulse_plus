@@ -13,39 +13,68 @@ from core.trade_calendar import is_trading_day, is_last_non_trading_day
 logger = logging.getLogger(__name__)
 
 _cached_pre_market_report: str = ""
-_job_last_run: Dict[str, Dict[str, Any]] = {}
-
 def _record_job_run(job_id: str, job_name: str):
-    """记录定时任务执行时间"""
+    """记录定时任务执行时间（仅数据库，不占内存）"""
     now = datetime.datetime.now()
-    _job_last_run[job_id] = {
-        "name": job_name,
-        "last_run": now.strftime("%H:%M:%S"),
-        "last_date": now.strftime("%Y%m%d"),
-        "today": now.strftime("%Y%m%d"),
-    }
+    try:
+        from database import SystemLogManager, db_manager
+        from database.models import SystemLog
+
+        # 监控循环每轮更新同一条记录（避免重复写入）
+        if job_id == "job_monitor_loop":
+            session = db_manager.get_session()
+            try:
+                existing = session.query(SystemLog).filter(
+                    SystemLog.log_date == now.strftime("%Y-%m-%d"),
+                    SystemLog.category == "job_run",
+                    SystemLog.title == job_name,
+                ).first()
+                if existing:
+                    existing.detail = f"{now.strftime('%H:%M:%S')}|{job_id}"
+                    session.commit()
+                    return
+            finally:
+                session.close()
+
+        SystemLogManager.add_log(
+            log_date=now.strftime("%Y-%m-%d"),
+            category="job_run",
+            title=job_name,
+            detail=f"{now.strftime('%H:%M:%S')}|{job_id}"
+        )
+    except Exception:
+        pass
 
 
 def _get_job_status() -> List[Dict[str, Any]]:
-    """获取所有定时任务的状态列表"""
-    today = datetime.datetime.now().strftime("%Y%m%d")
+    """获取所有定时任务的状态列表（查库）"""
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
     all_jobs = [
         {"id": "job_log_cleanup",    "name": "日志清理",         "time": "04:00", "desc": "系统/LLM/错误日志保留15天，推送30天"},
         {"id": "job_dragon_expire",  "name": "龙头过期标记",     "time": "04:05", "desc": "超过30天无人气龙头自动失效"},
         {"id": "job_pre_market",     "name": "盘前简报",         "time": "08:30", "desc": "新闻抓取→LLM分析→推送题材预测"},
         {"id": "job_call_auction",   "name": "竞价观察",         "time": "09:26", "desc": "竞价快照→LLM判断超预期标的"},
-        {"id": "job_monitor_loop",   "name": "盘中实时监控",     "time": "09:30-15:00", "desc": f"15秒轮询，点火异动+板块联动+AI自动交易"},
+        {"id": "job_monitor_loop",   "name": "盘中实时监控",     "time": "09:30-15:00", "desc": "15秒轮询，点火异动+板块联动+AI自动交易"},
         {"id": "job_post_market",    "name": "盘后深度复盘",     "time": "15:30", "desc": "LLM复盘+推荐标的+指数落库+盈亏推送"},
         {"id": "job_holiday_summary","name": "假日消息汇总",     "time": "20:00", "desc": "假期最后一天汇总近期消息"},
     ]
+
+    db_records = {}
+    try:
+        from database import SystemLogManager
+        logs = SystemLogManager.get_logs(log_date=today, category="job_run", limit=50)
+        for log in logs:
+            detail = log.get("detail", "")
+            if "|" in detail:
+                parts = detail.split("|", 1)
+                db_records[parts[1]] = {"last_run": parts[0], "last_date": today}
+    except Exception:
+        pass
+
     for j in all_jobs:
-        record = _job_last_run.get(j["id"])
-        if record:
-            j["last_run"] = record["last_run"]
-            j["ran_today"] = record.get("last_date") == today
-        else:
-            j["last_run"] = "-"
-            j["ran_today"] = False
+        record = db_records.get(j["id"])
+        j["last_run"] = record["last_run"] if record else "-"
+        j["ran_today"] = record is not None
     return all_jobs
 
 
@@ -223,6 +252,7 @@ def _auto_populate_dragons(trade_date: str, zt_df):
     if zt_df is None or zt_df.empty or "lbc" not in zt_df.columns:
         return
     try:
+        from database import RecommendationManager
         from database.services import db_manager
         from database.models import HistoricDragon
         import datetime

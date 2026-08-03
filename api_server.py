@@ -461,6 +461,8 @@ def monitor_page():
     return render_html()
 
 
+@app.get("/dashboard", summary="系统综合看板 JSON",
+         description="返回看板所需全部数据", tags=["AkShare 数据"])
 def dashboard():
     from dashboard import build_dashboard_data
     return {"code": 200, "data": build_dashboard_data()}
@@ -470,7 +472,7 @@ def dashboard():
          description="返回当前市场风格判定及推荐战法，每15秒自动更新",
          tags=[AKSHARE_TAG])
 def data_market_style():
-    from scheduler.market_monitor import _current_market_style_global
+    from scheduler.monitor_core import _current_market_style_global
     style = dict(_current_market_style_global)
     return {"code": 200, "data": style if style else {"style": "未知", "reason": "监控尚未启动或数据不足"}}
 

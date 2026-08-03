@@ -24,7 +24,7 @@ def build_dashboard_data() -> Dict[str, Any]:
     """
 
     # ---- 盘中实时状态（来自 market_monitor 全局缓存） ----
-    from scheduler.market_monitor import (
+    from scheduler.monitor_core import (
         _current_market_style_global, _monitor_running, _last_monitor_cycle,
         _circuit_breaker_alerted, _index_breaker_alerted,
     )

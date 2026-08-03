@@ -17,6 +17,7 @@ from database.logs import PushLogManager, LLMLogManager, ErrorLogManager, LogRet
 from database.market_data import MarketIndexManager, DailySnapshotManager, ZtPoolManager, SectorStrengthManager
 from database.calendar import TradeCalendarManager
 from database.system_log import SystemLogManager
+from database.investigation import InvestigationManager
 
 __all__ = [
     "db_manager",
@@ -36,4 +37,5 @@ __all__ = [
     "SectorStrengthManager",
     "TradeCalendarManager",
     "SystemLogManager",
+    "InvestigationManager",
 ]

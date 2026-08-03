@@ -63,6 +63,10 @@ def job_call_auction():
         spot_df = DataFetcher.get_realtime_spot()
 
         # ---- 5. LLM 竞价观察指令 ----
+        # 读取 09:25 规则引擎竞价预判作为 LLM 上下文
+        from scheduler.monitor_auction import _auction_prediction_cache
+        auction_prediction = _auction_prediction_cache or ""
+
         # 获取昨日涨停溢价，用于竞价风控
         premium_info = DataFetcher.get_yesterday_zt_premium()
         result = CallAuctionAnalyzer.run_auction_analysis(
@@ -70,7 +74,8 @@ def job_call_auction():
             auction_df=spot_df,
             yesterday_zt_auction_yield=premium_info.get("intraday_premium", 1.5),
             recommended_targets_summary=recs_summary,
-            predicted_sectors_summary=predicted_summary
+            predicted_sectors_summary=predicted_summary,
+            auction_prediction=auction_prediction
         )
 
         bark_notifier.send(

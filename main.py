@@ -172,6 +172,9 @@ def main():
         logger.info("收到底层终止信号，正在关闭系统...")
         scheduler.shutdown()
         logger.info("系统已安全退出。")
+    except Exception as e:
+        logger.error(f"系统运行异常: {e}", exc_info=True)
+        scheduler.shutdown()
 
 
 if __name__ == "__main__":

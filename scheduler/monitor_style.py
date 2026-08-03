@@ -116,7 +116,7 @@ class _MonitorStyleMixin:
         # 获取昨日涨停溢价（市场温度计），每 2 分钟刷新一次
         now = time.time()
         if now - getattr(self, '_premium_cache_time', 0) > 120:
-            self._premium_cache = DataFetcher.get_yesterday_zt_premium()
+            self._premium_cache = self._DF.get_yesterday_zt_premium()
             self._premium_cache_time = now
         premium = self._premium_cache.get("intraday_premium", 0)
 
@@ -154,17 +154,17 @@ class _MonitorStyleMixin:
         # ── 自适应动态容量因子 K ──
         now_date = datetime.datetime.now().strftime("%Y%m%d")
         if getattr(self, '_baseline_date', '') != now_date:
-            bl = DataFetcher.get_adaptive_baseline()
+            bl = self._DF.get_adaptive_baseline()
             self._baseline_ma = bl["ma_amount"]
             self._baseline_date = now_date
             self._baseline_source = bl["source"]
         baseline = getattr(self, '_baseline_ma', 8000)
 
-        spot_total = DataFetcher.get_market_total_amount() if not spot_df.empty else 0
+        spot_total = self._DF.get_market_total_amount() if not spot_df.empty else 0
         now_amount = spot_total / 1e8  # 此刻累计(亿)
 
         # 预估全天：时间外推 + 昨日全天兜底
-        est = DataFetcher.estimate_today_amount(spot_total)
+        est = self._DF.estimate_today_amount(spot_total)
         estimated_today = est["estimated"] if est.get("estimated", 0) > 0 else now_amount
 
         # K = 预估全天 / 昨日全天（盘后有真实数据时更准）
@@ -190,7 +190,7 @@ class _MonitorStyleMixin:
             style["flat_count"] = int((spot_df["change_pct"] == 0).sum())
             style["limit_up_est"] = int((spot_df["change_pct"] >= 9.8).sum())
             style["limit_down_est"] = int(spot_df.apply(
-            lambda r: MarketMonitor._is_limit_down(str(r["code"]), float(r["change_pct"])), axis=1).sum())
+            lambda r: type(self)._is_limit_down(str(r["code"]), float(r["change_pct"])), axis=1).sum())
         style["score_premium"] = score_premium
         style["score_breadth"] = score_breadth
         style["score_height"] = score_height
@@ -241,7 +241,7 @@ class _MonitorStyleMixin:
         try:
             from core.trade_calendar import get_previous_trading_day
             yesterday = get_previous_trading_day()
-            yesterday_zt = DataFetcher.get_zt_pool(date_str=yesterday)
+            yesterday_zt = self._DF.get_zt_pool(date_str=yesterday)
             today_zt = self._zt_pool_cache
 
             if yesterday_zt is None or yesterday_zt.empty or "lbc" not in yesterday_zt.columns:

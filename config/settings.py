@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     FUND_INFLOW_MIN: float = Field(default=2000.0, description="主力资金扫货绝对底线 (万元)，小盘股兜底阈值")
     FUND_INFLOW_CAP_RATIO: float = Field(default=0.0005, description="主力资金扫货流通市值比例，与 FUND_INFLOW_MIN 取较大值作为动态阈值")
     MONITOR_INTERVAL_SECONDS: int = Field(default=15, description="盘中实时快照轮询间隔(秒)")
+    MONITOR_POOL_CACHE_SECONDS: int = Field(default=60, description="涨停/炸板池缓存刷新间隔(秒)")
+    MONITOR_LLM_ALERT_LIMIT: int = Field(default=10, description="每日 LLM 润色异动推送次数上限")
+    MONITOR_NEAR_LIMIT_RATIO: float = Field(default=0.84, description="逼近封板区间 = 涨停线 × 比值")
     VOL_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动成交量相比过去5日均值的倍数门槛")
     PRICE_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动股价涨幅下限 (%)，低于此值不触发")
     PRICE_BURST_MAX: float = Field(default=9.5, description="点火异动股价涨幅上限 (%) - 主板 10cm，已涨停的不算点火")
@@ -79,6 +82,8 @@ class Settings(BaseSettings):
 
     # ==================== API Server 安全配置 ====================
     API_KEY: str = Field(default="", description="API Server 鉴权密钥，为空则跳过鉴权")
+    BACKTEST_INITIAL_CAPITAL: float = Field(default=1000000.0, description="回测/净值计算初始资金(元)")
+    INVESTIGATION_CACHE_SECONDS: int = Field(default=3600, description="立案调查黑名单缓存刷新间隔(秒)")
 
     # ==================== 策略引擎参数配置 ====================
     CORE_POOL_TOP_AMOUNT: int = Field(default=3, description="板块内选取的成交额 Top N 个股")

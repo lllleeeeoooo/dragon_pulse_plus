@@ -34,5 +34,6 @@ class MarketMonitor(
     _MonitorStyleMixin,
     _MonitorAuctionMixin,
 ):
-    """盘中 15 秒实时轮询监控引擎。方法分散在 4 个 mixin 模块中以保持文件精简。"""
+    """盘中 15 秒实时轮询监控引擎。"""
+    from data.fetcher import DataFetcher as _DF
     pass

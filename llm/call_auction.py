@@ -21,10 +21,14 @@ class CallAuctionAnalyzer:
         auction_df: pd.DataFrame,
         yesterday_zt_auction_yield: float = 1.5,
         predicted_sectors_summary: str = "",
-        recommended_targets_summary: str = ""
+        recommended_targets_summary: str = "",
+        auction_prediction: str = ""
     ) -> str:
         """
         分析 09:26 竞价开盘数据
+
+        :param auction_prediction: 规则引擎竞价预判（大盘走势+板块延续性），
+                                   来自 monitor_auction._send_auction_summary 的缓存。
         """
         logger.info(f"执行 {trade_date} 09:26 竞价观察与指令生成...")
 
@@ -49,7 +53,8 @@ class CallAuctionAnalyzer:
             yesterday_zt_auction_yield=round(yesterday_zt_auction_yield, 2),
             auction_data_text=auction_data_text,
             predicted_sector_auction_text=predicted_sectors_summary or "同盘前简报板块表现",
-            recommended_targets_auction_text=recommended_targets_summary or "参见今日盘后复盘标的"
+            recommended_targets_auction_text=recommended_targets_summary or "参见今日盘后复盘标的",
+            auction_prediction=auction_prediction or "暂无规则预判数据"
         )
 
         result = llm_client.generate(

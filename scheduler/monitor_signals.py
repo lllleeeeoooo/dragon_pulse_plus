@@ -15,6 +15,10 @@ from database.services import HoldingManager, RecommendationManager
 
 logger = logging.getLogger(__name__)
 
+# global 语句写入此模块，dashboard 从 monitor_core 读取同名变量（两个独立副本）
+_circuit_breaker_alerted: bool = False
+
+
 class _MonitorSignalsMixin:
     def _check_sector_linkage(self):
         """
@@ -138,7 +142,7 @@ class _MonitorSignalsMixin:
         for code in hot_codes[:3]:  # 最多查 3 只，避免 API 调用过频
             try:
                 market = "sh" if str(code).startswith(("6", "5")) else "sz"
-                fund_df = DataFetcher.get_individual_fund_flow(stock_code=code, market=market)
+                fund_df = self._DF.get_individual_fund_flow(stock_code=code, market=market)
                 if fund_df is None or fund_df.empty:
                     continue
 
@@ -176,7 +180,7 @@ class _MonitorSignalsMixin:
         为避免API频繁调用，仅在成交额>5亿的标的上检测。
         """
         try:
-            patterns = DataFetcher.detect_intraday_patterns(code)
+            patterns = self._DF.detect_intraday_patterns(code)
             bad_patterns = {"冲高回落", "放量滞涨", "天地板", "尾盘砸盘"}
             if bad_patterns & set(patterns):
                 logger.debug(f"{code} 分时形态不佳: {patterns}，跳过买入")

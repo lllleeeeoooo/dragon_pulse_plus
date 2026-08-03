@@ -135,7 +135,7 @@ class DailySnapshotManager:
             if existing:
                 return
 
-            total_equity = 1_000_000 + pnl_report.get("cumulative_total_pnl", 0)
+            total_equity = settings.BACKTEST_INITIAL_CAPITAL + pnl_report.get("cumulative_total_pnl", 0)
             snapshot = DailyEquitySnapshot(
                 trade_date=trade_date,
                 total_equity=round(total_equity, 2),

@@ -1,6 +1,7 @@
 import logging
 import pandas as pd
 from config.settings import settings
+import akshare as ak
 logger = logging.getLogger(__name__)
 from data.core import retry_on_exception
 
@@ -115,7 +116,7 @@ class _PoolMixin:
                 "上榜原因": "reason",
             }
             df = df.rename(columns=rename_dict)
-        return DataFetcher.filter_stocks(df) if df is not None else pd.DataFrame()
+        return filter_stocks(df) if df is not None else pd.DataFrame()
 
 
     @staticmethod
@@ -169,7 +170,7 @@ class _PoolMixin:
             # 新版 API 不含总市值,设为 0 兜底
             if "total_market_cap" not in df.columns:
                 df["total_market_cap"] = 0
-        return DataFetcher.filter_stocks(df) if df is not None else pd.DataFrame()
+        return filter_stocks(df) if df is not None else pd.DataFrame()
 
 
     @staticmethod

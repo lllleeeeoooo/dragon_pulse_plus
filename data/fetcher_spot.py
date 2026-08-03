@@ -1,14 +1,40 @@
 import logging
 import pandas as pd
 from config.settings import settings
+import akshare as ak
 logger = logging.getLogger(__name__)
+import time as _time
 from data.core import multi_source_fetch
+
+_cached_total_amount: float = 0.0
+
+# 立案调查黑名单缓存（每小时刷新一次，避免高频查库）
+_investigation_blacklist_cache: set = set()
+_investigation_cache_time: float = 0.0
+
+# 昨日涨停溢价兜底值（首次 API 调用失败时使用）
+_last_premium_fallback: float = 1.5
+
+
+def _get_investigation_blacklist() -> set:
+    """获取立案调查股票代码黑名单，带 1 小时缓存"""
+    global _investigation_blacklist_cache, _investigation_cache_time
+    now = _time.time()
+    if now - _investigation_cache_time > settings.INVESTIGATION_CACHE_SECONDS:
+        try:
+            from database import InvestigationManager
+            _investigation_blacklist_cache = InvestigationManager.get_blacklist_codes()
+            _investigation_cache_time = now
+        except Exception:
+            pass
+    return _investigation_blacklist_cache
+
 
 class _SpotMixin:
     @staticmethod
     def filter_stocks(df: pd.DataFrame) -> pd.DataFrame:
         """
-        根据全局配置过滤科创板、北交所及 ST 股票
+        根据全局配置过滤科创板、北交所、ST 股票及立案调查标的
         :param df: 包含 'code' 和 'name' 列的 DataFrame
         """
         if df is None or df.empty:
@@ -31,6 +57,11 @@ class _SpotMixin:
             st_mask = filtered_df["name"].astype(str).str.contains("ST", case=False, na=False)
             filtered_df = filtered_df[~st_mask]
 
+        # 4. 过滤立案调查/违规处罚标的
+        blacklist = _get_investigation_blacklist()
+        if blacklist and "code" in filtered_df.columns:
+            filtered_df = filtered_df[~filtered_df["code"].astype(str).isin(blacklist)]
+
         return filtered_df
 
 
@@ -45,35 +76,35 @@ class _SpotMixin:
             today = datetime.datetime.now().strftime("%Y%m%d")
             df = ak.stock_zt_pool_previous_em(date=today)
             if df is None or df.empty:
-                return {"opening_premium": DataFetcher._last_premium,
-                        "intraday_premium": DataFetcher._last_premium,
+                return {"opening_premium": _last_premium_fallback,
+                        "intraday_premium": _last_premium_fallback,
                         "high_open_ratio": 0, "positive_ratio": 0,
-                        "total_count": 0, "source": f"无数据(兜底{DataFetcher._last_premium}%)"}
+                        "total_count": 0, "source": f"无数据(兜底{_last_premium_fallback}%)"}
             changes = pd.to_numeric(df["涨跌幅"], errors="coerce").dropna()
             total = len(changes)
             if total == 0:
-                return {"opening_premium": DataFetcher._last_premium,
-                        "intraday_premium": DataFetcher._last_premium,
+                return {"opening_premium": _last_premium_fallback,
+                        "intraday_premium": _last_premium_fallback,
                         "high_open_ratio": 0, "positive_ratio": 0,
-                        "total_count": 0, "source": f"数据为空(兜底{DataFetcher._last_premium}%)"}
+                        "total_count": 0, "source": f"数据为空(兜底{_last_premium_fallback}%)"}
             # 即时溢价:当前涨跌幅均值（盘中会变）,成功后缓存
             intraday_premium = round(float(changes.mean()), 2)
-            DataFetcher._last_premium = intraday_premium
+            _last_premium_fallback = intraday_premium
             # 红盘率:当前涨幅>0的比例（盘中会变）
             positive_ratio = round((changes > 0).sum() / total * 100, 2)
             # 开盘溢价:9:35 前首次有效调用时缓存（此时涨跌幅≈开盘涨幅）
             cache_key = f"_open_premium_{today}"
             now = datetime.datetime.now()
             is_early = now.hour == 9 and now.minute <= 30  # 9:30 前算开盘窗口
-            if not hasattr(DataFetcher, cache_key) and total > 0:
+            if not hasattr(_SpotMixin, cache_key) and total > 0:
                 if is_early:
-                    setattr(DataFetcher, cache_key, ("open", intraday_premium,
+                    setattr(_SpotMixin, cache_key, ("open", intraday_premium,
                         round((changes > 3).sum() / total * 100, 2)))
                 else:
-                    setattr(DataFetcher, cache_key, ("snapshot", intraday_premium,
+                    setattr(_SpotMixin, cache_key, ("snapshot", intraday_premium,
                         round((changes > 3).sum() / total * 100, 2)))
-            if hasattr(DataFetcher, cache_key):
-                tag, opening_premium, high_open_ratio = getattr(DataFetcher, cache_key)
+            if hasattr(_SpotMixin, cache_key):
+                tag, opening_premium, high_open_ratio = getattr(_SpotMixin, cache_key)
             else:
                 tag, opening_premium, high_open_ratio = "snapshot", intraday_premium, round((changes > 3).sum() / total * 100, 2)
             logger.info(
@@ -91,11 +122,11 @@ class _SpotMixin:
                 "source": "stock_zt_pool_previous_em",
             }
         except Exception as e:
-            logger.warning(f"获取昨日涨停溢价失败: {e},使用上次缓存值{DataFetcher._last_premium}%")
-            return {"opening_premium": DataFetcher._last_premium,
-                    "intraday_premium": DataFetcher._last_premium,
+            logger.warning(f"获取昨日涨停溢价失败: {e},使用上次缓存值{_last_premium_fallback}%")
+            return {"opening_premium": _last_premium_fallback,
+                    "intraday_premium": _last_premium_fallback,
                     "high_open_ratio": 0, "positive_ratio": 0,
-                    "total_count": 0, "source": f"异常兜底{DataFetcher._last_premium}%"}
+                    "total_count": 0, "source": f"异常兜底{_last_premium_fallback}%"}
 
 
     @staticmethod
@@ -298,7 +329,7 @@ class _SpotMixin:
     @classmethod
     def get_market_total_amount(cls) -> float:
         """获取全市场实时总成交额（元）,无过滤.由 get_realtime_spot() 在过滤前写入缓存."""
-        return cls._cached_total_amount
+        return _cached_total_amount
 
 
     @staticmethod
@@ -308,16 +339,16 @@ class _SpotMixin:
         多数据源降级:新浪 -> 腾讯 -> 东财,某个源失败自动切换下一个.
         """
         df = multi_source_fetch([
-            ("新浪", DataFetcher._fetch_spot_sina),
-            ("腾讯", DataFetcher._fetch_spot_tencent),
-            ("东财", DataFetcher._fetch_spot_eastmoney),
+            ("新浪", _SpotMixin._fetch_spot_sina),
+            ("腾讯", _SpotMixin._fetch_spot_tencent),
+            ("东财", _SpotMixin._fetch_spot_eastmoney),
         ])
         if df.empty:
             logger.warning("获取全市场实时行情为空（所有数据源均失败）.")
             return pd.DataFrame()
         # 过滤前缓存全量总成交额（含科创板/北交所/ST,对齐券商软件）
         if "amount" in df.columns:
-            DataFetcher._cached_total_amount = float(df["amount"].sum())
-        return DataFetcher.filter_stocks(df)
+            _cached_total_amount = float(df["amount"].sum())
+        return _SpotMixin.filter_stocks(df)
 
 

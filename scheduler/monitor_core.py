@@ -15,6 +15,14 @@ from database.services import HoldingManager, RecommendationManager
 
 logger = logging.getLogger(__name__)
 
+# 全局变量（global 语句写入此模块命名空间，dashboard 直接从此读取）
+_current_market_style_global: Dict[str, str] = {}
+_monitor_running: bool = False
+_last_monitor_cycle: str = ""
+_circuit_breaker_alerted: bool = False
+_index_breaker_alerted: bool = False
+
+
 class _MonitorCoreMixin:
     def __init__(self):
         self.is_running = False
@@ -56,6 +64,8 @@ class _MonitorCoreMixin:
         # 竞价监控：09:15-09:25采集数据
         self._auction_snapshots: List[Dict[str, Any]] = []
         self._auction_summary_sent: bool = False
+        # 任务记录计数器（每 4 轮≈60 秒更新一次）
+        self._job_record_counter: int = 0
 
 
     def _reset_daily_state(self):
@@ -98,11 +108,11 @@ class _MonitorCoreMixin:
         today = self._alert_date
 
         # --- 流动性基准 ---
-        bl = DataFetcher.get_adaptive_baseline()
+        bl = self._DF.get_adaptive_baseline()
         baseline = bl["ma_amount"]
-        spot_total = DataFetcher.get_market_total_amount() if not spot_df.empty else 0
+        spot_total = self._DF.get_market_total_amount() if not spot_df.empty else 0
         now_amount = spot_total / 1e8  # 此刻累计(亿)
-        est = DataFetcher.estimate_today_amount(spot_total)
+        est = self._DF.estimate_today_amount(spot_total)
         estimated_today = est["estimated"] if est.get("estimated", 0) > 0 else now_amount
         k = MarketStyle._capacity_factor(estimated_today, baseline)
 
@@ -133,7 +143,7 @@ class _MonitorCoreMixin:
             down_count = int((spot_df["change_pct"] < 0).sum())
 
         # --- 昨日涨停溢价 ---
-        premium_data = DataFetcher.get_yesterday_zt_premium()
+        premium_data = self._DF.get_yesterday_zt_premium()
         self._premium_cache = premium_data
         self._premium_cache_time = time.time()
 
@@ -141,7 +151,7 @@ class _MonitorCoreMixin:
         market_max_lbc = self._get_market_max_lbc()
         market_zhaban_rate = self._get_market_zhaban_rate()
         dt_count = int(spot_df.apply(
-            lambda r: MarketMonitor._is_limit_down(str(r["code"]), float(r["change_pct"])), axis=1).sum())
+            lambda r: type(self)._is_limit_down(str(r["code"]), float(r["change_pct"])), axis=1).sum())
         emotion = {
             "height": market_max_lbc, "zt_count": zt_count, "dt_count": dt_count,
             "zhaban_rate": market_zhaban_rate, "zhaban_count": zhaban_count,
@@ -227,8 +237,8 @@ class _MonitorCoreMixin:
             return  # 缓存未过期
         try:
             today_str = datetime.datetime.now().strftime("%Y%m%d")
-            self._zt_pool_cache = DataFetcher.get_zt_pool(date_str=today_str)
-            self._zhaban_pool_cache = DataFetcher.get_zhaban_pool(date_str=today_str)
+            self._zt_pool_cache = self._DF.get_zt_pool(date_str=today_str)
+            self._zhaban_pool_cache = self._DF.get_zhaban_pool(date_str=today_str)
             self._pool_cache_time = now
 
             # 封单衰减检测
@@ -252,7 +262,7 @@ class _MonitorCoreMixin:
 
         if code not in self._ma_cache:
             try:
-                ma_data = DataFetcher.get_stock_ma_prices(code, lookback=30)
+                ma_data = self._DF.get_stock_ma_prices(code, lookback=30)
             except Exception as e:
                 logger.warning(f"获取 {code} 均线数据失败: {e}")
                 ma_data = {"ma5": None, "ma10": None, "ma20": None}
@@ -269,6 +279,8 @@ class _MonitorCoreMixin:
         global _monitor_running, _last_monitor_cycle
         self.is_running = True
         _monitor_running = True
+        from scheduler.helpers import _record_job_run
+        _record_job_run("job_monitor_loop", "盘中实时监控")
         logger.info(f"启动盘中实时轮询监控引擎 (轮询间隔: {settings.MONITOR_INTERVAL_SECONDS}秒)...")
 
         while self.is_running:
@@ -285,6 +297,11 @@ class _MonitorCoreMixin:
                 elif self.is_trading_time():
                     self._check_realtime_market()
                     _last_monitor_cycle = datetime.datetime.now().strftime("%H:%M:%S")
+                    # 每 60 秒更新一次任务执行时间（避免每次 15 秒轮询都写库）
+                    if getattr(self, '_job_record_counter', 0) % 4 == 0:
+                        from scheduler.helpers import _record_job_run
+                        _record_job_run("job_monitor_loop", "盘中实时监控")
+                    self._job_record_counter = getattr(self, '_job_record_counter', 0) + 1
                 else:
                     # 非交易时间清缓存
                     self._zt_pool_cache = None
@@ -309,7 +326,7 @@ class _MonitorCoreMixin:
         self._refresh_pool_cache()
 
         # 1. 获取全市场快照
-        spot_df = DataFetcher.get_realtime_spot()
+        spot_df = self._DF.get_realtime_spot()
         if spot_df.empty:
             return
 
@@ -660,7 +677,7 @@ class _MonitorCoreMixin:
                 is_main = str(code).startswith(("60", "00"))
                 is_gem_star = str(code).startswith(("30", "688"))
                 dt_limit = -19.8 if is_gem_star else -9.8
-                if not MarketMonitor._is_limit_down(code, change_pct):
+                if not type(self)._is_limit_down(code, change_pct):
                     # 破跌停板了，执行卖出
                     hold_match = [h for h in active_holdings if h["code"] == code]
                     if hold_match:
@@ -681,7 +698,7 @@ class _MonitorCoreMixin:
                 row = stock_data.iloc[0]
                 curr_price = float(row["price"])
                 curr_change_pct = float(row["change_pct"])
-                is_zt = MarketMonitor._is_limit_up(code, curr_change_pct)
+                is_zt = type(self)._is_limit_up(code, curr_change_pct)
 
                 # 实时计算并更新持仓最新价格与收益率 (%)
                 HoldingManager.update_holding_profit_rate(code, curr_price)
@@ -744,7 +761,7 @@ class _MonitorCoreMixin:
                     if sig["level"] in ("CRITICAL", "HIGH"):
                         # 判断是否跌停
 
-                        if MarketMonitor._is_limit_down(code, curr_change_pct):
+                        if type(self)._is_limit_down(code, curr_change_pct):
                             # 跌停板封死，暂不平仓，等破板
                             self._pending_sell_codes.add(code)
                             if code not in self._alerted_sell_signals.get("__dt_pending__", set()):

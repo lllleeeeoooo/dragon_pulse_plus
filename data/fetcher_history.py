@@ -1,6 +1,7 @@
 import logging
 import pandas as pd
 from config.settings import settings
+import akshare as ak
 logger = logging.getLogger(__name__)
 from typing import Dict, Any, List
 from data.core import multi_source_fetch
@@ -15,7 +16,7 @@ class _HistoryMixin:
         :param lookback: 回溯天数
         """
         def _from_sina():
-            prefix = DataFetcher._market_prefix(code)
+            prefix = _market_prefix(code)
             df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="qfq")
             if df is not None and not df.empty:
                 df = df.tail(lookback)
@@ -59,7 +60,7 @@ class _HistoryMixin:
         :param code: 股票代码,如 000001
         """
         try:
-            spot_df = DataFetcher.get_realtime_spot()
+            spot_df = get_realtime_spot()
             if not spot_df.empty:
                 match = spot_df[spot_df["code"] == str(code)]
                 if not match.empty:
@@ -81,7 +82,7 @@ class _HistoryMixin:
     def _fetch_intraday_5min_sina(code: str) -> pd.DataFrame:
         """新浪 5 分钟 K 线 -> 归一化为 [time, open, high, low, close, volume, change_pct]"""
         # 新浪分钟线需要市场前缀 sh/sz
-        symbol = f"{DataFetcher._market_prefix(code)}{code}"
+        symbol = f"{_market_prefix(code)}{code}"
         df = ak.stock_zh_a_minute(symbol=symbol, period="5")
         if df is None or df.empty:
             return pd.DataFrame()
