@@ -47,6 +47,9 @@ def build_dashboard_data() -> Dict[str, Any]:
     sectors = SectorStrengthManager.get_hot_sectors(top_n=8)
     sectors_date = sectors[0].get("_date", "") if sectors else ""
 
+    # ---- 概念/行业 双维度主线对照（切片3） ----
+    mainlines = _build_mainlines_section()
+
     # ---- 龙虎榜席位画像 ----
     from database import SeatProfileManager
     seat_profiles = SeatProfileManager.get_profiles(top=30, active_only=True)
@@ -81,6 +84,7 @@ def build_dashboard_data() -> Dict[str, Any]:
         "portfolio": _build_portfolio_section(holdings, pnl_report, ai_count),
         "sectors": sectors,
         "sectors_date": sectors_date or dragons_date,
+        "mainlines": mainlines,
         "dragons": dragons,
         "dragons_date": dragons_date,
         "seats": seat_profiles,
@@ -206,6 +210,41 @@ def _get_dragons_with_fallback(today_str: str) -> tuple:
     finally:
         session.close()
     return [], ""
+
+
+def _build_mainlines_section() -> Dict[str, Any]:
+    """
+    概念/行业 双维度主线对照（切片3）：concept_cycle(题材) vs sector_cycle(东财行业) 并排，
+    均含 阶段/涨停家数/最高连板/主线分。行业盘散 vs 概念聚簇一眼可辨，供阈值校准与复盘。
+    """
+    from database import ConceptCycleManager, SectorCycleManager
+    concepts, industries = [], []
+    try:
+        concepts = ConceptCycleManager.get_concept_cycle(top=10)
+    except Exception as e:
+        logger.warning(f"拉取概念主线失败: {e}")
+    try:
+        industries = SectorCycleManager.get_sector_cycle(top=10)
+    except Exception as e:
+        logger.warning(f"拉取行业主线失败: {e}")
+
+    def _norm(rec: dict) -> Dict[str, Any]:
+        return {
+            "name": rec.get("concept") or rec.get("sector", ""),
+            "phase": rec.get("phase", ""),
+            "zt": rec.get("zt_count", 0),
+            "lbc": rec.get("max_lbc", 0),
+            "mainline": bool(rec.get("is_mainline", False)),
+            "score": rec.get("mainline_score", 0),
+        }
+
+    date = (concepts[0].get("trade_date") if concepts
+            else (industries[0].get("trade_date") if industries else ""))
+    return {
+        "date": date,
+        "concepts": [_norm(c) for c in concepts],
+        "industries": [_norm(c) for c in industries],
+    }
 
 
 def _get_yesterday_total_amount(today_str: str) -> float:

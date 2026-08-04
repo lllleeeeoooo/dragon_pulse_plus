@@ -501,6 +501,14 @@ def data_concepts_cycle(
     return {"code": 200, "count": len(result), "data": result}
 
 
+@app.get("/data/mainlines", summary="概念/行业双维度主线对照",
+         description="概念主线(题材) vs 行业主线(东财) 并排对照，均含阶段/涨停/最高连板/主线分。",
+         tags=["概念"])
+def data_mainlines():
+    from dashboard.data import _build_mainlines_section
+    return {"code": 200, "data": _build_mainlines_section()}
+
+
 @app.get("/data/source-status", summary="数据源熔断状态",
          description="查看各数据源当日异常次数与熔断状态。某源当日异常达 SOURCE_FAIL_CIRCUIT_LIMIT 次后，当天不再调用该源（次日自动重置）",
          tags=["AkShare 数据"])

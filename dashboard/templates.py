@@ -154,6 +154,33 @@ if(d.sectors && d.sectors.length>0){
 
 
 
+def _section_mainlines():
+    return """
+// ---- 概念/行业 双维度主线对照 ----
+if(d.mainlines && (d.mainlines.concepts.length>0 || d.mainlines.industries.length>0)){
+  var md=d.mainlines.date||'';
+  var pMap={'发酵':'tag-green','高潮':'tag-red','退潮':'tag-yellow','启动':'tag-blue','冰点':'tag-blue'};
+  html+='<h2>🧭 双维度主线对照 <span style="font-size:10px;color:#5c6e80;font-weight:normal">'+md+' · 概念(题材) vs 行业</span></h2>';
+  var maxLen=Math.max(d.mainlines.concepts.length,d.mainlines.industries.length);
+  html+='<table class="tbl"><tr><th style="width:50%">概念主线</th><th style="width:50%">行业对照</th></tr>';
+  for(var i=0;i<maxLen;i++){
+    var c=d.mainlines.concepts[i], s=d.mainlines.industries[i];
+    var cell=function(o){
+      if(!o)return '<td></td>';
+      var star=o.mainline?'★':'';
+      var sc=o.score||0;
+      var nameStyle=o.mainline?'color:#ffd740;font-weight:bold':'';
+      return '<td><div style="'+nameStyle+'">'+star+' '+(o.name||'')+'</div>'
+        +'<div class="sub">'+B(o.phase,pMap[o.phase]||'tag-blue')+' '+o.zt+'涨停 '+o.lbc+'板 分'+sc.toFixed(2)+'</div></td>';
+    };
+    html+='<tr>'+cell(c)+cell(s)+'</tr>';
+  }
+  html+='</table>';
+}
+"""
+
+
+
 def _section_dragons():
     return """
 // ---- 涨停龙头 ----
@@ -273,6 +300,7 @@ _JS_SECTIONS = (
     + _section_breadth()
     + _section_portfolio()
     + _section_sectors()
+    + _section_mainlines()
     + _section_seats()
     + _section_dragons()
     + _section_equity()
