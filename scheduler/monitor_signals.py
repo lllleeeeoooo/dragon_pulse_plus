@@ -235,7 +235,7 @@ class _MonitorSignalsMixin:
 
             spot = spot_map[code]
             # 在涨停池中但当前涨幅回落 < 7% 且放量 → 炸板
-            if spot["change_pct"] < 7.0 and spot["volume_ratio"] > 2.0:
+            if spot["change_pct"] < settings.ZHABAN_ALERT_CHANGE and spot["volume_ratio"] > settings.ZHABAN_ALERT_VOL_RATIO:
                 logger.warning(f"盘中高位分歧炸板预警: {name}({code}) 当前涨幅: {spot['change_pct']}%")
                 bark_notifier.send(
                     title=f"💥 [炸板提醒] {name}({code})",

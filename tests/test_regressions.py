@@ -102,6 +102,62 @@ class TestPureRegressions(unittest.TestCase):
             self.assertIn("600519", codes)
 
 
+    def test_market_style_classify(self):
+        """市场风格分类：抱团/共振/打板 三档命中"""
+        from core.strategies import MarketStyle
+        r = MarketStyle.classify({"height": 2, "zt_count": 20, "dt_count": 12,
+                                  "zhaban_rate": 30, "sentiment_index": 30, "yield_rate": -3})
+        self.assertEqual(r["style"], "抱团")
+        self.assertEqual(r["priority_strategy"], "避险抱团")
+        r2 = MarketStyle.classify({"height": 4, "zt_count": 50, "dt_count": 0,
+                                   "zhaban_rate": 10, "sentiment_index": 60, "yield_rate": 2})
+        self.assertEqual(r2["style"], "共振")
+        r3 = MarketStyle.classify({"height": 6, "zt_count": 40, "dt_count": 0,
+                                   "zhaban_rate": 15, "sentiment_index": 50, "yield_rate": 1})
+        self.assertEqual(r3["style"], "打板")
+
+    def test_capacity_factor(self):
+        """容量因子 K：缩量 <1，放量 >1"""
+        from core.strategies import MarketStyle
+        self.assertLess(MarketStyle._capacity_factor(6000, 8000), 1.0)
+        self.assertGreater(MarketStyle._capacity_factor(10000, 8000), 1.0)
+
+    def test_backtest_trade_date_list(self):
+        """回测交易日历：akshare 日历生效，周末不计入；失败回退工作日"""
+        from core.backtest import AIBacktestEngine
+        cal = pd.DataFrame({"trade_date": pd.to_datetime(
+            ["2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30", "2026-07-31"])})
+        with patch("akshare.tool_trade_date_hist_sina", return_value=cal):
+            dates = AIBacktestEngine._build_trade_date_list("20260727", "20260802")  # 区间含周末
+            self.assertEqual(dates, ["20260727", "20260728", "20260729", "20260730", "20260731"])
+        with patch("akshare.tool_trade_date_hist_sina", side_effect=Exception("net down")):
+            dates2 = AIBacktestEngine._build_trade_date_list("20260803", "20260804")  # 周一/周二
+            self.assertEqual(dates2, ["20260803", "20260804"])
+
+    def test_pre_market_analyzer(self):
+        """盘前简报：content 为 None 不崩溃（修复 #P1-Q）+ prompt 组装正常"""
+        from llm.pre_market import PreMarketAnalyzer
+        news = [{"time": "10:00", "title": "标题", "content": None}]  # 旧代码此处崩溃
+        with patch("llm.pre_market.NewsFetcher.get_cls_news", return_value=news), \
+             patch("llm.pre_market.NewsFetcher.get_hot_search_words", return_value=["热搜词"]), \
+             patch("llm.pre_market.llm_client.generate", return_value="AI简报内容"):
+            self.assertEqual(PreMarketAnalyzer.run_report(), "AI简报内容")
+
+    def test_call_auction_analyzer(self):
+        """竞价观察：排序 Top15 + prompt 组装不崩（修复 #P1-L）"""
+        from llm.call_auction import CallAuctionAnalyzer
+        df = pd.DataFrame([
+            {"code": "600001", "name": "A", "price": 10.0, "change_pct": 2.0, "amount": 5e7},
+            {"code": "600002", "name": "B", "price": 20.0, "change_pct": 8.0, "amount": 8e7},
+        ])
+        with patch("llm.call_auction.llm_client.generate", return_value="竞价指令"):
+            result = CallAuctionAnalyzer.run_auction_analysis(
+                trade_date="20260804", auction_df=df,
+                yesterday_zt_auction_yield=2.0, recommended_targets_summary="",
+                predicted_sectors_summary="", auction_prediction="")
+            self.assertEqual(result, "竞价指令")
+
+
 class TestDbRegressions(unittest.TestCase):
     """数据库相关回归（使用独立测试库，防清空生产库）"""
 

@@ -85,13 +85,14 @@ class EmotionVector:
                 logger.warning(f"计算封单力度失败: {e}")
 
         # 5. 承接/炸板率 (Support)
-        # 真炸板 = 炸板池中不在涨停池的股票（扣除炸板后回封成功的）
+        # 真炸板 = 炸板池中不在涨停池的股票（口径与盘中 _compute_true_zhaban_count 一致）
         true_zhaban = zhaban_count
         if zt_df is not None and not zt_df.empty and "code" in zt_df.columns and \
            zhaban_df is not None and not zhaban_df.empty and "code" in zhaban_df.columns:
             zt_codes = set(zt_df["code"].astype(str))
             zhaban_codes = set(zhaban_df["code"].astype(str))
             true_zhaban = len(zhaban_codes - zt_codes)
+        zhaban_count = true_zhaban  # 返回真炸板数，与 zhaban_rate 口径一致（盘前/盘后/盘中统一）
         total_seal_attempts = zt_count + true_zhaban
         zhaban_rate = round((true_zhaban / total_seal_attempts * 100), 2) if total_seal_attempts > 0 else 0.0
 

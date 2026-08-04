@@ -356,6 +356,94 @@ class _MonitorCoreMixin:
         )
         pending_codes = {r["code"] for r in pending_recs}
 
+        # 4. 扫描全市场抢筹信号 + 自动买入 + 推送（已拆到 _scan_signals）
+        self._scan_signals(spot_df, market_style, pending_recs, pending_codes, index_breaker_triggered)
+
+        # 5. 全市场高位连板股"炸板"监控（基于真实涨停池对比）
+        self._check_zhaban_alert(spot_df)
+
+        self._check_emotion_top_alert(market_max_lbc, market_zhaban_rate)
+
+        self._check_consistency_alert()
+
+        # 7. 持仓卖出/止损信号监控 + 批量更新收益率（已拆到 _monitor_holdings）
+        self._monitor_holdings(spot_df, active_holdings, market_max_lbc, market_zhaban_rate)
+
+
+    def _notify_style_change(self, market_style):
+        """市场风格切换通知（从 _check_realtime_market 拆出）"""
+        if market_style["style"] != self._last_logged_style:
+            logger.info(
+                f"市场风格切换: [{market_style['style']}] {market_style['reason']} | "
+                f"涨停:{market_style['zt_count']}({market_style['zt_source']}) "
+                f"跌停:{market_style['dt_count']} "
+                f"炸板:{market_style['zhaban_count']}({market_style['zhaban_rate']}%) "
+                f"情绪分:{market_style['sentiment_index']}"
+            )
+            emoji_map = {"抱团": "🛡️", "共振": "🚀", "打板": "🎯", "低吸": "📉", "高潮": "⚠️", "观望": "💤"}
+            emoji = emoji_map.get(market_style["style"], "📊")
+            bark_notifier.send(
+                title=f"{emoji} 风格切换 → {market_style['style']}",
+                body=(f"{market_style['reason']}\n"
+                      f"涨停:{market_style['zt_count']} 跌停:{market_style['dt_count']} "
+                      f"情绪:{market_style['sentiment_index']}分 K={market_style.get('capacity_factor',0):.2f}"),
+                group="市场风格",
+                level="timeSensitive" if market_style["style"] in ("抱团", "高潮") else "active"
+            )
+            self._last_logged_style = market_style["style"]
+
+    def _check_index_breaker(self, spot_df) -> bool:
+        """大盘级熔断检查：全市场均涨幅跌破阈值时停止买入并预警，返回是否触发"""
+        # 2.8 大盘级熔断检查：全市场均涨幅跌破阈值时停止所有买入
+        market_avg_change = float(spot_df["change_pct"].mean()) if not spot_df.empty else 0.0
+        index_breaker_triggered = market_avg_change <= settings.INDEX_DROP_CIRCUIT_BREAKER
+        if index_breaker_triggered and not getattr(self, '_index_breaker_alerted', False):
+            global _index_breaker_alerted
+            self._index_breaker_alerted = True
+            _index_breaker_alerted = True
+            logger.warning(f"大盘熔断: 全市场均涨幅 {market_avg_change:.2f}% <= {settings.INDEX_DROP_CIRCUIT_BREAKER}%，停止自动买入")
+            bark_notifier.send(
+                title="🛑 [大盘熔断] 系统性风险",
+                body=f"全市场均涨幅 {market_avg_change:.2f}%，触发大盘熔断阈值({settings.INDEX_DROP_CIRCUIT_BREAKER}%)。已停止所有自动买入，建议逢高减仓。",
+                group="风控提醒",
+                level="timeSensitive"
+            )
+        return index_breaker_triggered
+
+    def _check_emotion_top_alert(self, market_max_lbc, market_zhaban_rate):
+        """全市场情绪到顶预警（每日仅一次）（从 _check_realtime_market 拆出）"""
+        # 6. 全市场情绪到顶预警（全局层面，每日仅推送一次）
+        # 必须同时满足：连板极高 + 炸板率高 + 情绪崩塌（涨停多时炸板率高属于正常分歧）
+        if (not self._emotion_top_alerted_today and
+                market_max_lbc >= settings.EMOTION_TOP_MAX_LBC and
+                market_zhaban_rate > settings.EMOTION_TOP_ZHABAN_RATE and
+                self._current_market_style.get("sentiment_index", 50) < 40):
+            self._emotion_top_alerted_today = True
+            style_info = self._current_market_style
+            bark_notifier.send(
+                title="🚨 [情绪到顶预警] 全市场退潮风险",
+                body=f"最高连板{market_max_lbc}板+炸板率{market_zhaban_rate}%+情绪仅{style_info.get('sentiment_index',0)}分，退潮前兆，建议落袋为安。",
+                group="卖出提醒",
+                level="timeSensitive"
+            )
+
+    def _check_consistency_alert(self):
+        """一致性预警：情绪过热+涨停过多→次日分歧概率大（每日一次）（从 _check_realtime_market 拆出）"""
+        # 6.5 一致性预警：情绪过热+涨停过多→次日分歧概率大（每日一次）
+        si = self._current_market_style.get("sentiment_index", 0)
+        zt = self._current_market_style.get("zt_count", 0)
+        if (not self._consistency_alerted_today and si >= 70 and zt >= 80):
+            self._consistency_alerted_today = True
+            bark_notifier.send(
+                title="⚠️ [一致性预警] 明日分歧风险",
+                body=(f"情绪{si}分+涨停{zt}家，市场过于一致。"
+                      f"建议：高位标的逢高减仓，不打缩量加速板。"),
+                group="卖出提醒",
+                level="timeSensitive"
+            )
+
+    def _scan_signals(self, spot_df, market_style, pending_recs, pending_codes, index_breaker_triggered):
+        """第4步：扫描全市场抢筹信号 + 自动买入 + 推送（从 _check_realtime_market 拆出）"""
         # 4. 扫描全市场抢筹信号（四种类型）
         #    a) 点火异动: 放量 + 涨幅 3%~9%
         #    b) 逼近封板: 涨幅 8%~9.5% + 量比 > 5
@@ -373,7 +461,7 @@ class _MonitorCoreMixin:
         spot_df["_limit_max"] = settings.PRICE_BURST_MAX  # 主板 10cm
         spot_df.loc[~is_main_board, "_limit_max"] = settings.PRICE_BURST_MAX_20CM  # 双创 20cm
         # 逼近封板区间 = 涨停线的 80%~100%
-        spot_df["_near_limit_min"] = spot_df["_limit_max"] * 0.84   # e.g. 9.5*0.84≈8.0 / 19.5*0.84≈16.4
+        spot_df["_near_limit_min"] = spot_df["_limit_max"] * settings.MONITOR_NEAR_LIMIT_RATIO  # 涨停线×比值
         spot_df["_near_limit_max"] = spot_df["_limit_max"]
 
         spot_df["_signal_burst"] = (
@@ -384,18 +472,18 @@ class _MonitorCoreMixin:
         spot_df["_signal_near_limit"] = (
             (spot_df["change_pct"] >= spot_df["_near_limit_min"]) &
             (spot_df["change_pct"] <= spot_df["_near_limit_max"]) &
-            (spot_df["volume_ratio"] > 5)
+            (spot_df["volume_ratio"] > settings.NEAR_LIMIT_VOL_RATIO)
         )
         spot_df["_signal_low_open_rally"] = (
-            (spot_df["open"].astype(float) < spot_df["pre_close"].astype(float) * 0.98) &
-            (spot_df["volume_ratio"] > 3) &
-            (rally_strength > 0.8) &
+            (spot_df["open"].astype(float) < spot_df["pre_close"].astype(float) * settings.LOW_OPEN_DEV) &
+            (spot_df["volume_ratio"] > settings.RALLY_VOL_RATIO) &
+            (rally_strength > settings.RALLY_STRENGTH_MIN) &
             (spot_df["change_pct"] > 0)
         )
         spot_df["_signal_amplitude"] = (
-            (spot_df["amplitude"] > 7) &
-            (spot_df["volume_ratio"] > 3) &
-            (spot_df["change_pct"] > 3)
+            (spot_df["amplitude"] > settings.AMPLITUDE_SIGNAL_MIN) &
+            (spot_df["volume_ratio"] > settings.RALLY_VOL_RATIO) &
+            (spot_df["change_pct"] > settings.AMPLITUDE_CHANGE_MIN)
         )
 
         # 任一信号命中
@@ -618,88 +706,6 @@ class _MonitorCoreMixin:
                         cap_map[c] = cap
             self._check_fund_inflow_alert(burst_codes_for_fund[:3], cap_map)
 
-        # 5. 全市场高位连板股"炸板"监控（基于真实涨停池对比）
-        self._check_zhaban_alert(spot_df)
-
-        self._check_emotion_top_alert(market_max_lbc, market_zhaban_rate)
-
-        self._check_consistency_alert()
-
-        # 7. 持仓卖出/止损信号监控 + 批量更新收益率（已拆到 _monitor_holdings）
-        self._monitor_holdings(spot_df, active_holdings, market_max_lbc, market_zhaban_rate)
-
-
-    def _notify_style_change(self, market_style):
-        """市场风格切换通知（从 _check_realtime_market 拆出）"""
-        if market_style["style"] != self._last_logged_style:
-            logger.info(
-                f"市场风格切换: [{market_style['style']}] {market_style['reason']} | "
-                f"涨停:{market_style['zt_count']}({market_style['zt_source']}) "
-                f"跌停:{market_style['dt_count']} "
-                f"炸板:{market_style['zhaban_count']}({market_style['zhaban_rate']}%) "
-                f"情绪分:{market_style['sentiment_index']}"
-            )
-            emoji_map = {"抱团": "🛡️", "共振": "🚀", "打板": "🎯", "低吸": "📉", "高潮": "⚠️", "观望": "💤"}
-            emoji = emoji_map.get(market_style["style"], "📊")
-            bark_notifier.send(
-                title=f"{emoji} 风格切换 → {market_style['style']}",
-                body=(f"{market_style['reason']}\n"
-                      f"涨停:{market_style['zt_count']} 跌停:{market_style['dt_count']} "
-                      f"情绪:{market_style['sentiment_index']}分 K={market_style.get('capacity_factor',0):.2f}"),
-                group="市场风格",
-                level="timeSensitive" if market_style["style"] in ("抱团", "高潮") else "active"
-            )
-            self._last_logged_style = market_style["style"]
-
-    def _check_index_breaker(self, spot_df) -> bool:
-        """大盘级熔断检查：全市场均涨幅跌破阈值时停止买入并预警，返回是否触发"""
-        # 2.8 大盘级熔断检查：全市场均涨幅跌破阈值时停止所有买入
-        market_avg_change = float(spot_df["change_pct"].mean()) if not spot_df.empty else 0.0
-        index_breaker_triggered = market_avg_change <= settings.INDEX_DROP_CIRCUIT_BREAKER
-        if index_breaker_triggered and not getattr(self, '_index_breaker_alerted', False):
-            global _index_breaker_alerted
-            self._index_breaker_alerted = True
-            _index_breaker_alerted = True
-            logger.warning(f"大盘熔断: 全市场均涨幅 {market_avg_change:.2f}% <= {settings.INDEX_DROP_CIRCUIT_BREAKER}%，停止自动买入")
-            bark_notifier.send(
-                title="🛑 [大盘熔断] 系统性风险",
-                body=f"全市场均涨幅 {market_avg_change:.2f}%，触发大盘熔断阈值({settings.INDEX_DROP_CIRCUIT_BREAKER}%)。已停止所有自动买入，建议逢高减仓。",
-                group="风控提醒",
-                level="timeSensitive"
-            )
-        return index_breaker_triggered
-
-    def _check_emotion_top_alert(self, market_max_lbc, market_zhaban_rate):
-        """全市场情绪到顶预警（每日仅一次）（从 _check_realtime_market 拆出）"""
-        # 6. 全市场情绪到顶预警（全局层面，每日仅推送一次）
-        # 必须同时满足：连板极高 + 炸板率高 + 情绪崩塌（涨停多时炸板率高属于正常分歧）
-        if (not self._emotion_top_alerted_today and
-                market_max_lbc >= settings.EMOTION_TOP_MAX_LBC and
-                market_zhaban_rate > settings.EMOTION_TOP_ZHABAN_RATE and
-                self._current_market_style.get("sentiment_index", 50) < 40):
-            self._emotion_top_alerted_today = True
-            style_info = self._current_market_style
-            bark_notifier.send(
-                title="🚨 [情绪到顶预警] 全市场退潮风险",
-                body=f"最高连板{market_max_lbc}板+炸板率{market_zhaban_rate}%+情绪仅{style_info.get('sentiment_index',0)}分，退潮前兆，建议落袋为安。",
-                group="卖出提醒",
-                level="timeSensitive"
-            )
-
-    def _check_consistency_alert(self):
-        """一致性预警：情绪过热+涨停过多→次日分歧概率大（每日一次）（从 _check_realtime_market 拆出）"""
-        # 6.5 一致性预警：情绪过热+涨停过多→次日分歧概率大（每日一次）
-        si = self._current_market_style.get("sentiment_index", 0)
-        zt = self._current_market_style.get("zt_count", 0)
-        if (not self._consistency_alerted_today and si >= 70 and zt >= 80):
-            self._consistency_alerted_today = True
-            bark_notifier.send(
-                title="⚠️ [一致性预警] 明日分歧风险",
-                body=(f"情绪{si}分+涨停{zt}家，市场过于一致。"
-                      f"建议：高位标的逢高减仓，不打缩量加速板。"),
-                group="卖出提醒",
-                level="timeSensitive"
-            )
 
     def _monitor_holdings(self, spot_df, active_holdings, market_max_lbc, market_zhaban_rate):
         """第7步：持仓卖出/止损信号监控 + 批量更新收益率（从 _check_realtime_market 拆出）"""
@@ -744,7 +750,7 @@ class _MonitorCoreMixin:
 
                 # 获取真实的 MA5 均线价格
                 ma_data = self._get_ma_prices(code)
-                ma5_price = ma_data.get("ma5") or (curr_price * 0.97)
+                ma5_price = ma_data.get("ma5") or (curr_price * settings.MA5_FALLBACK_RATIO)
 
                 # VWAP = 成交额 / 成交量（volume已统一为"股"）
                 raw_vol = float(row.get("volume", 0))
