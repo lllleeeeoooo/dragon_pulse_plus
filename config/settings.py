@@ -119,6 +119,11 @@ class Settings(BaseSettings):
     SECTOR_LINKAGE_MIN_COUNT: int = Field(default=3, description="板块涨停家数达到此值时触发联动预警")
     SECTOR_LINKAGE_ACCEL_DELTA: int = Field(default=2, description="板块涨停家数较上轮增加此值时触发加速预警")
 
+    # ==================== 概念主线识别配置（切片3） ====================
+    CONCEPT_MEMBER_REFRESH_INTERVAL_DAYS: int = Field(default=1, description="概念成分股映射刷新间隔(天)。成分股变化慢，可调大省请求(新浪约175次/刷新)")
+    CONCEPT_MAINLINE_SCORE_THRESHOLD: float = Field(default=0.5, description="概念主线分阈值，≥此值判为主线概念(与板块一致)")
+    CONCEPT_GATE_ENABLED: bool = Field(default=True, description="盘中概念因子否决开关。关闭后概念不参与买入闸门(板块因子仍生效)。若发现过度否决可关")
+
     SECOND_WAVE_RETREAT_MIN: float = Field(default=0.30, description="二波战法龙头回撤最小比例 (30%)")
     SECOND_WAVE_RETREAT_MAX: float = Field(default=0.50, description="二波战法龙头回撤最大比例 (50%)")
     SECOND_WAVE_LOOKBACK_DAYS: int = Field(default=30, description="二波战法追溯人气龙头的天数")

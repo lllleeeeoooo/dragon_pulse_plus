@@ -20,6 +20,7 @@ from database.system_log import SystemLogManager
 from database.investigation import InvestigationManager
 from database.seats import SeatProfileManager
 from database.sector_cycle import SectorCycleManager
+from database.concept_cycle import ConceptCycleManager
 
 __all__ = [
     "db_manager",
@@ -42,4 +43,5 @@ __all__ = [
     "InvestigationManager",
     "SeatProfileManager",
     "SectorCycleManager",
+    "ConceptCycleManager",
 ]

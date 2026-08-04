@@ -203,6 +203,44 @@ class SectorCycle(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
+class ConceptMember(Base):
+    """
+    概念板块成员映射表（切片3：概念主线识别数据底座）
+    存储 概念 → 成分股 的当前映射（新浪 gn_ 代码）。refresh_date 标记快照日期，
+    盘后按日刷新；成分股变化慢，刷新间隔由 CONCEPT_MEMBER_REFRESH_INTERVAL_DAYS 控制。
+    """
+    __tablename__ = "concept_member"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    concept_code = Column(String(16), nullable=False, index=True, comment="概念代码(新浪 gn_xxx)")
+    concept_name = Column(String(64), nullable=False, index=True, comment="概念名称")
+    stock_code = Column(String(12), nullable=False, index=True, comment="成分股代码")
+    refresh_date = Column(String(10), index=True, comment="快照日期 YYYYMMDD")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
+class ConceptCycle(Base):
+    """
+    概念情绪周期阶段表（切片3：概念主线识别落库）
+    与 sector_cycle 同构，但维度为「题材概念」（经 core.concept_filter 过滤非题材标签）：
+    每日从涨停池按概念聚合，判定每个活跃概念的 冰点/启动/发酵/高潮/退潮 与主线分，
+    供概念主线复盘与后续盘中概念因子使用。
+    """
+    __tablename__ = "concept_cycle"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(String(10), nullable=False, index=True, comment="交易日期 YYYYMMDD")
+    concept_name = Column(String(64), nullable=False, index=True, comment="概念名称(题材型)")
+    phase = Column(String(16), default="冰点", comment="概念阶段: 冰点/启动/发酵/高潮/退潮")
+    zt_count = Column(Integer, default=0, comment="当日概念涨停家数")
+    max_lbc = Column(Integer, default=0, comment="概念内最高连板")
+    prev_zt_count = Column(Integer, default=0, comment="上一交易日涨停家数")
+    prev_phase = Column(String(16), comment="上一交易日阶段")
+    is_mainline = Column(Boolean, default=False, comment="是否主线概念")
+    mainline_score = Column(Float, default=0.0, comment="主线分(涨停×持续×加速×高度归一化)")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
 class InvestigationRecord(Base):
     """
     立案调查记录表

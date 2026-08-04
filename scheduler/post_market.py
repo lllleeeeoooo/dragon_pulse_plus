@@ -181,6 +181,13 @@ def job_post_market():
         except Exception as e:
             logger.warning(f"板块周期同步失败: {e}")
 
+        # ---- 概念情绪周期计算（切片3：概念主线识别，非题材标签已过滤）----
+        try:
+            from database import ConceptCycleManager
+            ConceptCycleManager.sync_from_zt_pool(today_str, zt_df)
+        except Exception as e:
+            logger.warning(f"概念周期同步失败: {e}")
+
         # ---- 每日盈亏报告（同步收盘价 + 净值快照 + 推送） ----
         _push_daily_pnl_report(today_str, spot_df)
 

@@ -3,7 +3,7 @@ import pandas as pd
 from config.settings import settings
 import akshare as ak
 logger = logging.getLogger(__name__)
-from data.core import retry_on_exception
+from data.core import retry_on_exception, multi_source_fetch
 from data.fetcher_spot import _SpotMixin
 
 class _PoolMixin:
@@ -172,6 +172,125 @@ class _PoolMixin:
             if "total_market_cap" not in df.columns:
                 df["total_market_cap"] = 0
         return _SpotMixin.filter_stocks(df) if df is not None else pd.DataFrame()
+
+
+    @staticmethod
+    @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    def get_concept_boards() -> pd.DataFrame:
+        """
+        获取概念板块列表（东财 → 新浪 双源降级）。
+        东财: stock_board_concept_name_em（约300+概念，板块代码 BKxxxx）
+        新浪: stock_sector_spot(indicator='概念')（约175概念，板块代码 gn_xxx）
+        ※ 概念代码体系因源而异：东财 BKxxxx 需用「概念名」查成分股，新浪 gn_xxx 直接作参数。
+        统一输出: code(概念代码), name(概念名), stock_count, change_pct, amount, leading_stock(领涨股)
+        """
+        def _from_em() -> pd.DataFrame:
+            df = ak.stock_board_concept_name_em()
+            if df is None or df.empty:
+                return pd.DataFrame()
+            # 东财概念列表列名以 akshare 文档为准（当前网络被拒，字段未经实测，get() 兜底）
+            out = pd.DataFrame({
+                "code": df.get("板块代码", pd.Series(dtype=str)),
+                "name": df.get("板块名称", pd.Series(dtype=str)),
+                "change_pct": df.get("涨跌幅", 0.0),
+                "amount": df.get("成交额", df.get("总市值", 0.0)),
+                "leading_stock": df.get("领涨股票", ""),
+            })
+            up = df.get("上涨家数", 0)
+            down = df.get("下跌家数", 0)
+            out["stock_count"] = up.fillna(0) + down.fillna(0) if isinstance(up, pd.Series) else 0
+            out["code"] = out["code"].astype(str)
+            return out[["code", "name", "stock_count", "change_pct", "amount", "leading_stock"]]
+
+        def _from_sina() -> pd.DataFrame:
+            df = ak.stock_sector_spot(indicator="概念")
+            if df is None or df.empty:
+                return pd.DataFrame()
+            out = pd.DataFrame({
+                "code": df["label"],
+                "name": df["板块"],
+                "stock_count": df["公司家数"],
+                "change_pct": df["涨跌幅"],
+                "amount": df["总成交额"],
+                "leading_stock": df["股票名称"],
+            })
+            out["code"] = out["code"].astype(str)
+            return out[["code", "name", "stock_count", "change_pct", "amount", "leading_stock"]]
+
+        # 熔断键用 "东财概念板块" 而非 "东财"：概念接口被拒不能误伤主行情源(东财)的槽位
+        # （主行情东财若被熔断，信号会退回腾讯/新浪导致信号永不触发）
+        return multi_source_fetch([("东财概念板块", _from_em), ("新浪", _from_sina)])
+
+
+    @staticmethod
+    def get_concept_cons(concept: str) -> pd.DataFrame:
+        """
+        获取概念板块成分股。
+        concept 传参规则:
+          - 'gn_xxx'（新浪概念代码）→ 直接走新浪 stock_sector_detail
+          - 概念名 / 'BKxxxx'（东财）→ 先东财 stock_board_concept_cons_em(按名)，失败后回退新浪（经概念表反查 gn 代码）
+        统一输出: code(纯6位), name, price, change_pct, amount, turnover_rate
+        异常时返回空 DataFrame,不抛异常.
+        """
+        concept = str(concept).strip()
+
+        def _cons_from_sina(gn_code: str) -> pd.DataFrame:
+            df = ak.stock_sector_detail(sector=gn_code)
+            if df is None or df.empty:
+                return pd.DataFrame()
+            out = pd.DataFrame({
+                "code": df["code"].astype(str).str.zfill(6),
+                "name": df["name"],
+                "price": df.get("trade", 0.0),
+                "change_pct": df.get("changepercent", 0.0),
+                "amount": df.get("amount", 0.0),
+                "turnover_rate": df.get("turnoverratio", 0.0),
+            })
+            return out[["code", "name", "price", "change_pct", "amount", "turnover_rate"]]
+
+        def _cons_from_em(name: str) -> pd.DataFrame:
+            df = ak.stock_board_concept_cons_em(symbol=name)
+            if df is None or df.empty:
+                return pd.DataFrame()
+            out = pd.DataFrame({
+                "code": df.get("代码", pd.Series(dtype=str)).astype(str).str.zfill(6),
+                "name": df.get("名称", pd.Series(dtype=str)),
+                "price": df.get("最新价", 0.0),
+                "change_pct": df.get("涨跌幅", 0.0),
+                "amount": df.get("成交额", 0.0),
+                "turnover_rate": df.get("换手率", 0.0),
+            })
+            return out[["code", "name", "price", "change_pct", "amount", "turnover_rate"]]
+
+        # 新浪代码直接走新浪
+        if concept.startswith("gn_"):
+            try:
+                return _cons_from_sina(concept)
+            except Exception as e:
+                logger.warning(f"获取概念[{concept}]成分股失败(新浪): {e}")
+                return pd.DataFrame()
+
+        # 东财体系：按名取成分股，失败回退新浪（经概念表反查 gn 代码）
+        em_df = pd.DataFrame()
+        if not concept.startswith("BK"):
+            try:
+                em_df = _cons_from_em(concept)
+            except Exception as e:
+                logger.warning(f"获取概念[{concept}]成分股失败(东财): {e}")
+        if not em_df.empty:
+            return em_df
+        try:
+            boards = _PoolMixin.get_concept_boards()
+            match = boards[boards["name"].astype(str) == concept]
+            if match.empty:
+                match = boards[boards["name"].astype(str).str.contains(concept, na=False)]
+            if not match.empty:
+                gn_code = match.iloc[0]["code"]
+                if str(gn_code).startswith("gn_"):
+                    return _cons_from_sina(str(gn_code))
+        except Exception as e:
+            logger.warning(f"概念[{concept}]回退新浪反查失败: {e}")
+        return pd.DataFrame()
 
 
     @staticmethod
