@@ -42,19 +42,31 @@ class MarketStyle:
         return max(min(k, settings.CAPACITY_K_MAX), settings.CAPACITY_K_MIN)
 
     @staticmethod
+    def _ramp(x: float, a: float, b: float) -> float:
+        """线性爬升：x<=a→0，x>=b→1，[a,b] 之间线性。用于边界平滑，消除硬切悬崖。"""
+        if b <= a:
+            return 1.0 if x >= b else 0.0
+        return max(0.0, min(1.0, (x - a) / (b - a)))
+
+    @staticmethod
+    def _trap(x: float, a: float, b: float, c: float, d: float) -> float:
+        """平台函数：x∈[b,c]→1，两侧 [a,b] 与 [c,d] 线性衰减到 0。"""
+        if x <= a or x >= d:
+            return 0.0
+        if b <= x <= c:
+            return 1.0
+        if a < x < b:
+            return (x - a) / (b - a)
+        return (d - x) / (d - c)
+
+    @staticmethod
     def classify(emotion: dict, market_amount: float = 8000, baseline: float = 8000) -> dict:
         """
-        :param emotion: {
-            "height": 最高连板数,
-            "zt_count": 涨停家数,
-            "dt_count": 跌停家数,
-            "zhaban_rate": 炸板率(%),
-            "sentiment_index": 情绪综合分(0-100),
-            "yield_rate": 昨日涨停今日溢价率(%),
-        }
-        :param market_amount: 今日预估成交额（亿元），默认 8000
-        :param baseline: 20日均成交额基准（亿元），默认 8000
-        :return: {"style": "...", "reason": "...", "priority_strategy": "..."}
+        市场风格分类 —— 平滑评分模型（替代硬切档位，消除边界悬崖）。
+        :param emotion: {height, zt_count, dt_count, zhaban_rate, sentiment_index, yield_rate}
+        :param market_amount: 今日预估成交额（亿元）
+        :param baseline: 20日均成交额基准（亿元）
+        :return: {"style","reason","priority_strategy","capacity_factor","confidence","scores"}
         """
         height = emotion.get("height", 0)
         zt_count = emotion.get("zt_count", 0)
@@ -63,136 +75,78 @@ class MarketStyle:
         sentiment_index = emotion.get("sentiment_index", 50)
         premium = emotion.get("yield_rate", 0)
 
-        # ── 自适应容量因子 K = 今日预估 / 20日均值 ──
+        # ── 容量因子 K 与动态阈值 ──
         k = MarketStyle._capacity_factor(market_amount, baseline)
         sqrt_k = math.sqrt(k)
+        dt_panic = int(10 * sqrt_k)          # 跌停恐慌线
+        zt_daban_min = int(30 * k)           # 打板涨停区间下限
+        zt_daban_max = int(50 * k)           # 打板涨停区间上限
+        zt_dip_min = int(40 * k)             # 低吸涨停下限
+        zt_mid_min = int(20 * k)             # 中段活跃下限
+        base_zb = 25 / sqrt_k                # 基础炸板容忍度（随 K 缩放）
+        # 炸板容忍度随涨停家数平滑放宽（涨停越多容忍度越高），不再硬切档位
+        zb_limit = base_zb * (1 + 0.5 * MarketStyle._ramp(zt_count, 40, 100))
 
-        # 动态阈值
-        dt_panic = int(10 * sqrt_k)      # 跌停线：枯水期更敏感
-        zt_daban_min = int(30 * k)       # 打板涨停下限
-        zt_daban_max = int(50 * k)       # 打板涨停上限
-        zt_dip_min = int(40 * k)         # 低吸涨停下限
-        zb_resonance_max = 25 / sqrt_k   # 共振炸板率上限(%)
+        # ---- 各风格适宜度（0~1，加权平滑）----
+        dt_part = MarketStyle._ramp(dt_count, dt_panic * 0.6, dt_panic * 1.2)
+        prem_part = MarketStyle._ramp(-premium, 1.0, 3.0)
+        s_baotuan = max(dt_part, 0.8 * prem_part)          # 生存：跌停恐慌 或 溢价崩塌
 
-        # ═══════════════════════════════════════════
-        # 优先级 1：生存（冰点/抱团）
-        # ═══════════════════════════════════════════
-        if dt_count >= dt_panic:
-            return {
-                "style": "抱团",
-                "reason": f"跌停{dt_count}家（动态线{dt_panic}），恐慌蔓延，绝对防守",
-                "priority_strategy": "避险抱团",
-                "capacity_factor": round(k, 2),
-                "dt_panic": dt_panic,
-            }
-        if premium <= settings.PREMIUM_PANIC_THRESHOLD and dt_count >= 5:
-            return {
-                "style": "抱团",
-                "reason": f"昨日涨停溢价{premium}%，主力活埋追高资金+跌停{dt_count}家，立刻避险",
-                "priority_strategy": "避险抱团",
-                "capacity_factor": round(k, 2),
-                "dt_panic": dt_panic,
-            }
+        s_gaochao = (0.5 * MarketStyle._ramp(zt_count, zt_daban_max, zt_daban_max * 1.6)
+                     + 0.3 * MarketStyle._ramp(height, 5, 7)
+                     + 0.2 * MarketStyle._ramp(sentiment_index, 60, 80))   # 顶部：超上限+高标+热
 
-        # ═══════════════════════════════════════════
-        # 优先级 2：一致性过强 → 高潮（顶部风险，优先于共振）
-        # 涨停超打板上限 + 高标 + 情绪热 → 明日必分歧，高位减仓
-        # ═══════════════════════════════════════════
-        if height >= 5 and zt_count > zt_daban_max and sentiment_index >= 70:
-            return {
-                "style": "高潮",
-                "reason": f"最高{height}板+涨停{zt_count}家（超上限{zt_daban_max}）且情绪{sentiment_index}分，市场过于一致，明日必分歧。高位减仓，等分歧后做弱转强。",
-                "priority_strategy": "观望/跟随",
-                "capacity_factor": round(k, 2),
-            }
+        s_gongzhen = (0.5 * MarketStyle._ramp(zt_count, zt_dip_min * 0.8, zt_dip_min * 1.2)
+                      + 0.25 * (1 - MarketStyle._ramp(zhaban_rate, zb_limit * 0.5, zb_limit))
+                      + 0.25 * MarketStyle._ramp(sentiment_index, 50, 70))  # 共振：涨停多+炸板低+情绪高
 
-        # ═══════════════════════════════════════════
-        # 优先级 3：高潮（板块共振）
-        # 涨停多时放宽炸板率容忍度；基础值随 K 缩放（放量/缩量一致生效）
-        # ═══════════════════════════════════════════
-        base_zb = zb_resonance_max  # 25/sqrt(K)，随容量因子缩放
-        if zt_count >= 80:
-            zb_limit = base_zb * 1.8   # 百股涨停 → 约1.8倍（K=1时=45）
-        elif zt_count >= 60:
-            zb_limit = base_zb * 1.4   # 涨停>60 → 约1.4倍（K=1时=35）
-        else:
-            zb_limit = base_zb
-        if sentiment_index >= 55 and zhaban_rate < zb_limit and zt_count >= zt_dip_min:
-            return {
-                "style": "共振",
-                "reason": f"情绪{sentiment_index}分+涨停{zt_count}家+炸板率{zhaban_rate}%（上限{zb_limit:.0f}%），全力进攻首板",
-                "priority_strategy": "板块共振",
-                "capacity_factor": round(k, 2),
-            }
+        s_daban = (0.4 * MarketStyle._trap(zt_count, zt_daban_min * 0.8, zt_daban_min,
+                                           zt_daban_max, zt_daban_max * 1.2)
+                   + 0.4 * MarketStyle._ramp(height, 3, 5)
+                   + 0.2 * MarketStyle._ramp(sentiment_index, 40, 60))       # 打板：区间+高度+情绪
 
-        # ═══════════════════════════════════════════
-        # 优先级 3：分歧（高度接力）
-        # ═══════════════════════════════════════════
-        if height >= 5 and zt_daban_min <= zt_count <= zt_daban_max:
-            if sentiment_index >= 45:
-                return {
-                    "style": "打板",
-                    "reason": f"最高{height}板+涨停{zt_count}家（区间{zt_daban_min}~{zt_daban_max}），精选弱转强3进4/4进5",
-                    "priority_strategy": "打板接力",
-                    "capacity_factor": round(k, 2),
-                }
-            else:
-                return {
-                    "style": "观望",
-                    "reason": f"高标{height}板但情绪仅{sentiment_index}分（<45），打板缺情绪支撑，观望防高标补跌——情绪回升至45分以上方可打板",
-                    "priority_strategy": "观望/跟随",
-                    "capacity_factor": round(k, 2),
-                }
+        s_dixi = (0.4 * MarketStyle._ramp(zt_count, zt_mid_min * 0.8, zt_mid_min * 1.2)
+                  + 0.4 * (1 - MarketStyle._ramp(height, 2, 4))
+                  + 0.2 * MarketStyle._ramp(sentiment_index, 40, 60))        # 低吸：涨停够+高度低
 
-        # ═══════════════════════════════════════════
-        # 优先级 4：轮动（低吸修复）
-        # ═══════════════════════════════════════════
-        if zt_count >= zt_dip_min and height <= 3:
-            return {
-                "style": "低吸",
-                "reason": f"涨停{zt_count}家（下限{zt_dip_min}）但最高{height}板，试错轮动期，低吸中军",
-                "priority_strategy": "中军回踩",
-                "capacity_factor": round(k, 2),
-            }
-
-        # 补充：中等活跃市场（涨停未达低吸门槛但情绪可做，height不足打板）
-        # 适用场景：涨停20~40家 + 情绪>=45 + height 3~4，修复期中段
-        zt_mid_min = int(20 * k)
-        if zt_count >= zt_mid_min and sentiment_index >= 45 and height <= 4:
-            return {
-                "style": "低吸",
-                "reason": f"涨停{zt_count}家+情绪{sentiment_index}分+最高{height}板，修复期中段，精选低吸标的",
-                "priority_strategy": "中军回踩",
-                "capacity_factor": round(k, 2),
-            }
-
-        # 高标+涨停超上限但情绪未过热（≥70 已在前置的高潮分支处理）→ 谨慎接力或观望
-        if height >= 5 and zt_count > zt_daban_max:
-            if sentiment_index >= 40:
-                return {
-                    "style": "打板",
-                    "reason": f"最高{height}板+涨停{zt_count}家（超区间上限{zt_daban_max}），情绪{sentiment_index}分，谨慎接力",
-                    "priority_strategy": "打板接力",
-                    "capacity_factor": round(k, 2),
-                }
-            else:
-                return {
-                    "style": "观望",
-                    "reason": f"高标{height}板但涨停{zt_count}家偏多、情绪仅{sentiment_index}分，涨停与情绪背离，警惕退潮前兆——情绪企稳前不接力",
-                    "priority_strategy": "观望/跟随",
-                    "capacity_factor": round(k, 2),
-                }
-
-        # ═══════════════════════════════════════════
-        # 优先级 5：垃圾时间（观望）
-        # ═══════════════════════════════════════════
-        return {
-            "style": "观望",
-            "reason": f"涨停{zt_count}/跌停{dt_count}/情绪{sentiment_index}/K={k:.2f}均无明确攻防信号——等方向：涨停回升或跌停扩散后再定攻守",
-            "priority_strategy": "观望/跟随",
-            "capacity_factor": round(k, 2),
+        scores = {
+            "抱团": round(s_baotuan, 2), "高潮": round(s_gaochao, 2),
+            "共振": round(s_gongzhen, 2), "打板": round(s_daban, 2), "低吸": round(s_dixi, 2),
         }
 
+        def _ret(style, priority, reason, confidence):
+            return {"style": style, "reason": reason, "priority_strategy": priority,
+                    "capacity_factor": round(k, 2),
+                    "confidence": round(confidence, 2), "scores": scores}
+
+        # ── 风险风格优先（生存/顶部），得分达 0.5 即触发 ──
+        if s_baotuan >= 0.5:
+            return _ret("抱团", "避险抱团",
+                        f"跌停{dt_count}家（动态线{dt_panic}）或溢价{premium}%，恐慌蔓延，绝对防守", s_baotuan)
+        if s_gaochao >= 0.5:
+            return _ret("高潮", "观望/跟随",
+                        f"最高{height}板+涨停{zt_count}家（超上限{zt_daban_max}）且情绪{sentiment_index}分，"
+                        f"市场过于一致，明日必分歧。高位减仓，等分歧后做弱转强。", s_gaochao)
+
+        # ── 攻击风格取最高分，需达阈值 ──
+        attack = {"共振": s_gongzhen, "打板": s_daban, "低吸": s_dixi}
+        best_style = max(attack, key=attack.get)
+        best_score = attack[best_style]
+        if best_score >= 0.55:
+            if best_style == "共振":
+                return _ret("共振", "板块共振",
+                            f"情绪{sentiment_index}分+涨停{zt_count}家+炸板率{zhaban_rate}%（上限{zb_limit:.0f}%），全力进攻首板", best_score)
+            if best_style == "打板":
+                return _ret("打板", "打板接力",
+                            f"最高{height}板+涨停{zt_count}家（区间{zt_daban_min}~{zt_daban_max}），精选弱转强3进4/4进5", best_score)
+            return _ret("低吸", "中军回踩",
+                        f"涨停{zt_count}家（下限{zt_mid_min}）+高度{height}板+情绪{sentiment_index}分，轮动修复期，低吸中军", best_score)
+
+        # ── 都不够 → 观望（带原因：哪个风格差多少达标）──
+        gap = 0.55 - best_score
+        return _ret("观望", "观望/跟随",
+                    f"涨停{zt_count}/跌停{dt_count}/情绪{sentiment_index}/K={k:.2f}，各风格分均低"
+                    f"（最高{best_style} {best_score:.2f}，差{gap:.2f}达标）——观望等方向", 0.0)
 
 class StrategyAnalyzer:
     """
