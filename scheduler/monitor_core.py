@@ -601,7 +601,11 @@ class _MonitorCoreMixin:
                 sector_blocks_buy = sector_phase in ("退潮", "冰点") or (
                     sector_phase == "高潮" and not sector_mainline
                 )
-                should_buy = (not sector_blocks_buy) and (not style_blocks_buy) and (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
+                # 概念因子（切片3）：该股全部概念均为负向（退潮/冰点/高潮非主线）才否决；
+                # 存在任一可买概念（发酵/启动/主线高潮）即放行；无概念数据不否决（覆盖率有限）。
+                concept_blocks_buy = settings.CONCEPT_GATE_ENABLED and self._get_concept_blocks_buy(code)
+                concept_brief = self._get_stock_concept_tag(code)
+                should_buy = (not sector_blocks_buy) and (not concept_blocks_buy) and (not style_blocks_buy) and (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
                     (is_recommended and rec_condition_met) or is_high_signal
                 ) and not is_sealed
                 buy_reason = ""
@@ -637,9 +641,10 @@ class _MonitorCoreMixin:
                         if is_recommended and rec_info:
                             RecommendationManager.mark_triggered(rec_info["id"])
                         sector_tag = f" 板块[{sector_industry} {sector_phase}{'·主线' if sector_mainline else ''}]" if sector_phase else ""
+                        concept_tag = f" 概念[{concept_brief}]" if concept_brief else ""
                         bark_notifier.send(
                             title=f"🤖 [AI 自动买入] {name}({code})",
-                            body=f"{buy_reason}标的 {name}({code}) 触发买入信号 (现价:{price}元, 成交成本:{cost_price}元含滑点{slippage:.2f}%, +{change_pct}%, 量比{vol_ratio}倍, 成交{amt_billion:.1f}亿{sector_tag})，已自动纳入 AI 持仓追踪！",
+                            body=f"{buy_reason}标的 {name}({code}) 触发买入信号 (现价:{price}元, 成交成本:{cost_price}元含滑点{slippage:.2f}%, +{change_pct}%, 量比{vol_ratio}倍, 成交{amt_billion:.1f}亿{sector_tag}{concept_tag})，已自动纳入 AI 持仓追踪！",
                             group="AI自动持仓",
                             level="timeSensitive"
                         )
@@ -829,6 +834,77 @@ class _MonitorCoreMixin:
         """查询板块是否主线（当日缓存）"""
         self._ensure_sector_cycle_cache()
         return self._sector_cycle_info.get(industry, {}).get("is_mainline", False)
+
+    def _ensure_concept_cycle_cache(self):
+        """当日加载一次 概念周期(concept_cycle → 阶段/主线) + 概念成分股映射(concept_member → 个股概念)"""
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        if getattr(self, '_concept_cache_date', '') == today and hasattr(self, '_concept_cycle_info'):
+            return
+        self._concept_cycle_info = {}
+        self._concept_member_map = {}
+        self._concept_cache_date = today
+        try:
+            from database import ConceptCycleManager
+            for r in ConceptCycleManager.get_concept_cycle(top=500):
+                self._concept_cycle_info[r["concept"]] = {
+                    "phase": r["phase"], "is_mainline": r["is_mainline"],
+                }
+            from database.connection import db_manager
+            from database.models import ConceptMember
+            session = db_manager.get_session()
+            try:
+                for code, name in session.query(
+                        ConceptMember.stock_code, ConceptMember.concept_name).all():
+                    self._concept_member_map.setdefault(str(code).zfill(6), []).append(name)
+            finally:
+                session.close()
+        except Exception as e:
+            logger.warning(f"加载概念周期缓存失败: {e}")
+
+    def _get_stock_concepts(self, code: str) -> list:
+        """查询个股所属概念（当日缓存），返回概念名列表或 []"""
+        self._ensure_concept_cycle_cache()
+        return self._concept_member_map.get(str(code).zfill(6), [])
+
+    def _get_concept_blocks_buy(self, code: str) -> bool:
+        """
+        概念因子否决（切片3）：无概念数据 → 不否决（覆盖率有限，未知即放行）；
+        存在任一可买概念（发酵/启动/主线高潮）→ 不否决；
+        全部概念均为负向（退潮/冰点/高潮非主线）→ 否决。
+        """
+        concepts = self._get_stock_concepts(code)
+        if not concepts:
+            return False
+        for c in concepts:
+            info = self._concept_cycle_info.get(c, {})
+            phase = info.get("phase", "")
+            if phase in ("发酵", "启动"):
+                return False
+            if phase == "高潮" and info.get("is_mainline", False):
+                return False
+            # 退潮/冰点/高潮非主线/未知 → 视为该概念不可买，继续看下一个
+        return True
+
+    def _get_stock_concept_tag(self, code: str) -> str:
+        """生成个股概念标签（推送用）：取最优概念 概念名·阶段[·主线]"""
+        concepts = self._get_stock_concepts(code)
+        if not concepts:
+            return ""
+        scored = []
+        for c in concepts:
+            info = self._concept_cycle_info.get(c, {})
+            phase = info.get("phase", "")
+            if phase:
+                scored.append((c, phase, info.get("is_mainline", False)))
+        if not scored:
+            return ""
+        _RANK = {"发酵": 3, "启动": 2, "高潮": 2, "退潮": 0, "冰点": 0}
+
+        def _key(item):
+            c, phase, mainline = item
+            return (1 if mainline else 0, _RANK.get(phase, 1))
+        c, phase, mainline = max(scored, key=_key)
+        return f"{c}·{phase}{'·主线' if mainline else ''}"
 
     def _monitor_holdings(self, spot_df, active_holdings, market_max_lbc, market_zhaban_rate):
         """第7步：持仓卖出/止损信号监控 + 批量更新收益率（从 _check_realtime_market 拆出）"""

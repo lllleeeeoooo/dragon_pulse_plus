@@ -86,6 +86,63 @@ class PostMarketAnalyzer:
         return lines
 
     @classmethod
+    def _detect_leading_concepts(cls, zt_df: pd.DataFrame) -> str:
+        """
+        概念主线识别（切片3）：从 concept_cycle 取最新题材概念主线（非题材标签已过滤），
+        并标注每个主线概念的 阶段/涨停家数/最高连板/主线分 与 代表涨停股。
+        供盘后复盘 LLM 以「概念题材」为第一优先级归因主线。
+        """
+        try:
+            from database import ConceptCycleManager
+            cycle = ConceptCycleManager.get_concept_cycle(top=10)
+            if not cycle:
+                return ""
+            # 涨停股 → 概念 映射（供代表股选取）
+            member_map = {}
+            try:
+                from database.connection import db_manager
+                from database.models import ConceptMember
+                session = db_manager.get_session()
+                try:
+                    for code, name in session.query(
+                            ConceptMember.stock_code, ConceptMember.concept_name).all():
+                        member_map.setdefault(str(code).zfill(6), []).append(name)
+                finally:
+                    session.close()
+            except Exception:
+                pass
+            # 今日涨停股：code -> (连板, "name(code)")
+            concept_stocks: Dict[str, List[tuple]] = {}
+            if zt_df is not None and not zt_df.empty and "code" in zt_df.columns:
+                for _, r in zt_df.iterrows():
+                    code = str(r.get("code", "")).zfill(6)
+                    lbc = int(pd.to_numeric(r.get("lbc", 1), errors="coerce") or 1)
+                    label = f"{r.get('name', code)}({code})"
+                    for c in member_map.get(code, []):
+                        concept_stocks.setdefault(c, []).append((lbc, label))
+
+            lines = []
+            for item in cycle:
+                c = item["concept"]
+                phase = item["phase"]
+                zt_n = item["zt_count"]
+                max_lbc = item["max_lbc"]
+                mainline = item["is_mainline"]
+                score = item["mainline_score"]
+                reps = sorted(concept_stocks.get(c, []), reverse=True)[:3]
+                rep_str = "/".join(nm for _, nm in reps)
+                star = "★" if mainline else ""
+                line = (f"- **{c}**{star}：{phase}期，{zt_n}只涨停，最高{max_lbc}板，"
+                        f"主线分{score:.2f}")
+                if rep_str:
+                    line += f"，代表：{rep_str}"
+                lines.append(line)
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"概念主线识别失败: {e}")
+            return ""
+
+    @classmethod
     def _score_stocks(cls, zt_df: pd.DataFrame) -> dict:
         """
         多维度加权打分，区分核心标的与杂毛股。
@@ -198,6 +255,10 @@ class PostMarketAnalyzer:
         core_pool_lines = [f"- {c['name']}({c['code']}): 涨幅 {c['change_pct']}%, 日成交额 {c['amount_billion']}亿, 总市值 {c['market_cap_billion']}亿" for c in core_leaders]
         active_core_pool_text = "\n".join(core_pool_lines) if core_pool_lines else "暂无符合条件的大成交额核心中军"
 
+        # 4. 概念主线识别（切片3：题材维度，非题材标签已过滤）+ 行业聚类对照
+        leading_concept_text = cls._detect_leading_concepts(zt_df)
+        if not leading_concept_text:
+            leading_concept_text = "无概念主线数据"
         # 4. 主线板块检测（涨停池行业聚类）
         sector_lines = cls._detect_leading_sectors(zt_df)
         leading_sector_text = "\n".join(sector_lines) if sector_lines else "无明显主线板块"
@@ -383,6 +444,7 @@ class PostMarketAnalyzer:
             top_amount_text=top_amount_text,
             lhb_text=lhb_text,
             leading_sector_text=leading_sector_text,
+            leading_concept_text=leading_concept_text,
             dragon_text=dragon_text,
             intraday_text=intraday_text,
             market_style_info=market_style_info or ""
