@@ -153,6 +153,26 @@ class TestPureRegressions(unittest.TestCase):
         self.assertEqual(calls, ["600001"])  # 只联网一次
         self.assertIn("600001", obj._pattern_cache)
 
+    def test_pattern_cache_expires_and_refetches(self):
+        """分时形态缓存 TTL 过期后重新联网（盘中走势会变，不能冻结全天）"""
+        from scheduler.monitor_signals import _MonitorSignalsMixin
+        import time as _time
+        obj = object.__new__(_MonitorSignalsMixin)
+        calls = []
+        class _DF:
+            @staticmethod
+            def detect_intraday_patterns(code):
+                calls.append(code)
+                return ["平稳走势"]
+        obj._DF = _DF
+        # 预置一条已过期缓存（时间戳在 9999 秒前）
+        obj._pattern_cache = {"600001": (False, _time.time() - 9999)}
+        self.assertFalse(obj._is_bad_intraday_pattern("600001"))
+        self.assertEqual(calls, ["600001"])  # 过期 → 重新联网
+        # 新结果写入后，TTL 内不再联网
+        self.assertFalse(obj._is_bad_intraday_pattern("600001"))
+        self.assertEqual(calls, ["600001"])
+
     def test_market_style_classify(self):
         """市场风格分类：抱团/共振/打板 三档命中"""
         from core.strategies import MarketStyle

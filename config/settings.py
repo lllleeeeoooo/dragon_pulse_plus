@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     MA5_FALLBACK_RATIO: float = Field(default=0.97, description="MA5 获取失败时兜底为 现价×此比例")
     REC_FADE_MAX: float = Field(default=2.0, description="推荐标的高开买入：相对开盘回落超过此值(%)视为走弱，不自动买入")
     PATTERN_CHECK_MIN_AMOUNT: float = Field(default=5.0, description="分时形态检测的最低成交额(亿元)，低于此不检测（避免轮询内频繁联网）")
+    PATTERN_CHECK_CACHE_SECONDS: int = Field(default=300, description="分时形态缓存 TTL(秒)，过期后重新拉取以跟上盘中走势（默认5分钟）")
     VOL_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动成交量相比过去5日均值的倍数门槛")
     PRICE_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动股价涨幅下限 (%)，低于此值不触发")
     PRICE_BURST_MAX: float = Field(default=9.5, description="点火异动股价涨幅上限 (%) - 主板 10cm，已涨停的不算点火")

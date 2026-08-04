@@ -72,8 +72,8 @@ class _MonitorCoreMixin:
         self._auction_summary_sent: bool = False
         # 任务记录计数器（每 4 轮≈60 秒更新一次）
         self._job_record_counter: int = 0
-        # 分时形态检测缓存（当日），避免轮询内对同一标的重复联网
-        self._pattern_cache: Dict[str, bool] = {}
+        # 分时形态检测缓存 {code: (是否不佳, 时间戳)}，TTL 过期重拉以跟上盘中走势
+        self._pattern_cache: Dict[str, tuple] = {}
 
 
     def _reset_daily_state(self):

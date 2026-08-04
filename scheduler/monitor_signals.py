@@ -170,13 +170,18 @@ class _MonitorSignalsMixin:
 
     def _is_bad_intraday_pattern(self, code: str) -> bool:
         """
-        检测个股分时形态是否不利于买入（当日缓存，避免轮询内对同一标的重复联网）。
+        检测个股分时形态是否不利于买入（TTL 缓存，避免轮询内反复联网）。
+        分时形态随盘中时间演变，缓存过期后必须重新拉取以跟上走势。
         冲高回落/放量滞涨/天地板/尾盘砸盘 → 返回True（不宜买入）。
-        调用方已按 PATTERN_CHECK_MIN_AMOUNT 做成交额门槛，控制联网频次。
+        调用方已按 PATTERN_CHECK_MIN_AMOUNT 做成交额门槛。
         """
         cache = getattr(self, '_pattern_cache', {})
+        ttl = settings.PATTERN_CHECK_CACHE_SECONDS
+        now = time.time()
         if code in cache:
-            return cache[code]
+            is_bad, ts = cache[code]
+            if now - ts < ttl:
+                return is_bad  # TTL 内复用
         bad = False
         try:
             patterns = self._DF.detect_intraday_patterns(code)
@@ -186,7 +191,7 @@ class _MonitorSignalsMixin:
                 logger.debug(f"{code} 分时形态不佳: {patterns}，跳过买入")
         except Exception:
             pass
-        cache[code] = bad
+        cache[code] = (bad, now)
         return bad
 
 
