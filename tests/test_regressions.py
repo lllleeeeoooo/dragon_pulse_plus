@@ -257,6 +257,35 @@ class TestPureRegressions(unittest.TestCase):
         m.assert_not_called()
         fs._sina_ohlc_cache = None  # 清理缓存，避免影响其他测试
 
+    def test_source_circuit_breaker(self):
+        """数据源当日异常达阈值后熔断，后续不再调用该源；次日重置"""
+        import data.core as dc
+        from config.settings import settings
+        dc._source_fail_counts.clear()
+        dc._source_circuit_open.clear()
+        dc._source_fail_date = dc._today_str()
+        calls = []
+        def bad():
+            calls.append("bad"); raise Exception("conn reset")
+        def good():
+            calls.append("good"); return pd.DataFrame({"a": [1]})
+        limit = settings.SOURCE_FAIL_CIRCUIT_LIMIT
+        for _ in range(limit):
+            dc.multi_source_fetch([("坏源", bad), ("好源", good)])
+        self.assertEqual(calls.count("bad"), limit)
+        self.assertTrue(dc._source_circuit_open.get("坏源", False))
+        # 第 limit+1 次：坏源被熔断，直接走好源
+        calls.clear()
+        dc.multi_source_fetch([("坏源", bad), ("好源", good)])
+        self.assertEqual(calls.count("bad"), 0)
+        self.assertEqual(calls.count("good"), 1)
+        # 状态接口覆盖真实源
+        st = dc.source_circuit_status()
+        self.assertIn("东财", st)
+        # 次日重置
+        dc._source_fail_date = "19990101"
+        self.assertFalse(dc.source_blocked("坏源"))
+
     def test_spot_source_priority(self):
         """信号依赖量比/振幅：主源必须是东财或腾讯，不能是新浪（新浪缺量比振幅会让信号全灭，历史 bug）"""
         from data.core import SOURCE_PRIORITY

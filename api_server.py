@@ -477,6 +477,14 @@ def data_seats_stats():
     return {"code": 200, "data": SeatProfileManager.get_stats()}
 
 
+@app.get("/data/source-status", summary="数据源熔断状态",
+         description="查看各数据源当日异常次数与熔断状态。某源当日异常达 SOURCE_FAIL_CIRCUIT_LIMIT 次后，当天不再调用该源（次日自动重置）",
+         tags=["AkShare 数据"])
+def data_source_status():
+    from data.core import source_circuit_status
+    return {"code": 200, "data": source_circuit_status()}
+
+
 @app.get("/monitor", response_class=HTMLResponse, summary="系统综合看板",
          description="HTML 页面，展示大盘/情绪/持仓/板块/龙头/系统状态")
 def monitor_page():

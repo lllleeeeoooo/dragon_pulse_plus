@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     GEM_STAR_LIMIT_PCT: float = Field(default=19.8, description="创业板/科创板涨停线涨幅(%)")
     FETCH_RETRY_COUNT: int = Field(default=3, description="数据抓取重试次数")
     FETCH_RETRY_DELAY: float = Field(default=2.0, description="数据抓取重试延迟(秒)")
+    SOURCE_FAIL_CIRCUIT_LIMIT: int = Field(default=3, description="数据源当日异常达此次数后熔断，当天不再调用该源（次日重置）")
 
     # ==================== 仓位管理配置 ====================
     MAX_AI_POSITIONS: int = Field(default=5, description="AI自动持仓最大数量，超出不再买入")
