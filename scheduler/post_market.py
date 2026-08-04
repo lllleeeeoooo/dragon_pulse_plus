@@ -20,14 +20,14 @@ from core.emotion_index import EmotionVector
 from core.cycle_machine import EmotionCycleMachine
 def job_post_market():
     """
-    15:30 盘后复盘定时任务。非交易日自动跳过。
+    18:01 盘后复盘定时任务。非交易日自动跳过。
     """
     _record_job_run("job_post_market", "盘后深度复盘")
     if not is_trading_day():
         logger.info("今日非交易日，跳过盘后复盘")
         return
 
-    logger.info(">>> 触发 15:30 盘后深度复盘定时任务...")
+    logger.info(">>> 触发 18:01 盘后深度复盘定时任务...")
     try:
         today_str = datetime.datetime.now().strftime("%Y%m%d")
 
@@ -42,10 +42,12 @@ def job_post_market():
         top_amount_df = spot_df.sort_values(by="amount", ascending=False).head(20) if not spot_df.empty else None
 
         # ---- 盘后市场风格判定（在复盘前执行，传给 LLM 作为上下文）----
-        from core.emotion_index import EmotionVector
         # 获取真实溢价和成交额，替换默认值
         premium_data = DataFetcher.get_yesterday_zt_premium()
-        total_amount = float(spot_df["amount"].sum()) if not spot_df.empty else 8e11
+        # 使用未过滤全市场成交额（对齐券商软件口径），get_realtime_spot() 已在 L37 写入缓存
+        total_amount = DataFetcher.get_market_total_amount()
+        if not total_amount or total_amount <= 0:
+            total_amount = float(spot_df["amount"].sum()) if not spot_df.empty else 8e11
 
         # 计算"破规胆量"：昨日连板>=3且3日偏离度接近红线的股票中，今日仍涨停的比例
         yidong_bravery = _compute_yidong_bravery(today_str, zt_df)
@@ -64,7 +66,6 @@ def job_post_market():
                                             baseline=baseline)
 
         # 情绪周期状态机：基于前一交易日的周期状态和今日数据判定当前所处阶段
-        from core.cycle_machine import EmotionCycleMachine
         recent_sentiments = SentimentManager.get_recent_sentiments(days_lookback=3)
         yesterday_phase = recent_sentiments[0]["cycle_stage"] if recent_sentiments else "冰点"
         cycle_result = EmotionCycleMachine.determine_phase(emotion_res, yesterday_phase)
@@ -154,21 +155,18 @@ def job_post_market():
         )
 
         # ---- 大盘指数落库 ----
-        from database.services import MarketIndexManager
-        MarketIndexManager.save_daily_index(today_str, spot_df)
+        MarketIndexManager.save_daily_index(today_str, spot_df, total_amount_yuan=total_amount)
 
         # ---- 涨停池明细落库 ----
-        from database.services import ZtPoolManager
         ZtPoolManager.save_daily_zt_pool(today_str, zt_df)
 
         # ---- 板块强度落库 ----
-        from database.services import SectorStrengthManager
         SectorStrengthManager.save_daily_sectors(today_str, zt_df)
 
         # ---- 每日盈亏报告（同步收盘价 + 净值快照 + 推送） ----
         _push_daily_pnl_report(today_str, spot_df)
 
     except Exception as e:
-        logger.error(f"15:30 盘后复盘执行异常: {e}")
+        logger.error(f"18:01 盘后复盘执行异常: {e}")
 
 

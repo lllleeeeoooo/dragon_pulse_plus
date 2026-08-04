@@ -15,9 +15,6 @@ from database.services import HoldingManager, RecommendationManager
 
 logger = logging.getLogger(__name__)
 
-# global 语句写入此模块，dashboard 从 monitor_core 读取同名变量（两个独立副本）
-_circuit_breaker_alerted: bool = False
-
 
 class _MonitorSignalsMixin:
     def _check_sector_linkage(self):
@@ -169,8 +166,6 @@ class _MonitorSignalsMixin:
                                 f"(阈值 {dynamic_threshold/1e8:.2f}亿{cap_desc})")
             except Exception as e:
                 logger.debug(f"查询 {code} 资金流向失败: {e}")
-            except Exception as e:
-                logger.debug(f"查询 {code} 资金流向失败: {e}")
 
 
     def _is_bad_intraday_pattern(self, code: str) -> bool:
@@ -197,10 +192,10 @@ class _MonitorSignalsMixin:
         total_profit = sum(h.get("profit_rate", 0) for h in ai_holdings)
         avg_profit = total_profit / len(ai_holdings)
         if avg_profit <= settings.DAILY_LOSS_CIRCUIT_BREAKER:
-            global _circuit_breaker_alerted
+            import scheduler.monitor_core as _mcore
             if not getattr(self, '_circuit_breaker_alerted', False):
                 self._circuit_breaker_alerted = True
-                _circuit_breaker_alerted = True
+                _mcore._circuit_breaker_alerted = True
                 logger.warning(f"AI持仓亏损熔断：平均收益率 {avg_profit:.2f}% <= {settings.DAILY_LOSS_CIRCUIT_BREAKER}%，停止自动买入")
                 bark_notifier.send(
                     title="🛑 [亏损熔断] AI自动买入已暂停",

@@ -71,6 +71,7 @@ class _SpotMixin:
         获取昨日涨停股今日表现,计算竞价溢价和即时溢价.
         API 失败时用上次成功值兜底,默认 1.5%（中性溢价）.
         """
+        global _last_premium_fallback
         import datetime
         try:
             today = datetime.datetime.now().strftime("%Y%m%d")
@@ -347,6 +348,7 @@ class _SpotMixin:
             logger.warning("获取全市场实时行情为空（所有数据源均失败）.")
             return pd.DataFrame()
         # 过滤前缓存全量总成交额（含科创板/北交所/ST,对齐券商软件）
+        global _cached_total_amount
         if "amount" in df.columns:
             _cached_total_amount = float(df["amount"].sum())
         return _SpotMixin.filter_stocks(df)

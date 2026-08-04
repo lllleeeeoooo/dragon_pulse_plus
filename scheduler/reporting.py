@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 from database import HoldingManager, MarketIndexManager, DailySnapshotManager
 def _push_daily_pnl_report(trade_date: str, spot_df=None):
     """盘后每日盈亏推送：同步收盘价 + 生成盈亏报告 + Bark 推送。"""
-    from database.services import HoldingManager
 
     # 1. 用今日收盘价同步持仓
     spot_map = {}
@@ -40,7 +39,6 @@ def _push_daily_pnl_report(trade_date: str, spot_df=None):
         return f"+{v}" if v > 0 else str(v)
 
     # 大盘对比
-    from database.services import MarketIndexManager
     idx = MarketIndexManager.get_latest()
 
     lines = [
@@ -101,7 +99,6 @@ def _push_daily_pnl_report(trade_date: str, spot_df=None):
     )
 
     # 净值快照落库
-    from database.services import DailySnapshotManager
     sh_pct = idx.get("sh_change_pct", 0) if idx else 0.0
     DailySnapshotManager.save_snapshot(trade_date, report, sh_change_pct=sh_pct)
 

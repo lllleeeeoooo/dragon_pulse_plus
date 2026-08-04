@@ -9,10 +9,11 @@ class MarketIndexManager:
     """大盘指数日线数据管理"""
 
     @staticmethod
-    def save_daily_index(trade_date: str, spot_df=None):
+    def save_daily_index(trade_date: str, spot_df=None, total_amount_yuan: float = 0.0):
         """
         保存当日大盘指数数据。
         优先从 akshare 获取真实指数，失败则从全市场快照估算。
+        total_amount_yuan: 全市场未过滤成交额（元），对齐券商软件口径。
         """
         import numpy as np
 
@@ -29,9 +30,13 @@ class MarketIndexManager:
             sz_close, sz_change = MarketIndexManager._fetch_index("sz399001")
             gem_close, gem_change = MarketIndexManager._fetch_index("sz399006")
 
-            total_amt = 0.0
-            if spot_df is not None and not spot_df.empty and "amount" in spot_df.columns:
+            # 优先使用传入的全市场未过滤成交额，兜底从快照估算
+            if total_amount_yuan > 0:
+                total_amt = round(total_amount_yuan / 1e8, 2)
+            elif spot_df is not None and not spot_df.empty and "amount" in spot_df.columns:
                 total_amt = round(float(spot_df["amount"].sum()) / 1e8, 2)
+            else:
+                total_amt = 0.0
 
             record = MarketIndex(
                 trade_date=trade_date,
@@ -262,6 +267,8 @@ class ZtPoolManager:
             return [{"code": r.code, "name": r.name, "lbc": r.lbc,
                      "industry": r.industry or "", "price": r.price,
                      "change_pct": r.change_pct,
+                     "first_seal_time": r.first_seal_time or "",
+                     "open_count": r.open_count or 0,
                      "_date": latest_date[0]} for r in records]
         finally:
             session.close()

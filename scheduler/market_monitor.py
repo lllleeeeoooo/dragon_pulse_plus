@@ -15,13 +15,6 @@ from database.services import HoldingManager, RecommendationManager
 
 logger = logging.getLogger(__name__)
 
-# 模块级全局变量，供 API 端点实时查询
-_current_market_style_global: Dict[str, str] = {}
-_monitor_running: bool = False
-_last_monitor_cycle: str = ""
-_circuit_breaker_alerted: bool = False
-_index_breaker_alerted: bool = False
-
 from scheduler.monitor_core import _MonitorCoreMixin
 from scheduler.monitor_signals import _MonitorSignalsMixin
 from scheduler.monitor_style import _MonitorStyleMixin

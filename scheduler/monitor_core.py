@@ -82,7 +82,9 @@ class _MonitorCoreMixin:
             self._alert_date = today
             self._ma_cache.clear()
             self._startup_logged = False  # 允许下一天输出启动日志
+            global _circuit_breaker_alerted
             self._circuit_breaker_alerted = False
+            _circuit_breaker_alerted = False
             self._prev_seal_amounts.clear()
             self._alerted_seal_decay_codes.clear()
             self._prev_sector_counts.clear()
@@ -91,7 +93,9 @@ class _MonitorCoreMixin:
             self._llm_alert_calls_today = 0
             self._auction_snapshots.clear()
             self._auction_summary_sent = False
+            global _index_breaker_alerted
             self._index_breaker_alerted = False
+            _index_breaker_alerted = False
             self._promotion_rate_cache = None
             HoldingManager.reset_all_limit_up_flags()
             RecommendationManager.expire_old_recommendations(before_date=today)
@@ -446,6 +450,11 @@ class _MonitorCoreMixin:
 
         if not hit_df.empty:
             burst_codes_for_fund = []
+            # 全市场总成交额（未过滤，对齐券商软件口径）+ 均涨幅，循环外计算一次
+            _total_amt = self._DF.get_market_total_amount()
+            if not _total_amt or _total_amt <= 0:
+                _total_amt = float(spot_df["amount"].sum()) if "amount" in spot_df.columns else 1e12
+            _index_pct = float(spot_df["change_pct"].mean()) if "change_pct" in spot_df.columns else 0.0
             for _, row in hit_df.head(5).iterrows():
                 code = str(row["code"])
                 name = str(row["name"])
@@ -539,10 +548,6 @@ class _MonitorCoreMixin:
                             level="timeSensitive"
                         )
 
-                # 计算全市场总成交额（用于抱团战法等市场总量判断）
-                total_amt = float(spot_df["amount"].sum()) if "amount" in spot_df.columns else 1e12
-                index_pct = float(spot_df["change_pct"].mean()) if "change_pct" in spot_df.columns else 0.0
-
                 # 判断是否属于动态中军池（成交额 >= 20亿 即为大容量标的）
                 is_core = amt_billion >= settings.CORE_POOL_MIN_AMOUNT
 
@@ -561,8 +566,8 @@ class _MonitorCoreMixin:
                     change_pct=change_pct,
                     turnover_rate=float(row.get("turnover_rate", 0.0)),
                     is_in_core_pool=is_core,
-                    market_total_amount=total_amt,
-                    index_change_pct=index_pct,
+                    market_total_amount=_total_amt,
+                    index_change_pct=_index_pct,
                     sector_active_count=sector_count
                 )
 

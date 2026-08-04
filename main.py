@@ -78,14 +78,14 @@ def main():
         name="09:26 竞价观察"
     )
 
-    # 15:30 盘后深度复盘
+    # 18:01 盘后深度复盘
     scheduler.add_job(
         job_post_market,
         trigger="cron",
-        hour=15,
-        minute=30,
+        hour=18,
+        minute=1,
         id="job_post_market",
-        name="15:30 盘后深度复盘"
+        name="18:01 盘后深度复盘"
     )
 
     # 20:00 假日消息汇总（仅假期/周末最后一天执行，内部自动判断）
@@ -152,7 +152,7 @@ def main():
     logger.info("  08:30  盘前简报（新闻+热搜→LLM 预测板块→Bark 推送）")
     logger.info("  09:26  竞价观察（竞价快照+推荐标的→LLM 买卖指令→Bark 推送）")
     logger.info("  09:30  盘中实时监控（15秒轮询，点火异动+板块联动+AI自动交易）")
-    logger.info("  15:30  盘后深度复盘（情绪→风格→LLM复盘→指数/涨停池/板块落库→盈亏报告推送）")
+    logger.info("  18:01  盘后深度复盘（情绪→风格→LLM复盘→指数/涨停池/板块落库→盈亏报告推送）")
     logger.info("  20:00  假日消息汇总（假期最后一天推送）")
     logger.info("Web 服务: http://127.0.0.1:8000 | 看板: /monitor | API文档: /docs")
 

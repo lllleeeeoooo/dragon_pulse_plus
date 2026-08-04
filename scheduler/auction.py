@@ -11,14 +11,14 @@ from notifier.bark import bark_notifier
 from core.trade_calendar import is_trading_day, is_last_non_trading_day
 
 logger = logging.getLogger(__name__)
-from scheduler.helpers import _record_job_run
+import scheduler.helpers as _helpers
 from database import RecommendationManager
 from llm.call_auction import CallAuctionAnalyzer
 def job_call_auction():
     """
     09:26 竞价观察与指令定时任务。非交易日自动跳过。
     """
-    _record_job_run("job_call_auction", "竞价观察")
+    _helpers._record_job_run("job_call_auction", "竞价观察")
     if not is_trading_day():
         logger.info("今日非交易日，跳过竞价观察")
         return
@@ -55,9 +55,8 @@ def job_call_auction():
 
         recs_summary = "\n".join(lines) if lines else "暂无待观察标的"
 
-        # ---- 3. 盘前简报预测板块（修复 #2）----
-        global _cached_pre_market_report
-        predicted_summary = _cached_pre_market_report[:800] if _cached_pre_market_report else ""
+        # ---- 3. 盘前简报预测板块 ----
+        predicted_summary = _helpers._cached_pre_market_report[:800] if _helpers._cached_pre_market_report else ""
 
         # ---- 4. 抓取实时竞价快照 ----
         spot_df = DataFetcher.get_realtime_spot()

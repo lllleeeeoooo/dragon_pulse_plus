@@ -1,5 +1,7 @@
 import datetime
+import json
 import logging
+import re
 from typing import Dict, Any, List, Optional
 import pandas as pd
 
@@ -8,7 +10,10 @@ from data.fetcher import DataFetcher
 from data.news_fetcher import NewsFetcher
 from llm.client import llm_client
 from notifier.bark import bark_notifier
-from core.trade_calendar import is_trading_day, is_last_non_trading_day
+from core.trade_calendar import is_trading_day, is_last_non_trading_day, get_previous_trading_day
+from database.services import RecommendationManager, db_manager
+from database.models import SystemLog, HistoricDragon
+from database import SystemLogManager
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +22,6 @@ def _record_job_run(job_id: str, job_name: str):
     """记录定时任务执行时间（仅数据库，不占内存）"""
     now = datetime.datetime.now()
     try:
-        from database import SystemLogManager, db_manager
-        from database.models import SystemLog
-
         # 监控循环每轮更新同一条记录（避免重复写入）
         if job_id == "job_monitor_loop":
             session = db_manager.get_session()
@@ -55,13 +57,12 @@ def _get_job_status() -> List[Dict[str, Any]]:
         {"id": "job_pre_market",     "name": "盘前简报",         "time": "08:30", "desc": "新闻抓取→LLM分析→推送题材预测"},
         {"id": "job_call_auction",   "name": "竞价观察",         "time": "09:26", "desc": "竞价快照→LLM判断超预期标的"},
         {"id": "job_monitor_loop",   "name": "盘中实时监控",     "time": "09:30-15:00", "desc": "15秒轮询，点火异动+板块联动+AI自动交易"},
-        {"id": "job_post_market",    "name": "盘后深度复盘",     "time": "15:30", "desc": "LLM复盘+推荐标的+指数落库+盈亏推送"},
+        {"id": "job_post_market",    "name": "盘后深度复盘",     "time": "18:01", "desc": "LLM复盘+推荐标的+指数落库+盈亏推送"},
         {"id": "job_holiday_summary","name": "假日消息汇总",     "time": "20:00", "desc": "假期最后一天汇总近期消息"},
     ]
 
     db_records = {}
     try:
-        from database import SystemLogManager
         logs = SystemLogManager.get_logs(log_date=today, category="job_run", limit=50)
         for log in logs:
             detail = log.get("detail", "")
@@ -83,8 +84,6 @@ def _parse_and_save_recommendations(trade_date: str, report_text: str):
     从 LLM 复盘报告中提取推荐标的并落库到 recommendations 表。
     优先级：1) 结构化 JSON 块（Prompt 要求 LLM 输出）2) 正则兜底匹配
     """
-    import re
-    import json
     items = []
 
     json_parsed = False  # 标记是否成功解析了 JSON（包括空数组）
@@ -168,7 +167,6 @@ def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame =
     LLM 复盘打分：让 LLM 评估昨日推荐标的今日的实际表现，形成闭环反馈。
     评分存入 recommendations 表的 sell_condition 字段（复用为评分备注）。
     """
-    from core.trade_calendar import get_previous_trading_day
     yesterday = get_previous_trading_day(
         datetime.datetime.strptime(trade_date, "%Y%m%d").date()
     )
@@ -212,7 +210,6 @@ def _compute_yidong_bravery(today_str: str, today_zt_df) -> float:
     无数据时返回默认50%（中性）。
     """
     try:
-        from core.trade_calendar import get_previous_trading_day
         yesterday = get_previous_trading_day(
             datetime.datetime.strptime(today_str, "%Y%m%d").date()
         )
@@ -252,10 +249,6 @@ def _auto_populate_dragons(trade_date: str, zt_df):
     if zt_df is None or zt_df.empty or "lbc" not in zt_df.columns:
         return
     try:
-        from database import RecommendationManager
-        from database.services import db_manager
-        from database.models import HistoricDragon
-        import datetime
         session = db_manager.get_session()
         try:
             # 30 天前的龙头标记为失效

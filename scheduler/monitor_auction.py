@@ -6,6 +6,7 @@
 import time
 import datetime
 import logging
+import re
 from typing import Dict, Any, List, Optional
 import pandas as pd
 
@@ -42,7 +43,9 @@ class _MonitorAuctionMixin:
             high_open = spot_df[spot_df["change_pct"] >= 5.0] if "change_pct" in spot_df.columns else pd.DataFrame()
             low_open = spot_df[spot_df["change_pct"] <= -5.0] if "change_pct" in spot_df.columns else pd.DataFrame()
 
-            total_amount = float(spot_df["amount"].sum()) if "amount" in spot_df.columns else 0
+            total_amount = self._DF.get_market_total_amount()  # 全市场未过滤成交额
+            if not total_amount:
+                total_amount = float(spot_df["amount"].sum()) if "amount" in spot_df.columns else 0
             avg_change = float(spot_df["change_pct"].mean()) if "change_pct" in spot_df.columns else 0
 
             snapshot = {
@@ -141,8 +144,8 @@ class _MonitorAuctionMixin:
         global _auction_prediction_cache
         _auction_prediction_cache = (
             f"大盘预判: {market_prediction}\n"
-            f"板块预判:\n{sector_predictions}" if sector_predictions else ""
-            f"竞价龙头: {top_stocks}"
+            + (f"板块预判:\n{sector_predictions}\n" if sector_predictions else "")
+            + f"竞价龙头: {top_stocks}"
         )
         bark_notifier.send(
             title=f"📊 [竞价预判] {market_prediction[:12]}",
@@ -157,7 +160,6 @@ class _MonitorAuctionMixin:
 
     def _get_yesterday_context(self) -> dict:
         """获取昨日大盘、情绪周期、热门板块数据用于竞价预判"""
-        import datetime as _dt
         result = {}
 
         # --- 昨日大盘指数 ---
@@ -287,6 +289,14 @@ class _MonitorAuctionMixin:
             sector_name = s["name"]
             # 从竞价快照中筛选该板块成分股（通过涨停池缓存中的 industry 匹配）
             zt_df = self._zt_pool_cache
+            if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
+                # 集合竞价阶段 _zt_pool_cache 尚未填充（09:30+ 才刷新），
+                # 回退到昨日涨停池数据以匹配板块成分股
+                try:
+                    yesterday_str = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+                    zt_df = self._DF.get_zt_pool(date_str=yesterday_str)
+                except Exception:
+                    pass
             if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
                 continue
 

@@ -37,6 +37,7 @@ def build_dashboard_data() -> Dict[str, Any]:
 
     # ---- 大盘指数 ----
     idx = MarketIndexManager.get_latest()
+    yesterday_amount = _get_yesterday_total_amount(idx.get("trade_date", "") if idx else "")
 
     # ---- 净值曲线 ----
     equity = DailySnapshotManager.get_equity_curve(days=20)
@@ -69,7 +70,7 @@ def build_dashboard_data() -> Dict[str, Any]:
             "reason": style.get("reason", ""),
             "cycle_stage": style.get("cycle_stage", ""),
         },
-        "index": _build_index_section(idx),
+        "index": _build_index_section(idx, yesterday_amount),
         "emotion": _build_emotion_section(style),
         "breadth": _build_breadth_section(style),
         "portfolio": _build_portfolio_section(holdings, pnl_report, ai_count),
@@ -96,25 +97,36 @@ def build_dashboard_data() -> Dict[str, Any]:
 # 板块构建函数
 # ---------------------------------------------------------------------------
 
-def _build_index_section(idx: Optional[Dict]) -> Dict[str, Any]:
+def _build_index_section(idx: Optional[Dict], yesterday_amount: float = 0) -> Dict[str, Any]:
     if not idx:
         return {}
+    today_amount = idx.get("total_amount", 0) or 0
+    # 计算较昨日成交额变化
+    amount_diff = today_amount - yesterday_amount
+    if yesterday_amount > 0 and amount_diff != 0:
+        diff_sign = "+" if amount_diff > 0 else ""
+        amount_trend = f"较昨{diff_sign}{amount_diff:.0f}亿"
+    else:
+        amount_trend = ""
     return {
         "sh_close": idx.get("sh_close", 0),
         "sh_change_pct": idx.get("sh_change_pct", 0),
+        "sz_close": idx.get("sz_close", 0),
         "sz_change_pct": idx.get("sz_change_pct", 0),
+        "gem_close": idx.get("gem_close", 0),
         "gem_change_pct": idx.get("gem_change_pct", 0),
-        "total_amount": f"{idx.get('total_amount', 0):.0f}亿" if idx.get("total_amount") else "",
+        "total_amount": f"{today_amount:.0f}亿" if today_amount else "",
+        "amount_trend": amount_trend,
     }
 
 
 def _build_emotion_section(style: dict) -> Dict[str, Any]:
     return {
         "sentiment_index": style.get("sentiment_index", 0),
-        "score_premium": style.get("score_premium", 0),
-        "score_breadth": style.get("score_breadth", 0),
-        "score_height": style.get("score_height", 0),
-        "score_support": style.get("score_support", 0),
+        "score_premium": round(style.get("score_premium", 0), 1),
+        "score_breadth": round(style.get("score_breadth", 0), 1),
+        "score_height": round(style.get("score_height", 0), 1),
+        "score_support": round(style.get("score_support", 0), 1),
         "premium_intraday": f"{style.get('premium_intraday', 0)}%",
         "red_rate": f"{style.get('positive_ratio', 0)}%",
     }
@@ -179,9 +191,30 @@ def _get_dragons_with_fallback(today_str: str) -> tuple:
             ).order_by(DailyZtPool.lbc.desc()).limit(10).all()
             return [{"code": r.code, "name": r.name, "lbc": r.lbc,
                      "industry": r.industry or "", "change_pct": r.change_pct,
+                     "first_seal_time": r.first_seal_time or "",
+                     "open_count": r.open_count or 0,
                      "_date": latest[0]} for r in records], latest[0]
     except Exception:
         pass
     finally:
         session.close()
     return [], ""
+
+
+def _get_yesterday_total_amount(today_str: str) -> float:
+    """查询前一交易日全市场成交额（亿元），用于计算环比变化"""
+    if not today_str:
+        return 0.0
+    from database.models import MarketIndex
+    session = db_manager.get_session()
+    try:
+        prev = session.query(MarketIndex).filter(
+            MarketIndex.trade_date < today_str
+        ).order_by(MarketIndex.trade_date.desc()).first()
+        if prev and prev.total_amount:
+            return float(prev.total_amount)
+        return 0.0
+    except Exception:
+        return 0.0
+    finally:
+        session.close()
