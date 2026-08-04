@@ -258,6 +258,8 @@ class _MonitorCoreMixin:
             logger.debug("涨停/炸板池缓存已刷新")
         except Exception as e:
             logger.warning(f"刷新涨停/炸板池缓存失败: {e}")
+            # 失败后退避重试（默认 5 分钟后再试），避免对异常接口每 60 秒频繁轮询造成反爬压力
+            self._pool_cache_time = now + settings.POOL_CACHE_FAIL_BACKOFF_SECONDS
 
 
     def _get_ma_prices(self, code: str) -> Dict[str, Any]:

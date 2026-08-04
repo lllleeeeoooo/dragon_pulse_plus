@@ -75,6 +75,7 @@ class Settings(BaseSettings):
     FETCH_RETRY_COUNT: int = Field(default=3, description="数据抓取重试次数")
     FETCH_RETRY_DELAY: float = Field(default=2.0, description="数据抓取重试延迟(秒)")
     SOURCE_FAIL_CIRCUIT_LIMIT: int = Field(default=3, description="数据源当日异常达此次数后熔断，当天不再调用该源（次日重置）")
+    POOL_CACHE_FAIL_BACKOFF_SECONDS: int = Field(default=300, description="涨停/炸板池刷新失败后的退避重试间隔(秒)，避免对异常接口每60秒频繁轮询")
 
     # ==================== 仓位管理配置 ====================
     MAX_AI_POSITIONS: int = Field(default=5, description="AI自动持仓最大数量，超出不再买入")
