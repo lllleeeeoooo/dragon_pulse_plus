@@ -8,6 +8,11 @@ from data.core import multi_source_fetch
 
 _cached_total_amount: float = 0.0
 
+# 新浪 OHLC 补齐缓存（主源为腾讯时，避免每 15 秒轮询都全量拉新浪）
+_sina_ohlc_cache: pd.DataFrame = None
+_sina_ohlc_cache_time: float = 0.0
+_OHLC_CACHE_SECONDS: float = 60.0
+
 # 立案调查黑名单缓存（每小时刷新一次，避免高频查库）
 _investigation_blacklist_cache: set = set()
 _investigation_cache_time: float = 0.0
@@ -346,13 +351,49 @@ class _SpotMixin:
 
 
     @staticmethod
+    def _fill_ohlc_from_sina(df: pd.DataFrame) -> pd.DataFrame:
+        """腾讯源不提供 开/高/低，用新浪的 OHLC 补齐（新浪有 OHLC 但缺量比振幅）。
+        仅当主源 OHLC 缺失/全 0 时调用，避免低开猛拉等信号在 0 值 OHLC 上误触发（垃圾判定）。"""
+        try:
+            if df is None or df.empty or "open" not in df.columns:
+                return df
+            if pd.to_numeric(df["open"], errors="coerce").fillna(0).abs().max() > 0:
+                return df  # OHLC 已有真实值，无需补
+            # 新浪 OHLC 缓存（60 秒），避免每 15 秒轮询都全量拉一次新浪
+            global _sina_ohlc_cache, _sina_ohlc_cache_time
+            now = _time.time()
+            if _sina_ohlc_cache is None or (now - _sina_ohlc_cache_time) > _OHLC_CACHE_SECONDS:
+                _sina_ohlc_cache = _SpotMixin._fetch_spot_sina()
+                _sina_ohlc_cache_time = now
+            sina = _sina_ohlc_cache
+            if sina is None or sina.empty or not {"code", "open", "high", "low"} <= set(sina.columns):
+                return df
+            sina_slim = sina[["code", "open", "high", "low"]].copy()
+            sina_slim["code"] = sina_slim["code"].astype(str)
+            out = df.copy()
+            out["code"] = out["code"].astype(str)
+            out = out.merge(sina_slim, on="code", how="left", suffixes=("", "_sina"))
+            for col in ["open", "high", "low"]:
+                c2 = f"{col}_sina"
+                if c2 in out.columns:
+                    cur = pd.to_numeric(out[col], errors="coerce")
+                    fill = pd.to_numeric(out[c2], errors="coerce")
+                    out[col] = cur.where(cur > 0, fill)
+                    out = out.drop(columns=[c2])
+            logger.info("腾讯源 OHLC 缺失，已用新浪补齐")
+            return out
+        except Exception as e:
+            logger.warning(f"用新浪补齐 OHLC 失败: {e}")
+            return df
+
+    @staticmethod
     def get_realtime_spot() -> pd.DataFrame:
         """
         获取全市场 A 股实时行情快照.
-        多数据源降级:新浪 -> 腾讯 -> 东财,某个源失败自动切换下一个.
+        多数据源降级:东财 -> 腾讯 -> 新浪,某个源失败自动切换下一个.
         """
-        # 源优先级：东财(量比/振幅/换手率/市值全) → 腾讯(有量比lb/振幅zf) → 新浪(缺量比振幅，仅兜底)。
-        # 信号检测依赖量比/振幅，若退回新浪会导致所有信号永不触发（历史 bug：从未产生 AI 买入）。
+        # 源优先级：东财(量比/振幅/OHLC/市值全) → 腾讯(量比lb/振幅zf, 缺OHLC) → 新浪(OHLC, 缺量比振幅)。
+        # 信号依赖量比/振幅：若退回新浪会导致所有信号永不触发（历史 bug：从未产生 AI 买入）。
         df = multi_source_fetch([
             ("东财", _SpotMixin._fetch_spot_eastmoney),
             ("腾讯", _SpotMixin._fetch_spot_tencent),
@@ -361,6 +402,8 @@ class _SpotMixin:
         if df.empty:
             logger.warning("获取全市场实时行情为空（所有数据源均失败）.")
             return pd.DataFrame()
+        # 腾讯源缺 OHLC，用新浪补齐，避免低开猛拉/一字板等在 0 值上误触发
+        df = _SpotMixin._fill_ohlc_from_sina(df)
         # 过滤前缓存全量总成交额（含科创板/北交所/ST,对齐券商软件）
         global _cached_total_amount
         if "amount" in df.columns:

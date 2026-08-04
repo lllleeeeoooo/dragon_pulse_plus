@@ -482,6 +482,7 @@ class _MonitorCoreMixin:
             (spot_df["volume_ratio"] > settings.NEAR_LIMIT_VOL_RATIO)
         )
         spot_df["_signal_low_open_rally"] = (
+            (spot_df["open"].astype(float) > 0) &  # OHLC 数据缺失时（0值）不触发，避免垃圾判定
             (spot_df["open"].astype(float) < spot_df["pre_close"].astype(float) * settings.LOW_OPEN_DEV) &
             (spot_df["volume_ratio"] > settings.RALLY_VOL_RATIO) &
             (rally_strength > settings.RALLY_STRENGTH_MIN) &

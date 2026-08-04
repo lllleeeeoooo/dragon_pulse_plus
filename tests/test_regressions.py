@@ -228,6 +228,35 @@ class TestPureRegressions(unittest.TestCase):
                 predicted_sectors_summary="", auction_prediction="")
             self.assertEqual(result, "竞价指令")
 
+    def test_fill_ohlc_from_sina(self):
+        """腾讯源缺 OHLC 时用新浪补齐（修复低开猛拉在 0 值 OHLC 上误触发）"""
+        import data.fetcher_spot as fs
+        from data.fetcher_spot import _SpotMixin
+        fs._sina_ohlc_cache = None
+        fs._sina_ohlc_cache_time = 0.0
+        tencent = pd.DataFrame({
+            "code": ["002827", "600001"], "price": [41.84, 10.0],
+            "volume_ratio": [12.2, 1.0],
+            "open": [0.0, 0.0], "high": [0.0, 0.0], "low": [0.0, 0.0],
+        })
+        sina = pd.DataFrame({
+            "code": ["002827", "600001"],
+            "open": [41.87, 9.90], "high": [41.87, 10.2], "low": [38.82, 9.5],
+        })
+        with patch.object(_SpotMixin, "_fetch_spot_sina", return_value=sina):
+            out = _SpotMixin._fill_ohlc_from_sina(tencent)
+        r = out[out["code"] == "002827"].iloc[0]
+        self.assertGreater(float(r["open"]), 0)
+        self.assertEqual(float(r["open"]), 41.87)
+        self.assertEqual(float(r["low"]), 38.82)
+        # OHLC 已有真实值时不补（不触发新浪拉取）
+        tencent2 = tencent.copy()
+        tencent2["open"] = 41.87; tencent2["high"] = 41.9; tencent2["low"] = 38.8
+        with patch.object(_SpotMixin, "_fetch_spot_sina", return_value=sina) as m:
+            _SpotMixin._fill_ohlc_from_sina(tencent2)
+        m.assert_not_called()
+        fs._sina_ohlc_cache = None  # 清理缓存，避免影响其他测试
+
     def test_spot_source_priority(self):
         """信号依赖量比/振幅：主源必须是东财或腾讯，不能是新浪（新浪缺量比振幅会让信号全灭，历史 bug）"""
         from data.core import SOURCE_PRIORITY
