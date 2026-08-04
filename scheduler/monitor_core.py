@@ -592,7 +592,10 @@ class _MonitorCoreMixin:
                 verdict_blocked = is_recommended and auction_verdict == "放弃"
                 # 当前已封板则买不进（封板判定覆盖一字板，含盘中打开后重新封死的）
                 is_sealed = type(self)._is_limit_up(code, change_pct)
-                should_buy = (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
+                # 市场风格否决权（④ 风格/周期协同）：观望 = 无明确攻防信号，
+                # 无论情绪周期说什么都不自动买入（抱团是防御买入型，不在此列）
+                style_blocks_buy = market_style.get("style") == "观望"
+                should_buy = (not style_blocks_buy) and (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
                     (is_recommended and rec_condition_met) or is_high_signal
                 ) and not is_sealed
                 buy_reason = ""
