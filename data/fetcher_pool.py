@@ -187,7 +187,8 @@ class _PoolMixin:
         if df is not None and not df.empty:
             # 兼容不同版本的字段名
             rename_map = {}
-            for raw, target in [("名称", "name"), ("代码", "code"), ("日期", "date"),
+            for raw, target in [("名称", "name"), ("股票简称", "name"),
+                                ("代码", "code"), ("股票代码", "code"), ("日期", "date"),
                                 ("主力净流入-净额", "main_net_inflow"),
                                 ("主力净流入-净占比", "main_net_ratio"),
                                 ("超大单净流入-净额", "super_large_net"),

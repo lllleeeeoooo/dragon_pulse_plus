@@ -257,6 +257,32 @@ class TestPureRegressions(unittest.TestCase):
         m.assert_not_called()
         fs._sina_ohlc_cache = None  # 清理缓存，避免影响其他测试
 
+    def test_tencent_market_cap_unit(self):
+        """腾讯市值 亿元→元（修复 流通市值:0亿、市值阈值算错）"""
+        from data.fetcher_spot import _SpotMixin
+        raw = pd.DataFrame({
+            "code": ["sh600519"], "name": ["贵州茅台"], "zxj": ["1332.98"], "zdf": ["-1.91"],
+            "zd": ["-26.00"], "zf": ["1.46"], "hsl": ["0.18"], "lb": ["0.79"],
+            "volume": ["22125.00"], "turnover": ["296389"], "ltsz": ["16663.34"],
+            "zsz": ["16663.34"], "pe_ttm": ["20.15"],
+        })
+        with patch("akshare.stock_zh_a_spot_tx", return_value=raw):
+            df = _SpotMixin._fetch_spot_tencent()
+        self.assertAlmostEqual(float(df.iloc[0]["circ_market_cap"]), 16663.34e8, delta=1e7)
+        self.assertAlmostEqual(float(df.iloc[0]["total_market_cap"]), 16663.34e8, delta=1e7)
+
+    def test_individual_fund_flow_name_mapping(self):
+        """资金流接口：股票简称→name（修复名称显示成代码）"""
+        from data.fetcher_pool import _PoolMixin
+        raw = pd.DataFrame({
+            "日期": ["2026-08-04"], "股票代码": ["301082"], "股票简称": ["奥雅股份"],
+            "收盘价": [10.0], "涨跌幅": [5.0], "主力净流入-净额": [5e7],
+        })
+        with patch("akshare.stock_individual_fund_flow", return_value=raw):
+            df = _PoolMixin.get_individual_fund_flow("301082", "sz")
+        self.assertEqual(df.iloc[-1]["name"], "奥雅股份")
+        self.assertEqual(df.iloc[-1]["main_net_inflow"], 5e7)
+
     def test_source_circuit_breaker(self):
         """数据源当日异常达阈值后熔断，后续不再调用该源；次日重置"""
         import data.core as dc

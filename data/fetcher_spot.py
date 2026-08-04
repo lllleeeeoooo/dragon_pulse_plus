@@ -330,11 +330,15 @@ class _SpotMixin:
             if col in df.columns:
                 df[col] = pd.to_numeric(
                     df[col].astype(str).str.replace("%", "", regex=False), errors="coerce")
-        # 单位统一（实测验证）：腾讯 成交量=手(×100→股)、成交额=万元(×1e4→元)，与新浪/东财口径一致
+        # 单位统一（实测验证）：腾讯 成交量=手(×100→股)、成交额=万元(×1e4→元)，
+        # 流通/总市值=亿元(×1e8→元)，与新浪/东财口径一致（否则市值显示成 0 亿、市值阈值算错）
         if "volume" in df.columns:
             df["volume"] = df["volume"] * 100
         if "amount" in df.columns:
             df["amount"] = df["amount"] * 1e4
+        for _col in ["circ_market_cap", "total_market_cap"]:
+            if _col in df.columns:
+                df[_col] = df[_col] * 1e8
         # 腾讯 code 带前缀 (sh600519 / sz000001 / bj920000),去掉前缀
         if "code" in df.columns:
             df["code"] = df["code"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
