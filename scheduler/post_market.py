@@ -38,6 +38,13 @@ def job_post_market():
         lhb_df = DataFetcher.get_lhb_detail(date_str=today_str)
         lhb_seats_df = DataFetcher.get_lhb_seats(date_str=today_str)  # 营业部级席位数据
 
+        # 龙虎榜席位画像同步（行为分类自动更新，供席位"神韵"分析）
+        try:
+            from database import SeatProfileManager
+            SeatProfileManager.sync_from_lhb(lhb_seats_df, today_str)
+        except Exception as e:
+            logger.warning(f"龙虎榜席位画像同步失败: {e}")
+
         # 排序成交额 Top 20
         top_amount_df = spot_df.sort_values(by="amount", ascending=False).head(20) if not spot_df.empty else None
 

@@ -190,6 +190,27 @@ class TestDbRegressions(unittest.TestCase):
         h = HoldingManager.get_active_holdings(holding_type="AI_AUTO")[0]
         self.assertAlmostEqual(h["profit_rate"], 10.0, places=2)
 
+    def test_seat_profile_sync_and_classify(self):
+        """龙虎榜席位画像：名席位种子 + 行为自动分类 + DB 查询"""
+        from database import SeatProfileManager
+        # 名席位种子（六一中路人工标签优先于自动分类）
+        SeatProfileManager.seed_famous_seats()
+        # 模拟新营业部连续 5 天净买入（与生产一致：每日同步一次）→ 应自动定型为格局派
+        for i in range(5):
+            day = f"2026080{i + 1}"
+            SeatProfileManager.sync_from_lhb(pd.DataFrame([{
+                "seat_name": "华鑫证券某新锐营业部", "trade_date": day,
+                "buy_stock_count": 3, "sell_stock_count": 0,
+                "buy_amount": 5e7, "sell_amount": 0, "net_amount": 5e7, "buy_stocks": "A,B,C",
+            }]), day)
+        prof = SeatProfileManager.get_seat_type("华鑫证券某新锐营业部")
+        self.assertIsNotNone(prof)
+        self.assertIn("格局", prof["type"])
+        # 名席位种子：精确匹配返回人工标签
+        famous = SeatProfileManager.get_seat_type("六一中路")
+        self.assertIsNotNone(famous)
+        self.assertIn("格局", famous["type"])
+
     def test_core_pool_beta_real(self):
         """core_pool Beta 实际生效：用个股收盘价与市场指数计算相关性并过滤"""
         from core.core_pool import ActiveCorePool

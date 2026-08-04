@@ -18,6 +18,7 @@ from database.market_data import MarketIndexManager, DailySnapshotManager, ZtPoo
 from database.calendar import TradeCalendarManager
 from database.system_log import SystemLogManager
 from database.investigation import InvestigationManager
+from database.seats import SeatProfileManager
 
 __all__ = [
     "db_manager",
@@ -38,4 +39,5 @@ __all__ = [
     "TradeCalendarManager",
     "SystemLogManager",
     "InvestigationManager",
+    "SeatProfileManager",
 ]

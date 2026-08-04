@@ -55,6 +55,11 @@ def main():
     TradeCalendarManager.sync_calendar()
     logger.info("交易日历已同步，数据库表结构已就绪。")
 
+    # 0.5 龙虎榜名席位种子初始化（幂等，六一中路等人工标签优先于自动分类）
+    from database import SeatProfileManager
+    SeatProfileManager.seed_famous_seats()
+    logger.info("龙虎榜名席位种子已初始化。")
+
     # 1. 初始化 APScheduler 定时任务
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 

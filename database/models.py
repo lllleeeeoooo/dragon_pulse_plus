@@ -200,6 +200,34 @@ class InvestigationRecord(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
+class SeatProfile(Base):
+    """
+    龙虎榜营业部画像表（席位行为画像，每日自动更新）
+    记录每个上榜营业部的累计买卖统计与行为分类。
+    分类优先级：人工标签(is_manual) > 自动行为分类(seat_type)。
+    六一中路等名席位作为人工种子灌入，新出现的营业部靠行为统计自动定型。
+    """
+    __tablename__ = "seat_profiles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    seat_name = Column(String(64), nullable=False, unique=True, index=True, comment="营业部名称")
+    first_seen = Column(String(10), nullable=False, comment="首次出现日期 YYYYMMDD")
+    last_seen = Column(String(10), nullable=False, comment="最近出现日期 YYYYMMDD")
+    appear_count = Column(Integer, default=0, comment="累计上榜次数")
+    buy_amount_total = Column(Float, default=0.0, comment="累计买入总金额(元)")
+    sell_amount_total = Column(Float, default=0.0, comment="累计卖出总金额(元)")
+    net_amount_total = Column(Float, default=0.0, comment="累计净买入(元)")
+    net_positive_days = Column(Integer, default=0, comment="净买入为正的天数")
+    buy_stock_count_total = Column(Integer, default=0, comment="累计买入个股数")
+    seat_type = Column(String(16), default="未知", comment="自动行为分类: 格局派/砸盘派/散户派/对倒派/未知")
+    is_manual = Column(Boolean, default=False, comment="是否人工标签（人工优先于自动）")
+    manual_type = Column(String(16), comment="人工标签类型（如 A类-格局派）")
+    desc = Column(String(128), comment="人工标签描述")
+    is_active = Column(Boolean, default=True, comment="近30天是否活跃")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
+
+
 class PushLog(Base):
     """
     推送通知日志表

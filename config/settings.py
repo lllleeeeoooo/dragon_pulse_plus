@@ -112,6 +112,12 @@ class Settings(BaseSettings):
     HEIGHT_WEIGHT: float = Field(default=0.21, description="高度在盘中情绪分中的权重")
     SUPPORT_WEIGHT: float = Field(default=0.14, description="承接在盘中情绪分中的权重")
 
+    # ==================== 龙虎榜席位画像配置 ====================
+    SEAT_CLASSIFY_MIN_SAMPLES: int = Field(default=3, description="席位自动分类所需最低上榜次数（样本不足判未知）")
+    SEAT_AVG_BUY_THRESHOLD_WAN: float = Field(default=800.0, description="平均单只买入金额低于此(万元)视为散户/小单倾向")
+    SEAT_NET_POSITIVE_ZHIGE: float = Field(default=0.6, description="格局派判定：净买入天数占比下限")
+    SEAT_NET_POSITIVE_ZSHA: float = Field(default=0.3, description="砸盘派判定：净买入天数占比上限")
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         weight_sum = self.PREMIUM_WEIGHT + self.BREADTH_WEIGHT + self.HEIGHT_WEIGHT + self.SUPPORT_WEIGHT
