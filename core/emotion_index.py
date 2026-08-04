@@ -17,6 +17,31 @@ class EmotionVector:
     6. 破规胆量 (YidongBravery)：触发监管异动后，资金次日敢于继续封板/强行突破的晋级率
     """
 
+    # ---------- 维度打分公共函数（盘前/盘后/盘中统一口径，避免公式四处重复漂移） ----------
+
+    @staticmethod
+    def _score_height(height: int) -> float:
+        """高度得分：1板=15,2板=30,...,7板=95, 8板+=100（低板敏感高板平缓）"""
+        _hm = {0: 0, 1: 15, 2: 30, 3: 50, 4: 65, 5: 78, 6: 88, 7: 95}
+        h = int(height)
+        return float(_hm.get(h, 100) if h <= 7 else 100)
+
+    @staticmethod
+    def _score_premium(premium: float) -> float:
+        """溢价得分：0%=50分(中性锚点), -3%=0分, +4%=100分"""
+        p = float(premium)
+        return max(min((p + 3) * (100 / 7), 100), 0) if p < 0 else max(min(50 + p * (50 / 4), 100), 50)
+
+    @staticmethod
+    def _score_breadth(breadth: int) -> float:
+        """宽度得分：中性(涨停=跌停)≈40，涨停越多越高"""
+        return max(min((float(breadth) + 40) * 1.0, 100), 0)
+
+    @staticmethod
+    def _score_support(zhaban_rate: float) -> float:
+        """承接得分：炸板率越高越低"""
+        return max(100 - float(zhaban_rate) * 2.5, 0)
+
     @staticmethod
     def calculate(
         zt_df: pd.DataFrame,
@@ -75,14 +100,11 @@ class EmotionVector:
 
         # 7. 综合情绪指数得分 (0 ~ 100分)
         # 权重设定：反馈 25%, 破规胆量 20%, 宽度 20%, 高度 15%, 承接 10%, 力度 10%
-        # height得分：分段线性，低板敏感高板平缓
-        # 1板=15, 2板=30, 3板=50, 4板=65, 5板=78, 6板=88, 7板=95, 8板+=100
-        _height_map = {0: 0, 1: 15, 2: 30, 3: 50, 4: 65, 5: 78, 6: 88, 7: 95}
-        score_height = _height_map.get(height, 100) if height <= 7 else 100
-        score_breadth = max(min((breadth + 40) * 1.0, 100), 0)
-        # yield得分：以0%为中性锚点(50分), -3%=0分, +4%=100分
-        score_yield = max(min((yield_rate + 3) * (100 / 7), 100), 0) if yield_rate < 0 else max(min(50 + yield_rate * (50 / 4), 100), 50)
-        score_support = max(100 - zhaban_rate * 2.5, 0)
+        # 各维度打分统一走 EmotionVector._score_*（与盘中公式共用，避免口径漂移）
+        score_height = EmotionVector._score_height(height)
+        score_breadth = EmotionVector._score_breadth(breadth)
+        score_yield = EmotionVector._score_premium(yield_rate)
+        score_support = EmotionVector._score_support(zhaban_rate)
         score_force = min(seal_force_ratio * 500, 100)
         score_bravery = min(max(yidong_bravery, 0), 100)
 
@@ -116,13 +138,11 @@ class EmotionVector:
         盘中快速情绪分计算（与 _classify_intraday_style 和 _log_startup_report 共用）。
         """
         from config.settings import settings
-        # yield得分：0%=50分(中性锚点)
-        score_premium = max(min((premium + 3) * (100 / 7), 100), 0) if premium < 0 else max(min(50 + premium * (50 / 4), 100), 50)
-        # height得分：分段线性
-        _hm = {0: 0, 1: 15, 2: 30, 3: 50, 4: 65, 5: 78, 6: 88, 7: 95}
-        score_height = _hm.get(height, 100) if height <= 7 else 100
-        score_breadth = max(min(((zt_count - dt_count) + 40) * 1.0, 100), 0)
-        score_support = max(100 - zhaban_rate * 2.5, 0)
+        # 维度打分统一走 EmotionVector._score_*（与盘后 calculate 共用，避免口径漂移）
+        score_premium = EmotionVector._score_premium(premium)
+        score_height = EmotionVector._score_height(height)
+        score_breadth = EmotionVector._score_breadth(zt_count - dt_count)
+        score_support = EmotionVector._score_support(zhaban_rate)
         return round(
             score_premium * settings.PREMIUM_WEIGHT +
             score_breadth * settings.BREADTH_WEIGHT +

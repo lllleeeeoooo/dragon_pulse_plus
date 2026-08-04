@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     PRICE_BURST_THRESHOLD: float = Field(default=3.0, description="点火异动股价涨幅下限 (%)，低于此值不触发")
     PRICE_BURST_MAX: float = Field(default=9.5, description="点火异动股价涨幅上限 (%) - 主板 10cm，已涨停的不算点火")
     PRICE_BURST_MAX_20CM: float = Field(default=19.5, description="点火异动股价涨幅上限 (%) - 双创 20cm，已涨停的不算点火")
+    MAIN_BOARD_LIMIT_PCT: float = Field(default=9.8, description="主板涨停线涨幅(%)，达到此值视为涨停")
+    GEM_STAR_LIMIT_PCT: float = Field(default=19.8, description="创业板/科创板涨停线涨幅(%)")
     FETCH_RETRY_COUNT: int = Field(default=3, description="数据抓取重试次数")
     FETCH_RETRY_DELAY: float = Field(default=2.0, description="数据抓取重试延迟(秒)")
 
@@ -82,6 +84,7 @@ class Settings(BaseSettings):
 
     # ==================== API Server 安全配置 ====================
     API_KEY: str = Field(default="", description="API Server 鉴权密钥，为空则跳过鉴权")
+    API_HOST: str = Field(default="127.0.0.1", description="API 服务监听地址，默认本机回环（如需局域网访问改为 0.0.0.0）")
     BACKTEST_INITIAL_CAPITAL: float = Field(default=1000000.0, description="回测/净值计算初始资金(元)")
     INVESTIGATION_CACHE_SECONDS: int = Field(default=3600, description="立案调查黑名单缓存刷新间隔(秒)")
 

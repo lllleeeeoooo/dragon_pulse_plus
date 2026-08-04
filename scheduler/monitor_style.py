@@ -6,6 +6,7 @@ import pandas as pd
 
 from config.settings import settings
 from data.fetcher import DataFetcher
+from core.emotion_index import EmotionVector
 from core.strategies import StrategyAnalyzer, MarketStyle
 from core.holding_monitor import HoldingMonitor
 from core.trade_calendar import is_trading_day
@@ -55,11 +56,11 @@ class _MonitorStyleMixin:
 
     @staticmethod
     def _is_limit_down(code: str, change_pct: float) -> bool:
-        """判断是否跌停（按板块区分跌停线）"""
+        """判断是否跌停（按板块区分跌停线，阈值取自 settings）"""
         code_str = str(code)
         if code_str.startswith(("30", "688")):
-            return change_pct <= -19.8   # 双创 20cm 跌停
-        return change_pct <= -9.8        # 主板 10cm 跌停
+            return change_pct <= -settings.GEM_STAR_LIMIT_PCT   # 双创 20cm 跌停
+        return change_pct <= -settings.MAIN_BOARD_LIMIT_PCT     # 主板 10cm 跌停
 
 
     @staticmethod
@@ -67,8 +68,8 @@ class _MonitorStyleMixin:
         """判断是否涨停"""
         code_str = str(code)
         if code_str.startswith(("30", "688")):
-            return change_pct >= 19.8
-        return change_pct >= 9.8
+            return change_pct >= settings.GEM_STAR_LIMIT_PCT
+        return change_pct >= settings.MAIN_BOARD_LIMIT_PCT
 
 
     def _classify_intraday_style(self, spot_df: pd.DataFrame,
@@ -127,13 +128,11 @@ class _MonitorStyleMixin:
             "_premium_source": self._premium_cache.get("source", ""),
         }
 
-        # 情绪分公式 (动态权重, 0%溢价=50分中性锚点)
-        _p2 = premium
-        score_premium = max(min((_p2 + 3) * (100 / 7), 100), 0) if _p2 < 0 else max(min(50 + _p2 * (50 / 4), 100), 50)
-        _hm2 = {0: 0, 1: 15, 2: 30, 3: 50, 4: 65, 5: 78, 6: 88, 7: 95}
-        score_height = _hm2.get(market_max_lbc, 100) if market_max_lbc <= 7 else 100
-        score_breadth = max(min(((zt_count - dt_count) + 40) * 1.0, 100), 0)  # 涨停多→高分
-        score_support = max(100 - market_zhaban_rate * 2.5, 0)
+        # 情绪分公式 (动态权重, 0%溢价=50分中性锚点) —— 维度打分统一走 EmotionVector._score_*
+        score_premium = EmotionVector._score_premium(premium)
+        score_height = EmotionVector._score_height(market_max_lbc)
+        score_breadth = EmotionVector._score_breadth(zt_count - dt_count)
+        score_support = EmotionVector._score_support(market_zhaban_rate)
         emotion["sentiment_index"] = round(
             score_premium * settings.PREMIUM_WEIGHT +
             score_breadth * settings.BREADTH_WEIGHT +

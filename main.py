@@ -159,7 +159,7 @@ def main():
     # 2. 在后台异步启动持仓管理 FastAPI API Web 服务 (端口 8000)
     import threading
     from api_server import run_server
-    api_thread = threading.Thread(target=run_server, kwargs={"host": "0.0.0.0", "port": 8000}, daemon=True)
+    api_thread = threading.Thread(target=run_server, kwargs={"host": settings.API_HOST, "port": 8000}, daemon=True)
     api_thread.start()
     logger.info("持仓管理 HTTP API 服务已在后台启动 (端口 8000)。")
 

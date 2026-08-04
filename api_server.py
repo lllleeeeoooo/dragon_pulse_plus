@@ -490,9 +490,9 @@ def data_emotion(date: str = Query(..., description="日期 YYYYMMDD")):
     return {"code": 200, "data": result}
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000):
-    """启动持仓管理 HTTP API 服务"""
-    uvicorn.run(app, host=host, port=port, log_level="info")
+def run_server(host: str = None, port: int = 8000):
+    """启动持仓管理 HTTP API 服务（默认绑定 settings.API_HOST，安全起见为 127.0.0.1）"""
+    uvicorn.run(app, host=host or settings.API_HOST, port=port, log_level="info")
 
 
 if __name__ == "__main__":
