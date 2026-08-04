@@ -592,10 +592,16 @@ class _MonitorCoreMixin:
                 verdict_blocked = is_recommended and auction_verdict == "放弃"
                 # 当前已封板则买不进（封板判定覆盖一字板，含盘中打开后重新封死的）
                 is_sealed = type(self)._is_limit_up(code, change_pct)
-                # 市场风格否决权（④ 风格/周期协同）：观望 = 无明确攻防信号，
-                # 无论情绪周期说什么都不自动买入（抱团是防御买入型，不在此列）
+                # 市场风格否决权（④）：观望不自动买入（抱团是防御买入型，不在此列）
                 style_blocks_buy = market_style.get("style") == "观望"
-                should_buy = (not style_blocks_buy) and (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
+                # 板块因子（切片2）：该股所在板块阶段——退潮/冰点板块否决；高潮非主线否决（只做主线高潮龙头）
+                sector_industry = self._get_stock_industry(code)
+                sector_phase = self._get_sector_phase(sector_industry)
+                sector_mainline = self._get_sector_is_mainline(sector_industry)
+                sector_blocks_buy = sector_phase in ("退潮", "冰点") or (
+                    sector_phase == "高潮" and not sector_mainline
+                )
+                should_buy = (not sector_blocks_buy) and (not style_blocks_buy) and (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
                     (is_recommended and rec_condition_met) or is_high_signal
                 ) and not is_sealed
                 buy_reason = ""
@@ -630,9 +636,10 @@ class _MonitorCoreMixin:
                         # 复盘推荐被买入 → 推荐状态流转 TRIGGERED，形成胜率闭环
                         if is_recommended and rec_info:
                             RecommendationManager.mark_triggered(rec_info["id"])
+                        sector_tag = f" 板块[{sector_industry} {sector_phase}{'·主线' if sector_mainline else ''}]" if sector_phase else ""
                         bark_notifier.send(
                             title=f"🤖 [AI 自动买入] {name}({code})",
-                            body=f"{buy_reason}标的 {name}({code}) 触发买入信号 (现价:{price}元, 成交成本:{cost_price}元含滑点{slippage:.2f}%, +{change_pct}%, 量比{vol_ratio}倍, 成交{amt_billion:.1f}亿)，已自动纳入 AI 持仓追踪！",
+                            body=f"{buy_reason}标的 {name}({code}) 触发买入信号 (现价:{price}元, 成交成本:{cost_price}元含滑点{slippage:.2f}%, +{change_pct}%, 量比{vol_ratio}倍, 成交{amt_billion:.1f}亿{sector_tag})，已自动纳入 AI 持仓追踪！",
                             group="AI自动持仓",
                             level="timeSensitive"
                         )
@@ -794,6 +801,34 @@ class _MonitorCoreMixin:
             return False  # 查不到行业则不限制
         same = sum(1 for h in ai_holdings if h["code"] != code and self._get_stock_industry(h["code"]) == industry)
         return same >= settings.MAX_AI_SECTOR_POSITIONS
+
+    def _ensure_sector_cycle_cache(self):
+        """当日加载一次最新板块周期（sector_cycle → 板块阶段/主线 缓存）"""
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        if getattr(self, '_sector_cycle_date', '') == today and hasattr(self, '_sector_cycle_info'):
+            return
+        self._sector_cycle_info = {}
+        self._sector_cycle_date = today
+        try:
+            from database import SectorCycleManager
+            for r in SectorCycleManager.get_sector_cycle(top=500):
+                self._sector_cycle_info[r["sector"]] = {
+                    "phase": r["phase"], "is_mainline": r["is_mainline"],
+                }
+        except Exception as e:
+            logger.warning(f"加载板块阶段缓存失败: {e}")
+
+    def _get_sector_phase(self, industry: str) -> str:
+        """查询板块阶段（当日缓存），返回 冰点/启动/发酵/高潮/退潮 或 ""（未知）"""
+        self._ensure_sector_cycle_cache()
+        if not industry:
+            return ""
+        return self._sector_cycle_info.get(industry, {}).get("phase", "")
+
+    def _get_sector_is_mainline(self, industry: str) -> bool:
+        """查询板块是否主线（当日缓存）"""
+        self._ensure_sector_cycle_cache()
+        return self._sector_cycle_info.get(industry, {}).get("is_mainline", False)
 
     def _monitor_holdings(self, spot_df, active_holdings, market_max_lbc, market_zhaban_rate):
         """第7步：持仓卖出/止损信号监控 + 批量更新收益率（从 _check_realtime_market 拆出）"""

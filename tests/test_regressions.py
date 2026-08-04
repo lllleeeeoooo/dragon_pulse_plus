@@ -212,6 +212,21 @@ class TestPureRegressions(unittest.TestCase):
         self.assertGreater(M.mainline_score(6, 4, 2, 4), 0.5)
         self.assertLess(M.mainline_score(1, 1, 0, 1), 0.5)
 
+    def test_get_sector_phase_cache(self):
+        """板块阶段缓存：当日加载，退潮板块可识别；未知板块返回空"""
+        from scheduler.monitor_core import _MonitorCoreMixin
+        obj = object.__new__(_MonitorCoreMixin)
+        obj._sector_cycle_date = ""
+        with patch("database.SectorCycleManager.get_sector_cycle", return_value=[
+            {"sector": "电网设备", "phase": "发酵", "is_mainline": True},
+            {"sector": "电池", "phase": "退潮", "is_mainline": False},
+        ]):
+            self.assertEqual(obj._get_sector_phase("电网设备"), "发酵")
+            self.assertTrue(obj._get_sector_is_mainline("电网设备"))
+            self.assertEqual(obj._get_sector_phase("电池"), "退潮")
+            self.assertFalse(obj._get_sector_is_mainline("电池"))
+            self.assertEqual(obj._get_sector_phase("未知板块"), "")
+
     def test_market_style_classify(self):
         """市场风格分类：抱团/共振/打板 三档命中"""
         from core.strategies import MarketStyle
