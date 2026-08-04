@@ -139,7 +139,7 @@ class MarketStyle:
             else:
                 return {
                     "style": "观望",
-                    "reason": f"高标{height}板但情绪仅{sentiment_index}分，警惕高标补跌",
+                    "reason": f"高标{height}板但情绪仅{sentiment_index}分（<45），打板缺情绪支撑，观望防高标补跌——情绪回升至45分以上方可打板",
                     "priority_strategy": "观望/跟随",
                     "capacity_factor": round(k, 2),
                 }
@@ -178,7 +178,7 @@ class MarketStyle:
             else:
                 return {
                     "style": "观望",
-                    "reason": f"高标{height}板但涨停{zt_count}家偏多+情绪{sentiment_index}分，警惕退潮前兆",
+                    "reason": f"高标{height}板但涨停{zt_count}家偏多、情绪仅{sentiment_index}分，涨停与情绪背离，警惕退潮前兆——情绪企稳前不接力",
                     "priority_strategy": "观望/跟随",
                     "capacity_factor": round(k, 2),
                 }
@@ -188,7 +188,7 @@ class MarketStyle:
         # ═══════════════════════════════════════════
         return {
             "style": "观望",
-            "reason": f"涨停{zt_count}/跌停{dt_count}/情绪{sentiment_index}/K={k:.2f}，无明确攻防信号",
+            "reason": f"涨停{zt_count}/跌停{dt_count}/情绪{sentiment_index}/K={k:.2f}均无明确攻防信号——等方向：涨停回升或跌停扩散后再定攻守",
             "priority_strategy": "观望/跟随",
             "capacity_factor": round(k, 2),
         }
