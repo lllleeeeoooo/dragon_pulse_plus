@@ -18,10 +18,12 @@ from llm.call_auction import CallAuctionAnalyzer
 
 def _classify_auction_verdicts(result_text: str, targets: list) -> dict:
     """
-    从 LLM 竞价结论中为每个推荐标的归类：买入 / 观察 / 放弃。
-    按代码/名称定位相关行，关键词近似判断（LLM 输出非严格结构化，不追求完美解析）。
-    写入 recommendations.auction_verdict，供盘中自动买入门控。
+    从 LLM 竞价结论中为每个推荐标的归类，返回 {code: {"verdict": 买入/观察/放弃, "premise": 满足/不满足/""}}。
+    优先解析结构化字段「判断=买入/观察/放弃」「前提=满足/不满足」（Prompt 已强制逐票下判），
+    解析不到时回退到关键词近似匹配。
+    供盘中"判断=买入 且 前提=满足"才执行竞价买入指令。
     """
+    import re
     verdicts = {}
     if not result_text:
         return verdicts
@@ -32,14 +34,43 @@ def _classify_auction_verdicts(result_text: str, targets: list) -> dict:
             continue
         lines = [ln for ln in result_text.splitlines() if code in ln or name in ln]
         text = "\n".join(lines)
-        if not text:
-            verdicts[code] = "观察"
-        elif any(k in text for k in ("放弃", "不介入", "回避", "不追", "不买", "不参与", "不建议")):
-            verdicts[code] = "放弃"
-        elif any(k in text for k in ("直接挂单买入", "挂单买入", "竞价买入", "直接买入", "抢筹", "买进", "建议买入")):
-            verdicts[code] = "买入"
-        else:
-            verdicts[code] = "观察"
+        verdict = "观察"
+        premise = ""
+        if text:
+            # 结构化判定优先：判断=买入/观察/放弃（支持 = : ： 变体）
+            m = re.search(r"判断\s*[=:：]\s*(买入|观察|放弃)", text)
+            if m:
+                verdict = m.group(1)
+            elif any(k in text for k in ("放弃", "不介入", "回避", "不追", "不买", "不参与", "不建议")):
+                verdict = "放弃"
+            elif any(k in text for k in ("直接挂单买入", "挂单买入", "竞价买入", "直接买入", "抢筹", "买进", "建议买入")):
+                verdict = "买入"
+            p = re.search(r"前提\s*[=:：]\s*(满足|不满足)", text)
+            if p:
+                premise = p.group(1)
+        verdicts[code] = {"verdict": verdict, "premise": premise}
+    return verdicts
+
+
+def _extract_verdicts_json(result_text: str) -> dict:
+    """
+    从 LLM 竞价结论解析结构化 JSON（Prompt 已要求输出）:
+    {"verdicts": [{"code": "001208", "verdict": "买入", "premise": "满足", "reason": "..."}]}
+    → {code: {"verdict", "premise", "reason"}}。解析失败返回 {}。
+    """
+    data = _helpers.extract_json_block(result_text)
+    if not data:
+        return {}
+    verdicts = {}
+    for item in data.get("verdicts") or []:
+        code = str(item.get("code", "")).strip()
+        if not code or len(code) != 6 or not code.isdigit():
+            continue
+        verdicts[code] = {
+            "verdict": item.get("verdict", "观察"),
+            "premise": item.get("premise", ""),
+            "reason": item.get("reason", ""),
+        }
     return verdicts
 
 
@@ -111,15 +142,18 @@ def job_call_auction():
             auction_prediction=auction_prediction
         )
 
-        # 竞价结论落库：按关键词归类每个推荐标的 买入/观察/放弃，供盘中自动买入门控
+        # 竞价结论落库：优先解析 LLM 结构化 JSON（verdicts 列表），解析不到再回退关键词分类
         if result and pending_recs:
             try:
-                verdicts = _classify_auction_verdicts(result, pending_recs)
+                verdicts = _extract_verdicts_json(result)
+                if not verdicts:
+                    verdicts = _classify_auction_verdicts(result, pending_recs)
                 RecommendationManager.update_auction_verdicts(verdicts)
                 logger.info(f"竞价结论落库: {verdicts}")
             except Exception as e:
                 logger.warning(f"竞价结论落库失败: {e}")
 
+        # 推送（bark 层统一去掉结构化 JSON 块，用户只看可读 Markdown 结论）
         bark_notifier.send(
             title="🎯 09:26 竞价超预期指令",
             body=result,

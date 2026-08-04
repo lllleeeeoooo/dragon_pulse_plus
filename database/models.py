@@ -52,6 +52,7 @@ class Recommendation(Base):
     status = Column(String(16), default="PENDING", comment="状态: PENDING(待观察), TRIGGERED(已买入), EXPIRED(已失效)")
     eval_note = Column(Text, comment="复盘评估备注（LLM 对次日表现的一言点评与评分）")
     auction_verdict = Column(String(8), comment="竞价 LLM 结论: 买入/观察/放弃（09:26 写入，盘中按此门控自动买入）")
+    auction_premise = Column(String(8), comment="竞价 LLM 对开盘前提是否满足的声明: 满足/不满足（判断=买入 且 前提=满足 才执行）")
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
@@ -473,6 +474,7 @@ class DatabaseManager:
         _ensure_column(self.engine, "daily_sentiment", "total_amount", "FLOAT DEFAULT 0.0")
         _ensure_column(self.engine, "recommendations", "eval_note", "TEXT")
         _ensure_column(self.engine, "recommendations", "auction_verdict", "VARCHAR(8)")
+        _ensure_column(self.engine, "recommendations", "auction_premise", "VARCHAR(8)")
 
     def get_session(self) -> Session:
         """获取数据库 Session"""

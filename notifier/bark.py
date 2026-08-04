@@ -12,15 +12,9 @@ BARK_MAX_CHARS = 1000  # 中文每字3字节，1000字≈3000字节，留安全�
 
 
 def _strip_json_block(text: str) -> str:
-    """去掉 JSON 代码块（```json ... ```），保留标题和总结"""
-    text = text.replace("\r\n", "\n")
-    start = text.rfind("\n```json")
-    if start < 0:
-        return text
-    end = text.find("\n```", start + 3)
-    if end < 0:
-        return text
-    return text[:start] + text[end + 4:]
+    """去掉所有 JSON 代码块（```json ... ```），只留用户可读的 Markdown。
+    所有 Bark 推送统一在此去结构化 JSON，调用方无需重复剥。"""
+    return re.sub(r"```json\s*.*?\s*```", "", text, flags=re.DOTALL).strip()
 
 
 def _split_body(body: str, max_chars: int = BARK_MAX_CHARS) -> List[str]:

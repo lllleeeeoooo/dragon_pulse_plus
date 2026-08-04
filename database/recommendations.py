@@ -63,6 +63,7 @@ class RecommendationManager:
                     "buy_condition": r.buy_condition,
                     "sell_condition": r.sell_condition,
                     "auction_verdict": r.auction_verdict,
+                    "auction_premise": r.auction_premise,
                 }
                 for r in recs
             ]
@@ -71,18 +72,20 @@ class RecommendationManager:
 
     @staticmethod
     def update_auction_verdicts(verdicts: dict):
-        """将竞价 LLM 结论写入对应 PENDING 推荐标的的 auction_verdict 字段（09:26 调用）"""
+        """将竞价 LLM 结论写入对应 PENDING 推荐标的的 auction_verdict / auction_premise 字段（09:26 调用）"""
         if not verdicts:
             return
         session = db_manager.get_session()
         try:
-            for code, verdict in verdicts.items():
+            for code, info in verdicts.items():
                 rec = session.query(Recommendation).filter(
                     Recommendation.code == code,
                     Recommendation.status == "PENDING",
                 ).first()
                 if rec:
-                    rec.auction_verdict = verdict
+                    rec.auction_verdict = info.get("verdict", "观察")
+                    if info.get("premise"):
+                        rec.auction_premise = info["premise"]
             session.commit()
             logger.info(f"竞价结论落库 {len(verdicts)} 条")
         except Exception as e:
@@ -112,6 +115,7 @@ class RecommendationManager:
                     "sell_condition": r.sell_condition,
                     "status": r.status,
                     "auction_verdict": r.auction_verdict,
+                    "auction_premise": r.auction_premise,
                 }
                 for r in recs
             ]

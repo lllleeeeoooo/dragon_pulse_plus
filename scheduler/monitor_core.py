@@ -516,6 +516,11 @@ class _MonitorCoreMixin:
         else:
             hit_df = hit_df.sort_values(by=["volume_ratio", "change_pct"], ascending=[False, False])
 
+        # ---- 竞价"买入"指令执行权（切片：LLM 逐票判定=买入的推荐标的，无信号也进候选） ----
+        # 09:26 竞价 LLM 明确判定"买入"的推荐标的 = 最高优先级执行指令，不再依赖命中技术信号；
+        # 仍需过 open_requirement / 各闸门 / 封板 / 持仓限制。其余判定(观察/放弃/无verdict)维持原状。
+        hit_df = self._merge_auction_buy_candidates(spot_df, hit_df, pending_recs)
+
         if not hit_df.empty:
             burst_codes_for_fund = []
             # 全市场总成交额（未过滤，对齐券商软件口径）+ 均涨幅，循环外计算一次
@@ -555,13 +560,13 @@ class _MonitorCoreMixin:
                 rec_condition_met = True
                 if is_recommended:
                     rec_info = next((r for r in pending_recs if r["code"] == code), None)
-                    if rec_info and rec_info.get("open_requirement"):
-                        open_req = rec_info["open_requirement"]
-                        open_change = round((float(row.get("open", price)) - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0
-                        rec_condition_met = self._check_open_requirement(open_change, open_req)
-                        # 当下走势校验：高开标的相对开盘回落超过 REC_FADE_MAX（走弱）不自动买入
-                        if rec_condition_met and open_change > 0 and (open_change - change_pct) > settings.REC_FADE_MAX:
-                            rec_condition_met = False
+                    if rec_info:
+                        rec_condition_met = self._check_rec_buy_condition(
+                            rec_info,
+                            open_price=float(row.get("open", price)),
+                            pre_close=pre_close,
+                            change_pct=float(change_pct),
+                        )
 
                 # 高质量信号 = 逼近封板 / 低开猛拉 / 点火异动(高质量)
                 # 高质量信号判定跟随市场风格
@@ -834,6 +839,58 @@ class _MonitorCoreMixin:
         """查询板块是否主线（当日缓存）"""
         self._ensure_sector_cycle_cache()
         return self._sector_cycle_info.get(industry, {}).get("is_mainline", False)
+
+    def _check_rec_buy_condition(self, rec_info, open_price: float,
+                                 pre_close: float, change_pct: float) -> bool:
+        """
+        推荐标的是否满足买入条件：
+        - 竞价判定"买入"(前提=满足已自证) → 跳过脆弱的 open_requirement 正则，信任竞价 LLM 实时判断
+        - 观察/无verdict（未获竞价确认）→ 用 open_requirement 正则防御
+        - 无论哪种：相对开盘回落超过 REC_FADE_MAX（走弱）均不买（活的安全网）
+        """
+        open_change = round((float(open_price) - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0
+        auction_verdict = (rec_info or {}).get("auction_verdict", "")
+        if auction_verdict != "买入" and (rec_info or {}).get("open_requirement"):
+            if not self._check_open_requirement(open_change, rec_info["open_requirement"]):
+                return False
+        if open_change > 0 and (open_change - change_pct) > settings.REC_FADE_MAX:
+            return False
+        return True
+
+    def _merge_auction_buy_candidates(self, spot_df, hit_df, pending_recs) -> pd.DataFrame:
+        """
+        竞价"买入"指令执行权：仅 判断=买入 且 前提=满足 的推荐标的并入候选池（无信号也进），且置顶评估。
+        - 判断=买入 但 前提=不满足/未声明 → 不执行，记录矛盾（LLM 自相矛盾，供复盘）
+        - 无 买入 verdict → 原样返回 hit_df（不改变现有行为）
+        - 补全信号列默认值，避免下游 row["_signal_*"] KeyError
+        """
+        try:
+            _auction_buy_codes = set()
+            for r in (pending_recs or []):
+                if r.get("auction_verdict") == "买入":
+                    premise = r.get("auction_premise")
+                    if premise == "满足":
+                        _auction_buy_codes.add(str(r.get("code", "")))
+                    else:
+                        logger.warning(
+                            f"竞价矛盾: {r.get('name')}({r.get('code')}) "
+                            f"判断=买入但前提={premise or '未声明'}，不执行")
+        except Exception as _e:
+            logger.warning(f"解析竞价买入判定失败: {_e}")
+            return hit_df
+        if not _auction_buy_codes:
+            return hit_df
+        try:
+            _rec_buy_df = spot_df[spot_df["code"].astype(str).isin(_auction_buy_codes)].copy()
+            if _rec_buy_df.empty:
+                return hit_df
+            for _col in ("_signal_burst", "_signal_near_limit",
+                         "_signal_low_open_rally", "_signal_amplitude"):
+                _rec_buy_df[_col] = False
+            return pd.concat([_rec_buy_df, hit_df], ignore_index=True).drop_duplicates(subset=["code"])
+        except Exception as _e:
+            logger.warning(f"竞价买入指令候选合并失败: {_e}")
+            return hit_df
 
     def _ensure_concept_cycle_cache(self):
         """当日加载一次 概念周期(concept_cycle → 阶段/主线) + 概念成分股映射(concept_member → 个股概念)"""

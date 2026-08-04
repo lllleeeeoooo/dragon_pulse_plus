@@ -80,6 +80,51 @@ def _get_job_status() -> List[Dict[str, Any]]:
     return all_jobs
 
 
+def extract_json_block(text: str) -> dict:
+    """
+    从 LLM 输出中提取结构化 JSON：
+    1) 优先 ```json ... ``` 代码块；2) 无围栏时取最外层 {...} 对象。
+    解析失败返回 {}。用于"结构化结论落库 + 推送去 JSON"的通用模式。
+    """
+    import json
+    import re
+    if not text:
+        return {}
+    json_text = None
+    block = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+    if block:
+        json_text = block.group(1)
+        start = json_text.find("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(json_text)):
+                if json_text[i] == "{":
+                    depth += 1
+                elif json_text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        json_text = json_text[start:i + 1]
+                        break
+    else:
+        start = text.find("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        json_text = text[start:i + 1]
+                        break
+    if not json_text:
+        return {}
+    try:
+        return json.loads(json_text)
+    except Exception:
+        return {}
+
+
 def _parse_and_save_recommendations(trade_date: str, report_text: str):
     """
     从 LLM 复盘报告中提取推荐标的并落库到 recommendations 表。

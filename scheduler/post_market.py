@@ -158,7 +158,7 @@ def job_post_market():
         # ---- 自动填充历史龙头表 ----
         _auto_populate_dragons(today_str, zt_df)
 
-        # 发送 Bark 推送
+        # 发送 Bark 推送（bark 层统一去掉 LLM 结构化 JSON 块，只推用户可读报告）
         bark_notifier.send(
             title="🌙 盘后深度复盘与次日交易指南",
             body=review_report,

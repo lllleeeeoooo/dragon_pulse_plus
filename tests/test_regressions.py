@@ -114,9 +114,9 @@ class TestPureRegressions(unittest.TestCase):
                   "长缆科技(002879) 低开走弱，放弃介入\n"
                   "华电辽能(600396) 平开震荡，观察")
         v = _classify_auction_verdicts(result, targets)
-        self.assertEqual(v.get("001208"), "买入")
-        self.assertEqual(v.get("002879"), "放弃")
-        self.assertEqual(v.get("600396"), "观察")
+        self.assertEqual(v.get("001208")["verdict"], "买入")
+        self.assertEqual(v.get("002879")["verdict"], "放弃")
+        self.assertEqual(v.get("600396")["verdict"], "观察")
 
     def test_daily_loss_breaker_uses_today_change(self):
         """熔断用当日盈亏(相对昨收)而非持仓总浮亏（修复名不副实）"""
@@ -551,9 +551,10 @@ class TestDbRegressions(unittest.TestCase):
         from database import RecommendationManager, db_manager
         from database.models import Recommendation
         RecommendationManager.add_recommendations("20260803", [{"code": "600519", "name": "茅台", "strategy_type": "打板"}])
-        RecommendationManager.update_auction_verdicts({"600519": "买入"})
+        RecommendationManager.update_auction_verdicts({"600519": {"verdict": "买入", "premise": "满足"}})
         recs = RecommendationManager.get_pending_recommendations("20260803")
         self.assertEqual(recs[0]["auction_verdict"], "买入")
+        self.assertEqual(recs[0]["auction_premise"], "满足")
         # 标记 TRIGGERED 后，按日期查询仍能查到（胜率复盘不漏已买入）
         RecommendationManager.mark_triggered(recs[0]["id"])
         all_recs = RecommendationManager.get_recommendations_by_date("20260803")
