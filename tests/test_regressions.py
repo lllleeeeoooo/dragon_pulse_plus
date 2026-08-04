@@ -211,6 +211,20 @@ class TestDbRegressions(unittest.TestCase):
         self.assertIsNotNone(famous)
         self.assertIn("格局", famous["type"])
 
+    def test_seat_northbound_special_case(self):
+        """北向(外资)专用席位特判：买卖对半也应直接标"外资北向"，不误判为对倒派"""
+        from database import SeatProfileManager
+        for i in range(5):  # 连续 5 天买卖严格对半 → 行为分类本会判对倒，北向应特判
+            day = f"2026081{i + 1}"
+            SeatProfileManager.sync_from_lhb(pd.DataFrame([{
+                "seat_name": "沪股通专用", "trade_date": day,
+                "buy_stock_count": 5, "sell_stock_count": 5,
+                "buy_amount": 5e7, "sell_amount": 5e7, "net_amount": 0, "buy_stocks": "A,B,C,D,E",
+            }]), day)
+        prof = SeatProfileManager.get_seat_type("沪股通专用")
+        self.assertIsNotNone(prof)
+        self.assertIn("北向", prof["type"])
+
     def test_core_pool_beta_real(self):
         """core_pool Beta 实际生效：用个股收盘价与市场指数计算相关性并过滤"""
         from core.core_pool import ActiveCorePool

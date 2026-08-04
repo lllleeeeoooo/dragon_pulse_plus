@@ -5,7 +5,8 @@
 
 - seed_famous_seats():   将内置 FAMOUS_SEATS（六一中路等）作为人工种子灌入（幂等）
 - sync_from_lhb():       每日从东财活跃营业部数据 upsert 各席位累计买卖统计，
-                         并按行为重新自动分类（净买/净卖/对倒/单笔大小）
+                         并按行为重新自动分类（净买/净卖/对倒/单笔大小）；
+                         沪股通/深股通/陆股通 特判为"外资北向"，不走行为分类
 - get_seat_type():       按营业部名查询分类（DB 精确 → 人工种子子串 → 内置字典兜底）
 """
 import datetime
@@ -119,9 +120,12 @@ class SeatProfileManager:
                 profile.last_seen = trade_date
                 profile.is_active = True
 
-                # 自动分类：非人工标签且样本足够才定型
+                # 自动分类：非人工标签才自动定型（北向外资席位特判，不走行为分类）
                 if not profile.is_manual:
-                    profile.seat_type = SeatProfileManager._classify(profile)
+                    if SeatProfileManager._is_northbound(seat_name):
+                        profile.seat_type = "外资北向"
+                    else:
+                        profile.seat_type = SeatProfileManager._classify(profile)
                 updated += 1
 
             # 近 30 天未出现的席位标记为不活跃
@@ -169,6 +173,11 @@ class SeatProfileManager:
         if net_ratio >= settings.SEAT_NET_POSITIVE_ZHIGE:
             return "格局派"
         return "未知"
+
+    @staticmethod
+    def _is_northbound(seat_name: str) -> bool:
+        """判断是否为北向(外资)专用席位。北向买卖几乎对半，行为分类易误判为对倒，故特判。"""
+        return any(k in seat_name for k in ("沪股通", "深股通", "陆股通"))
 
     @staticmethod
     def get_seat_type(full_seat_name: str) -> Optional[Dict[str, Any]]:
