@@ -174,7 +174,8 @@ def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame =
     yesterday = get_previous_trading_day(
         datetime.datetime.strptime(trade_date, "%Y%m%d").date()
     )
-    pending = RecommendationManager.get_pending_recommendations(trade_date=yesterday)
+    # 含已买入(TRIGGERED)/已过期(EXPIRED)——胜率复盘必须把实际买入的也算进去
+    pending = RecommendationManager.get_recommendations_by_date(yesterday)
     if not pending or spot_df is None or spot_df.empty:
         return
 

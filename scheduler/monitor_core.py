@@ -575,7 +575,12 @@ class _MonitorCoreMixin:
                 cycle_only_rec = self._cycle_stance.get("only_recommended", False)
                 if cycle_only_rec and not is_recommended:
                     cycle_allow = False
-                should_buy = cycle_allow and not index_breaker_triggered and (
+                # 竞价 LLM 结论门控：09:26 判定"放弃"的推荐标的不自动买入（仍推送异动提醒）
+                auction_verdict = ""
+                if is_recommended and rec_info:
+                    auction_verdict = rec_info.get("auction_verdict", "") or ""
+                verdict_blocked = is_recommended and auction_verdict == "放弃"
+                should_buy = (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
                     (is_recommended and rec_condition_met) or is_high_signal
                 ) and not is_one_word_board
                 buy_reason = ""

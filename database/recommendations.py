@@ -61,7 +61,57 @@ class RecommendationManager:
                     "open_requirement": r.open_requirement,
                     "auction_vol_ratio": r.auction_vol_ratio,
                     "buy_condition": r.buy_condition,
-                    "sell_condition": r.sell_condition
+                    "sell_condition": r.sell_condition,
+                    "auction_verdict": r.auction_verdict,
+                }
+                for r in recs
+            ]
+        finally:
+            session.close()
+
+    @staticmethod
+    def update_auction_verdicts(verdicts: dict):
+        """将竞价 LLM 结论写入对应 PENDING 推荐标的的 auction_verdict 字段（09:26 调用）"""
+        if not verdicts:
+            return
+        session = db_manager.get_session()
+        try:
+            for code, verdict in verdicts.items():
+                rec = session.query(Recommendation).filter(
+                    Recommendation.code == code,
+                    Recommendation.status == "PENDING",
+                ).first()
+                if rec:
+                    rec.auction_verdict = verdict
+            session.commit()
+            logger.info(f"竞价结论落库 {len(verdicts)} 条")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"竞价结论落库失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_recommendations_by_date(trade_date: str) -> List[Dict[str, Any]]:
+        """按日期查询推荐标的（含 PENDING/TRIGGERED/EXPIRED），用于胜率复盘（不漏掉已买入的）"""
+        session = db_manager.get_session()
+        try:
+            recs = session.query(Recommendation).filter(
+                Recommendation.trade_date == trade_date
+            ).all()
+            return [
+                {
+                    "id": r.id,
+                    "trade_date": r.trade_date,
+                    "code": r.code,
+                    "name": r.name,
+                    "strategy_type": r.strategy_type,
+                    "open_requirement": r.open_requirement,
+                    "auction_vol_ratio": r.auction_vol_ratio,
+                    "buy_condition": r.buy_condition,
+                    "sell_condition": r.sell_condition,
+                    "status": r.status,
+                    "auction_verdict": r.auction_verdict,
                 }
                 for r in recs
             ]

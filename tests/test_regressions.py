@@ -102,6 +102,22 @@ class TestPureRegressions(unittest.TestCase):
             self.assertIn("600519", codes)
 
 
+    def test_classify_auction_verdicts(self):
+        """竞价结论关键词归类：买入/观察/放弃"""
+        from scheduler.auction import _classify_auction_verdicts
+        targets = [
+            {"code": "001208", "name": "华菱线缆"},
+            {"code": "002879", "name": "长缆科技"},
+            {"code": "600396", "name": "华电辽能"},
+        ]
+        result = ("华菱线缆(001208) 竞价抢筹，建议直接挂单买入\n"
+                  "长缆科技(002879) 低开走弱，放弃介入\n"
+                  "华电辽能(600396) 平开震荡，观察")
+        v = _classify_auction_verdicts(result, targets)
+        self.assertEqual(v.get("001208"), "买入")
+        self.assertEqual(v.get("002879"), "放弃")
+        self.assertEqual(v.get("600396"), "观察")
+
     def test_market_style_classify(self):
         """市场风格分类：抱团/共振/打板 三档命中"""
         from core.strategies import MarketStyle
@@ -281,6 +297,21 @@ class TestDbRegressions(unittest.TestCase):
         HoldingManager.batch_update_profit_rates([("600519", 110.0, "AI_AUTO")])
         h = HoldingManager.get_active_holdings(holding_type="AI_AUTO")[0]
         self.assertAlmostEqual(h["profit_rate"], 10.0, places=2)
+
+    def test_auction_verdict_roundtrip(self):
+        """竞价结论落库 + 按日期查全状态(含 TRIGGERED，胜率复盘用)"""
+        from database import RecommendationManager, db_manager
+        from database.models import Recommendation
+        RecommendationManager.add_recommendations("20260803", [{"code": "600519", "name": "茅台", "strategy_type": "打板"}])
+        RecommendationManager.update_auction_verdicts({"600519": "买入"})
+        recs = RecommendationManager.get_pending_recommendations("20260803")
+        self.assertEqual(recs[0]["auction_verdict"], "买入")
+        # 标记 TRIGGERED 后，按日期查询仍能查到（胜率复盘不漏已买入）
+        RecommendationManager.mark_triggered(recs[0]["id"])
+        all_recs = RecommendationManager.get_recommendations_by_date("20260803")
+        self.assertEqual(len(all_recs), 1)
+        self.assertEqual(all_recs[0]["status"], "TRIGGERED")
+        self.assertEqual(all_recs[0]["auction_verdict"], "买入")
 
     def test_seat_profile_sync_and_classify(self):
         """龙虎榜席位画像：名席位种子 + 行为自动分类 + DB 查询"""

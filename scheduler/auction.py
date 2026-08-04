@@ -14,6 +14,35 @@ logger = logging.getLogger(__name__)
 import scheduler.helpers as _helpers
 from database import RecommendationManager
 from llm.call_auction import CallAuctionAnalyzer
+
+
+def _classify_auction_verdicts(result_text: str, targets: list) -> dict:
+    """
+    从 LLM 竞价结论中为每个推荐标的归类：买入 / 观察 / 放弃。
+    按代码/名称定位相关行，关键词近似判断（LLM 输出非严格结构化，不追求完美解析）。
+    写入 recommendations.auction_verdict，供盘中自动买入门控。
+    """
+    verdicts = {}
+    if not result_text:
+        return verdicts
+    for t in targets or []:
+        code = str(t.get("code", "")).strip()
+        name = str(t.get("name", code))
+        if not code:
+            continue
+        lines = [ln for ln in result_text.splitlines() if code in ln or name in ln]
+        text = "\n".join(lines)
+        if not text:
+            verdicts[code] = "观察"
+        elif any(k in text for k in ("放弃", "不介入", "回避", "不追", "不买", "不参与", "不建议")):
+            verdicts[code] = "放弃"
+        elif any(k in text for k in ("直接挂单买入", "挂单买入", "竞价买入", "直接买入", "抢筹", "买进", "建议买入")):
+            verdicts[code] = "买入"
+        else:
+            verdicts[code] = "观察"
+    return verdicts
+
+
 def job_call_auction():
     """
     09:26 竞价观察与指令定时任务。非交易日自动跳过。
@@ -81,6 +110,15 @@ def job_call_auction():
             predicted_sectors_summary=predicted_summary,
             auction_prediction=auction_prediction
         )
+
+        # 竞价结论落库：按关键词归类每个推荐标的 买入/观察/放弃，供盘中自动买入门控
+        if result and pending_recs:
+            try:
+                verdicts = _classify_auction_verdicts(result, pending_recs)
+                RecommendationManager.update_auction_verdicts(verdicts)
+                logger.info(f"竞价结论落库: {verdicts}")
+            except Exception as e:
+                logger.warning(f"竞价结论落库失败: {e}")
 
         bark_notifier.send(
             title="🎯 09:26 竞价超预期指令",

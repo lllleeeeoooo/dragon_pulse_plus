@@ -83,8 +83,12 @@ class CallAuctionAnalyzer:
             if match is not None and not match.empty:
                 r = match.iloc[0]
                 amt_wan = round(float(r.get("amount", 0)) / 1e4, 2)
+                vol_req = rec.get("auction_vol_ratio", "") or ""
+                buy_c = rec.get("buy_condition", "") or ""
+                extra = f" 量能要求[{vol_req}]" if vol_req else ""
+                extra += f" 买点[{buy_c[:80]}]" if buy_c else ""
                 rec_auction_lines.append(
-                    f"- {name}({code}) 要求[{req}] → 实际竞价涨幅 {r.get('change_pct')}%, "
+                    f"- {name}({code}) 要求[{req}]{extra} → 实际竞价涨幅 {r.get('change_pct')}%, "
                     f"竞价金额 {amt_wan}万, 量比 {r.get('volume_ratio', '?')}"
                 )
             else:
