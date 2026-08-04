@@ -32,7 +32,13 @@ def job_pre_market():
             logger.warning(f"立案调查黑名单已更新，当前 {len(blacklist)} 只风险股票")
 
         report = PreMarketAnalyzer.run_report()
-        _helpers._cached_pre_market_report = report  # 缓存供 09:26 竞价使用
+        _helpers._cached_pre_market_report = report  # 内存缓存供 09:26 竞价使用（快速路径）
+        try:
+            from database import PreMarketReportManager
+            PreMarketReportManager.save(
+                datetime.datetime.now().strftime("%Y%m%d"), report)  # 落库，进程重启不丢
+        except Exception as e:
+            logger.warning(f"盘前简报落库失败: {e}")
         # 发送 Bark 推送
         bark_notifier.send(
             title="☀️ 盘前简报与爆发题材预测",

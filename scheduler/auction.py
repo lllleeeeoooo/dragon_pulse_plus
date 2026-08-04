@@ -118,8 +118,14 @@ def job_call_auction():
 
         recs_summary = "\n".join(lines) if lines else "暂无待观察标的"
 
-        # ---- 3. 盘前简报预测板块 ----
-        predicted_summary = _helpers._cached_pre_market_report[:800] if _helpers._cached_pre_market_report else ""
+        # ---- 3. 盘前简报预测板块（优先 DB——进程重启不丢；内存缓存次之；都无则空）----
+        try:
+            from database import PreMarketReportManager
+            predicted_summary = (PreMarketReportManager.get(today_str)
+                                 or _helpers._cached_pre_market_report or "")[:800]
+        except Exception as e:
+            logger.warning(f"读取盘前简报失败: {e}")
+            predicted_summary = (_helpers._cached_pre_market_report or "")[:800]
 
         # ---- 4. 抓取实时竞价快照 ----
         spot_df = DataFetcher.get_realtime_spot()

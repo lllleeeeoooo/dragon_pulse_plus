@@ -242,6 +242,19 @@ class ConceptCycle(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
+class PreMarketReport(Base):
+    """
+    盘前简报持久化表（断链4修复）
+    08:30 生成的盘前简报落库，09:26 竞价从库读取——进程重启不丢失盘前上下文。
+    """
+    __tablename__ = "pre_market_report"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(String(10), nullable=False, unique=True, index=True, comment="交易日期 YYYYMMDD")
+    report = Column(Text, comment="盘前简报全文")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
 class InvestigationRecord(Base):
     """
     立案调查记录表
