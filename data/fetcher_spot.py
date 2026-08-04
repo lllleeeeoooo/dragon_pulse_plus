@@ -351,10 +351,12 @@ class _SpotMixin:
         获取全市场 A 股实时行情快照.
         多数据源降级:新浪 -> 腾讯 -> 东财,某个源失败自动切换下一个.
         """
+        # 源优先级：东财(量比/振幅/换手率/市值全) → 腾讯(有量比lb/振幅zf) → 新浪(缺量比振幅，仅兜底)。
+        # 信号检测依赖量比/振幅，若退回新浪会导致所有信号永不触发（历史 bug：从未产生 AI 买入）。
         df = multi_source_fetch([
-            ("新浪", _SpotMixin._fetch_spot_sina),
-            ("腾讯", _SpotMixin._fetch_spot_tencent),
             ("东财", _SpotMixin._fetch_spot_eastmoney),
+            ("腾讯", _SpotMixin._fetch_spot_tencent),
+            ("新浪", _SpotMixin._fetch_spot_sina),
         ])
         if df.empty:
             logger.warning("获取全市场实时行情为空（所有数据源均失败）.")

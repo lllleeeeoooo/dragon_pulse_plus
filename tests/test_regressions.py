@@ -228,6 +228,12 @@ class TestPureRegressions(unittest.TestCase):
                 predicted_sectors_summary="", auction_prediction="")
             self.assertEqual(result, "竞价指令")
 
+    def test_spot_source_priority(self):
+        """信号依赖量比/振幅：主源必须是东财或腾讯，不能是新浪（新浪缺量比振幅会让信号全灭，历史 bug）"""
+        from data.core import SOURCE_PRIORITY
+        self.assertEqual(SOURCE_PRIORITY[0], "东财")
+        self.assertIn("腾讯", SOURCE_PRIORITY[:2])  # 腾讯必须在主源位置（东财挂时顶上）
+
     def test_sell_advisor_format_alert(self):
         """盘中异动润色：LLM 成功返回润色文本；失败降级为规则化文案"""
         from llm.sell_advisor import DynamicSellAdvisor

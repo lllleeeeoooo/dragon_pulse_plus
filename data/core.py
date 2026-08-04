@@ -37,7 +37,7 @@ def retry_on_exception(retries: int = 3, delay: float = 2.0, backoff: float = 1.
     return decorator
 
 
-SOURCE_PRIORITY = ["新浪", "腾讯", "东财"]
+SOURCE_PRIORITY = ["东财", "腾讯", "新浪"]
 
 
 def multi_source_fetch(source_chain: List[Tuple[str, Callable[[], pd.DataFrame]]]) -> pd.DataFrame:
