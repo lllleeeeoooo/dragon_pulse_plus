@@ -30,7 +30,8 @@ class HoldingManager:
                     "buy_date": h.buy_date,
                     "buy_strategy": h.buy_strategy,
                     "holding_type": h.holding_type,
-                    "was_limit_up_today": h.was_limit_up_today
+                    "was_limit_up_today": h.was_limit_up_today,
+                    "prev_close_price": h.prev_close_price
                 }
                 for h in holdings
             ]

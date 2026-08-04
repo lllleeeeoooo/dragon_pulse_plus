@@ -170,36 +170,51 @@ class _MonitorSignalsMixin:
 
     def _is_bad_intraday_pattern(self, code: str) -> bool:
         """
-        检测个股分时形态是否不利于买入。
-        冲高回落/放量滞涨/天地板 → 返回True（不宜买入）。
-        为避免API频繁调用，仅在成交额>5亿的标的上检测。
+        检测个股分时形态是否不利于买入（当日缓存，避免轮询内对同一标的重复联网）。
+        冲高回落/放量滞涨/天地板/尾盘砸盘 → 返回True（不宜买入）。
+        调用方已按 PATTERN_CHECK_MIN_AMOUNT 做成交额门槛，控制联网频次。
         """
+        cache = getattr(self, '_pattern_cache', {})
+        if code in cache:
+            return cache[code]
+        bad = False
         try:
             patterns = self._DF.detect_intraday_patterns(code)
             bad_patterns = {"冲高回落", "放量滞涨", "天地板", "尾盘砸盘"}
-            if bad_patterns & set(patterns):
+            bad = bool(bad_patterns & set(patterns))
+            if bad:
                 logger.debug(f"{code} 分时形态不佳: {patterns}，跳过买入")
-                return True
         except Exception:
             pass
-        return False
+        cache[code] = bad
+        return bad
 
 
     def _is_daily_loss_breaker_triggered(self, ai_holdings: list) -> bool:
-        """检查AI持仓当日总亏损是否触发熔断"""
+        """检查AI持仓当日平均亏损是否触发熔断（当日盈亏 = 相对昨收，非持仓总浮亏）"""
         if not ai_holdings:
             return False
-        total_profit = sum(h.get("profit_rate", 0) for h in ai_holdings)
-        avg_profit = total_profit / len(ai_holdings)
+        changes = []
+        for h in ai_holdings:
+            prev = float(h.get("prev_close_price") or 0)
+            cur = float(h.get("current_price") or 0)
+            if prev > 0 and cur > 0:
+                changes.append((cur - prev) / prev * 100)
+            else:
+                # 昨收缺失（当日新买/数据未同步），退用持仓总收益率近似
+                changes.append(float(h.get("profit_rate") or 0))
+        if not changes:
+            return False
+        avg_profit = sum(changes) / len(changes)
         if avg_profit <= settings.DAILY_LOSS_CIRCUIT_BREAKER:
             import scheduler.monitor_core as _mcore
             if not getattr(self, '_circuit_breaker_alerted', False):
                 self._circuit_breaker_alerted = True
                 _mcore._circuit_breaker_alerted = True
-                logger.warning(f"AI持仓亏损熔断：平均收益率 {avg_profit:.2f}% <= {settings.DAILY_LOSS_CIRCUIT_BREAKER}%，停止自动买入")
+                logger.warning(f"AI持仓当日亏损熔断：平均当日盈亏 {avg_profit:.2f}% <= {settings.DAILY_LOSS_CIRCUIT_BREAKER}%，停止自动买入")
                 bark_notifier.send(
-                    title="🛑 [亏损熔断] AI自动买入已暂停",
-                    body=f"AI持仓平均亏损 {avg_profit:.2f}% 触发熔断阈值({settings.DAILY_LOSS_CIRCUIT_BREAKER}%)，今日不再自动买入。",
+                    title="🛑 [当日亏损熔断] AI自动买入已暂停",
+                    body=f"AI持仓当日平均盈亏 {avg_profit:.2f}% 触发熔断阈值({settings.DAILY_LOSS_CIRCUIT_BREAKER}%)，今日不再自动买入。",
                     group="风控提醒",
                     level="timeSensitive"
                 )

@@ -72,6 +72,8 @@ class _MonitorCoreMixin:
         self._auction_summary_sent: bool = False
         # 任务记录计数器（每 4 轮≈60 秒更新一次）
         self._job_record_counter: int = 0
+        # 分时形态检测缓存（当日），避免轮询内对同一标的重复联网
+        self._pattern_cache: Dict[str, bool] = {}
 
 
     def _reset_daily_state(self):
@@ -87,6 +89,7 @@ class _MonitorCoreMixin:
             self._alerted_sell_signals.clear()
             self._alert_date = today
             self._ma_cache.clear()
+            self._pattern_cache.clear()
             self._startup_logged = False  # 允许下一天输出启动日志
             global _circuit_breaker_alerted
             self._circuit_breaker_alerted = False
@@ -538,13 +541,9 @@ class _MonitorCoreMixin:
 
                 is_recommended = code in pending_codes
 
-                # 判断是否为一字板（无法买入）——按板块区分涨停线（主板 10cm / 双创 20cm）
                 pre_close = float(row.get("pre_close", price))
-                is_one_word_board = type(self)._is_limit_up(code, change_pct) and (
-                    float(row.get("low", price)) == price
-                )
 
-                # 推荐标的竞价条件验证：检查开盘涨幅是否满足 open_requirement
+                # 推荐标的竞价条件验证：开盘涨幅满足 open_requirement + 当下未明显走弱
                 rec_condition_met = True
                 if is_recommended:
                     rec_info = next((r for r in pending_recs if r["code"] == code), None)
@@ -552,6 +551,9 @@ class _MonitorCoreMixin:
                         open_req = rec_info["open_requirement"]
                         open_change = round((float(row.get("open", price)) - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0
                         rec_condition_met = self._check_open_requirement(open_change, open_req)
+                        # 当下走势校验：高开标的相对开盘回落超过 REC_FADE_MAX（走弱）不自动买入
+                        if rec_condition_met and open_change > 0 and (open_change - change_pct) > settings.REC_FADE_MAX:
+                            rec_condition_met = False
 
                 # 高质量信号 = 逼近封板 / 低开猛拉 / 点火异动(高质量)
                 # 高质量信号判定跟随市场风格
@@ -569,7 +571,7 @@ class _MonitorCoreMixin:
                         (row["_signal_burst"] and change_pct >= 5.0 and vol_ratio >= 5.0 and amt_billion >= 2.0)
                     )
 
-                # 自动买入: 推荐标的 或 符合当前风格的高质量信号，且非一字板
+                # 自动买入: 推荐标的 或 符合当前风格的高质量信号，且当前未封板（封板买不进）
                 # 情绪周期约束：冰点/退潮期不自动买入，启动期只买推荐标的
                 cycle_allow = self._cycle_stance.get("allow_auto_buy", True)
                 cycle_only_rec = self._cycle_stance.get("only_recommended", False)
@@ -580,9 +582,11 @@ class _MonitorCoreMixin:
                 if is_recommended and rec_info:
                     auction_verdict = rec_info.get("auction_verdict", "") or ""
                 verdict_blocked = is_recommended and auction_verdict == "放弃"
+                # 当前已封板则买不进（封板判定覆盖一字板，含盘中打开后重新封死的）
+                is_sealed = type(self)._is_limit_up(code, change_pct)
                 should_buy = (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
                     (is_recommended and rec_condition_met) or is_high_signal
-                ) and not is_one_word_board
+                ) and not is_sealed
                 buy_reason = ""
                 if should_buy and code not in self._auto_bought_codes:
                     # 仓位管理检查
@@ -593,7 +597,7 @@ class _MonitorCoreMixin:
                         pass  # 超出当日最大买入次数，跳过
                     elif self._is_daily_loss_breaker_triggered(ai_holdings):
                         pass  # 当日总亏损熔断，跳过
-                    elif self._is_bad_intraday_pattern(code):
+                    elif amt_billion >= settings.PATTERN_CHECK_MIN_AMOUNT and self._is_bad_intraday_pattern(code):
                         pass  # 分时形态不佳（冲高回落/放量滞涨），跳过
                     elif not any(h["code"] == code for h in ai_holdings):
                         self._auto_bought_codes.add(code)

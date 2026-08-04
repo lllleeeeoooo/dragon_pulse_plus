@@ -118,6 +118,41 @@ class TestPureRegressions(unittest.TestCase):
         self.assertEqual(v.get("002879"), "放弃")
         self.assertEqual(v.get("600396"), "观察")
 
+    def test_daily_loss_breaker_uses_today_change(self):
+        """熔断用当日盈亏(相对昨收)而非持仓总浮亏（修复名不副实）"""
+        from scheduler.monitor_signals import _MonitorSignalsMixin
+        from unittest.mock import patch
+        obj = object.__new__(_MonitorSignalsMixin)
+        obj._circuit_breaker_alerted = False
+        # 今日 +5% / -10% → 平均 -2.5%，未破 -5%，即便 profit_rate 平均为 0 也不触发
+        holdings = [
+            {"code": "600001", "current_price": 10.5, "prev_close_price": 10.0, "profit_rate": 20.0},
+            {"code": "600002", "current_price": 9.0, "prev_close_price": 10.0, "profit_rate": -20.0},
+        ]
+        with patch("scheduler.monitor_signals.bark_notifier.send"):
+            self.assertFalse(_MonitorSignalsMixin._is_daily_loss_breaker_triggered(obj, holdings))
+        # 单只今日 -10% → 触发
+        with patch("scheduler.monitor_signals.bark_notifier.send"):
+            self.assertTrue(_MonitorSignalsMixin._is_daily_loss_breaker_triggered(
+                obj, [{"code": "600001", "current_price": 9.0, "prev_close_price": 10.0, "profit_rate": 50.0}]))
+
+    def test_pattern_cache_reuses_result(self):
+        """分时形态检测缓存：同一 code 只联网一次（修复轮询内重复联网）"""
+        from scheduler.monitor_signals import _MonitorSignalsMixin
+        obj = object.__new__(_MonitorSignalsMixin)
+        obj._pattern_cache = {}
+        calls = []
+        class _DF:
+            @staticmethod
+            def detect_intraday_patterns(code):
+                calls.append(code)
+                return ["平稳走势"]
+        obj._DF = _DF
+        self.assertFalse(obj._is_bad_intraday_pattern("600001"))
+        self.assertFalse(obj._is_bad_intraday_pattern("600001"))
+        self.assertEqual(calls, ["600001"])  # 只联网一次
+        self.assertIn("600001", obj._pattern_cache)
+
     def test_market_style_classify(self):
         """市场风格分类：抱团/共振/打板 三档命中"""
         from core.strategies import MarketStyle
