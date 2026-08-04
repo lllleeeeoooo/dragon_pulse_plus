@@ -47,6 +47,11 @@ def build_dashboard_data() -> Dict[str, Any]:
     sectors = SectorStrengthManager.get_hot_sectors(top_n=8)
     sectors_date = sectors[0].get("_date", "") if sectors else ""
 
+    # ---- 龙虎榜席位画像 ----
+    from database import SeatProfileManager
+    seat_profiles = SeatProfileManager.get_profiles(top=30, active_only=True)
+    seat_stats = SeatProfileManager.get_stats()
+
     # ---- 涨停龙头（回退逻辑：今日 → 最新历史） ----
     today_str = datetime.datetime.now().strftime("%Y%m%d")
     dragons, dragons_date = _get_dragons_with_fallback(today_str)
@@ -78,6 +83,8 @@ def build_dashboard_data() -> Dict[str, Any]:
         "sectors_date": sectors_date or dragons_date,
         "dragons": dragons,
         "dragons_date": dragons_date,
+        "seats": seat_profiles,
+        "seat_stats": seat_stats,
         "equity_curve": equity[-20:] if equity else [],
         "equity_date": equity_date,
         "ai_status": {

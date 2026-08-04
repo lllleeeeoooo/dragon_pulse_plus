@@ -8,3 +8,4 @@ from database.logs import PushLogManager, LLMLogManager, ErrorLogManager, LogRet
 from database.market_data import MarketIndexManager, DailySnapshotManager, ZtPoolManager, SectorStrengthManager
 from database.calendar import TradeCalendarManager
 from database.system_log import SystemLogManager
+from database.seats import SeatProfileManager

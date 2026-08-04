@@ -225,6 +225,25 @@ class TestDbRegressions(unittest.TestCase):
         self.assertIsNotNone(prof)
         self.assertIn("北向", prof["type"])
 
+    def test_seat_profiles_api(self):
+        """席位画像查询接口：get_profiles/get_stats（人工种子 + 自动分类都在列表）"""
+        from database import SeatProfileManager
+        SeatProfileManager.seed_famous_seats()
+        for i in range(5):
+            day = f"2026081{i + 1}"
+            SeatProfileManager.sync_from_lhb(pd.DataFrame([{
+                "seat_name": "华鑫证券新锐B", "trade_date": day,
+                "buy_stock_count": 3, "sell_stock_count": 0,
+                "buy_amount": 5e7, "sell_amount": 0, "net_amount": 5e7, "buy_stocks": "A,B,C",
+            }]), day)
+        profs = SeatProfileManager.get_profiles(top=10)
+        self.assertTrue(any(p["seat_name"] == "华鑫证券新锐B" and p["type"] == "格局派" for p in profs))
+        self.assertTrue(any(p["seat_name"] == "六一中路" and p["is_manual"] for p in profs))
+        stats = SeatProfileManager.get_stats()
+        self.assertGreaterEqual(stats["total"], 2)
+        self.assertGreaterEqual(stats["manual"], 1)
+        self.assertIn("格局派", stats["by_type"])
+
     def test_core_pool_beta_real(self):
         """core_pool Beta 实际生效：用个股收盘价与市场指数计算相关性并过滤"""
         from core.core_pool import ActiveCorePool

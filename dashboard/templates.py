@@ -176,6 +176,39 @@ if(d.dragons && d.dragons.length>0){
 
 
 
+def _section_seats():
+    return """
+// ---- 龙虎榜席位画像 ----
+if(d.seat_stats && d.seat_stats.total>0){
+  var st=d.seat_stats;
+  var typeMap={'格局派':'#00e676','砸盘派':'#ff5252','散户派':'#78909c','对倒派':'#ffd740','外资北向':'#40c4ff','未知':'#78909c'};
+  html+='<h2>🏛 龙虎榜席位画像 <span style="font-size:10px;color:#5c6e80;font-weight:normal">共'+st.total+'席·人工'+st.manual+'·盘后自动更新</span></h2>';
+  html+='<div class="card" style="font-size:11px">';
+  Object.keys(typeMap).forEach(function(t){
+    var n=st.by_type? (st.by_type[t]||0):0;
+    if(n>0) html+='<span class="tag" style="background:'+typeMap[t]+'26;color:'+typeMap[t]+'">'+t+' '+n+'</span> ';
+  });
+  html+='</div>';
+  if(d.seats && d.seats.length>0){
+    html+='<table class="tbl"><tr><th>席位</th><th>类型</th><th>净买入</th><th>上榜</th><th>标记</th></tr>';
+    d.seats.forEach(function(s){
+      var c=typeMap[s.type]||'#78909c';
+      html+='<tr><td>'+s.seat_name+'<br><span style="font-size:10px;color:#5c6e80">'+(s.desc||'')+'</span></td>';
+      html+='<td><span class="tag" style="background:'+c+'26;color:'+c+'">'+s.type+'</span></td>';
+      var net=s.net_amount_wan||0;
+      html+='<td style="color:'+(net>=0?'#ff5252':'#00e676')+'">'+S(Math.round(net))+'万</td>';
+      html+='<td>'+s.appear_count+'</td>';
+      html+='<td>'+(s.is_manual?'<span class="tag tag-yellow">人工</span>':'<span class="tag tag-blue">自动</span>')+'</td></tr>';
+    });
+    html+='</table>';
+  } else {
+    html+='<div class="card-sm" style="text-align:center;color:#5c6e80">暂无席位数据（需运行盘后复盘）</div>';
+  }
+}
+"""
+
+
+
 def _section_equity():
     return """
 // ---- 净值曲线 ----
@@ -240,6 +273,7 @@ _JS_SECTIONS = (
     + _section_breadth()
     + _section_portfolio()
     + _section_sectors()
+    + _section_seats()
     + _section_dragons()
     + _section_equity()
     + _section_ai_status()

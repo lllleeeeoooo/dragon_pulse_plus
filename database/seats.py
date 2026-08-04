@@ -11,7 +11,7 @@
 """
 import datetime
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from config.settings import settings
 from database.models import SeatProfile
@@ -213,3 +213,70 @@ class SeatProfileManager:
             if key in name:
                 return {"type": info["type"], "desc": info["desc"]}
         return None
+
+    @staticmethod
+    def _display_type(p) -> str:
+        """归一化类型用于展示："A类-格局派" → "格局派"（人工/自动统一口径）"""
+        t = p.manual_type or p.seat_type or "未知"
+        for prefix in ("A类-", "B类-", "C类-"):
+            if t.startswith(prefix):
+                return t[len(prefix):]
+        return t
+
+    @staticmethod
+    def get_profiles(seat_type: str = None, top: int = 50, active_only: bool = True) -> List[Dict[str, Any]]:
+        """查询席位画像列表（按累计净买入降序），供 API / 看板使用。"""
+        session = db_manager.get_session()
+        try:
+            from sqlalchemy import or_
+            query = session.query(SeatProfile)
+            if active_only:
+                query = query.filter(SeatProfile.is_active == True)
+            if seat_type:
+                # 同时匹配人工类型与自动类型（含归一化前的"A类-xxx"）
+                query = query.filter(
+                    or_(
+                        SeatProfile.manual_type == seat_type,
+                        SeatProfile.seat_type == seat_type,
+                        SeatProfile.manual_type.like(f"%{seat_type}%"),
+                        SeatProfile.seat_type.like(f"%{seat_type}%"),
+                    )
+                )
+            profiles = query.order_by(SeatProfile.net_amount_total.desc()).limit(top).all()
+            return [
+                {
+                    "seat_name": p.seat_name,
+                    "type": SeatProfileManager._display_type(p),
+                    "is_manual": bool(p.is_manual),
+                    "desc": p.desc or "",
+                    "appear_count": p.appear_count or 0,
+                    "buy_amount_wan": round((p.buy_amount_total or 0) / 1e4, 2),
+                    "sell_amount_wan": round((p.sell_amount_total or 0) / 1e4, 2),
+                    "net_amount_wan": round((p.net_amount_total or 0) / 1e4, 2),
+                    "first_seen": p.first_seen,
+                    "last_seen": p.last_seen,
+                    "is_active": bool(p.is_active),
+                }
+                for p in profiles
+            ]
+        finally:
+            session.close()
+
+    @staticmethod
+    def get_stats() -> Dict[str, Any]:
+        """席位画像概览：总数 + 按类型计数（归一化后）。"""
+        session = db_manager.get_session()
+        try:
+            profiles = session.query(SeatProfile).all()
+            by_type: Dict[str, int] = {}
+            total = 0
+            manual = 0
+            for p in profiles:
+                total += 1
+                if p.is_manual:
+                    manual += 1
+                t = SeatProfileManager._display_type(p)
+                by_type[t] = by_type.get(t, 0) + 1
+            return {"total": total, "manual": manual, "by_type": by_type}
+        finally:
+            session.close()

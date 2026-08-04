@@ -455,6 +455,28 @@ def hot_sectors(date: str = Query(None, description="日期 YYYYMMDD，默认最
     return {"code": 200, "data": result}
 
 
+@app.get("/data/seats", summary="龙虎榜席位画像",
+         description="查询席位画像（累计买卖/自动分类/人工标签），按累计净买入降序。"
+                     "示例：/data/seats?top=20",
+         tags=["龙虎榜"])
+def data_seats(
+    seat_type: Optional[str] = Query(None, description="按类型筛选: 格局派/砸盘派/散户派/对倒派/外资北向/未知"),
+    top: int = Query(20, description="返回前N个(按累计净买入降序)"),
+    active_only: bool = Query(True, description="仅活跃席位"),
+):
+    from database import SeatProfileManager
+    result = SeatProfileManager.get_profiles(seat_type=seat_type, top=top, active_only=active_only)
+    return {"code": 200, "count": len(result), "data": result}
+
+
+@app.get("/data/seats/stats", summary="龙虎榜席位画像统计",
+         description="席位总数 + 按类型计数",
+         tags=["龙虎榜"])
+def data_seats_stats():
+    from database import SeatProfileManager
+    return {"code": 200, "data": SeatProfileManager.get_stats()}
+
+
 @app.get("/monitor", response_class=HTMLResponse, summary="系统综合看板",
          description="HTML 页面，展示大盘/情绪/持仓/板块/龙头/系统状态")
 def monitor_page():
