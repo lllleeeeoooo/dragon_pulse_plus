@@ -31,7 +31,8 @@ def job_call_auction():
         yesterday_str = get_previous_trading_day(today.date())
 
         # ---- 1. 昨日 LLM 复盘推荐标的 ----
-        pending_recs = RecommendationManager.get_pending_recommendations(trade_date=today_str)
+        # 复盘在 T 日 18:01 以 trade_date=T 落库，T+1 日需按"上一交易日"查询
+        pending_recs = RecommendationManager.get_pending_recommendations(trade_date=yesterday_str)
         lines = []
         if pending_recs:
             for r in pending_recs:

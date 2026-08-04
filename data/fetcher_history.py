@@ -10,12 +10,10 @@ import datetime
 
 class _HistoryMixin:
     @staticmethod
-    def get_stock_ma_prices(code: str, lookback: int = 30) -> dict:
+    def get_stock_daily_closes(code: str, lookback: int = 30) -> list:
         """
-        获取个股历史日K线数据并计算关键均线 (MA5/MA10/MA20).
-        多源降级:新浪 -> 东财.
-        :param code: 股票代码 (6位)
-        :param lookback: 回溯天数
+        获取个股近 N 日收盘价序列（多源降级:新浪 -> 东财），用于 Beta 相关性计算。
+        :return: 收盘价 list（升序，最近在末尾），失败返回空列表
         """
         def _from_sina():
             prefix = _HistoryMixin._market_prefix(code)
@@ -43,15 +41,26 @@ class _HistoryMixin:
                 ("东财", _from_eastmoney),
             ])
             if not df.empty:
-                closes = pd.to_numeric(df["close"], errors="coerce").dropna().tolist()
-                if len(closes) >= 5:
-                    return {
-                        "ma5": round(sum(closes[-5:]) / 5, 2),
-                        "ma10": round(sum(closes[-10:]) / min(10, len(closes)), 2) if len(closes) >= 10 else None,
-                        "ma20": round(sum(closes[-20:]) / min(20, len(closes)), 2) if len(closes) >= 20 else None,
-                    }
+                return pd.to_numeric(df["close"], errors="coerce").dropna().tolist()
         except Exception as e:
-            logger.warning(f"获取 {code} 历史K线计算均线失败: {e}")
+            logger.warning(f"获取 {code} 历史收盘价失败: {e}")
+        return []
+
+    @staticmethod
+    def get_stock_ma_prices(code: str, lookback: int = 30) -> dict:
+        """
+        获取个股历史日K线数据并计算关键均线 (MA5/MA10/MA20).
+        多源降级:新浪 -> 东财.
+        :param code: 股票代码 (6位)
+        :param lookback: 回溯天数
+        """
+        closes = _HistoryMixin.get_stock_daily_closes(code, lookback)
+        if len(closes) >= 5:
+            return {
+                "ma5": round(sum(closes[-5:]) / 5, 2),
+                "ma10": round(sum(closes[-10:]) / min(10, len(closes)), 2) if len(closes) >= 10 else None,
+                "ma20": round(sum(closes[-20:]) / min(20, len(closes)), 2) if len(closes) >= 20 else None,
+            }
         return {"ma5": None, "ma10": None, "ma20": None}
 
 

@@ -97,6 +97,34 @@ class HoldingManager:
             session.close()
 
     @staticmethod
+    def batch_update_profit_rates(updates: List[tuple]):
+        """
+        批量更新持仓当前价与收益率（一次 session 写库）。
+        盘中轮询每 15 秒调用一次，避免逐只开 session 造成的写放大。
+        :param updates: [(code, current_price, holding_type), ...]
+        """
+        if not updates:
+            return
+        session = db_manager.get_session()
+        try:
+            for code, current_price, holding_type in updates:
+                query = session.query(Holding).filter(
+                    Holding.code == code, Holding.status == "HOLDING"
+                )
+                if holding_type:
+                    query = query.filter(Holding.holding_type == holding_type)
+                holding = query.first()
+                if holding and holding.cost_price > 0:
+                    holding.current_price = current_price
+                    holding.profit_rate = round(((current_price - holding.cost_price) / holding.cost_price) * 100, 2)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.error(f"批量更新持仓收益率失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
     def update_was_limit_up(code: str, was_zt: bool, holding_type: Optional[str] = None):
         """更新持仓股票今日是否曾封涨停状态（支持按 holding_type 区分同代码多持仓）"""
         session = db_manager.get_session()
@@ -282,6 +310,35 @@ class HoldingManager:
             session.close()
 
     @staticmethod
+    def update_current_prices(spot_map: Dict[str, float]):
+        """
+        盘后用当日收盘价更新所有活跃持仓的 current_price 与收益率。
+        与 sync_close_prices 的区别：不改动 prev_close_price（保留"上一交易日收盘"基准，
+        供当日盈亏报告计算"今日涨跌"）。报告生成后应再调用 sync_close_prices 滚存昨收。
+        """
+        if not spot_map:
+            return
+        session = db_manager.get_session()
+        try:
+            holdings = session.query(Holding).filter(Holding.status == "HOLDING").all()
+            updated = 0
+            for h in holdings:
+                close_px = spot_map.get(h.code, 0)
+                if close_px > 0:
+                    h.current_price = close_px
+                    if h.cost_price > 0:
+                        h.profit_rate = round((close_px - h.cost_price) / h.cost_price * 100, 2)
+                    updated += 1
+            if updated:
+                session.commit()
+                logger.info(f"更新 {updated} 只持仓收盘价")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"更新持仓收盘价失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
     def get_daily_pnl_report() -> Dict[str, Any]:
         """
         生成每日盈亏报告，包含：
@@ -379,11 +436,11 @@ class HoldingManager:
             active_count = len(active)
             today_closed_count = len(today_closed)
 
-            # 计算增减百分比（相对总成本）
-            total_cost = sum(h.cost_price * h.quantity for h in active if h.cost_price > 0)
-            total_cost += sum(h.cost_price * h.quantity for h in all_closed if h.cost_price > 0)
+            # 收益率分母区分：今日用"当前活跃持仓成本"，累计用"累计投入成本"，避免历史平仓稀释今日收益率
+            active_cost = sum(h.cost_price * h.quantity for h in active if h.cost_price > 0)
+            total_cost = active_cost + sum(h.cost_price * h.quantity for h in all_closed if h.cost_price > 0)
             total_pnl_pct = round(cumulative_total_pnl / total_cost * 100, 2) if total_cost > 0 else 0.0
-            today_pnl_pct = round(today_total_pnl / total_cost * 100, 2) if total_cost > 0 else 0.0
+            today_pnl_pct = round(today_total_pnl / active_cost * 100, 2) if active_cost > 0 else 0.0
 
             # 活跃持仓中盈利/亏损数量
             profit_count = sum(1 for h in holdings_detail if h["profit_pct"] > 0)

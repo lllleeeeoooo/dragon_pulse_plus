@@ -137,8 +137,9 @@ class _SpotMixin:
 
         :return: {"ma_amount": 基准成交额(亿元), "source": "昨日全市场/指数合成/默认"}
         """
-        import datetime
-        yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+        # 用交易日而非自然日（周一应取周五），避免取到周末无数据
+        from core.trade_calendar import get_previous_trading_day
+        yesterday = get_previous_trading_day()
         # 1. 优先从数据库取昨日全市场真实成交额
         try:
             from database.services import db_manager

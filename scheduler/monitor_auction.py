@@ -14,7 +14,7 @@ from config.settings import settings
 from data.fetcher import DataFetcher
 from core.strategies import StrategyAnalyzer, MarketStyle
 from core.holding_monitor import HoldingMonitor
-from core.trade_calendar import is_trading_day
+from core.trade_calendar import is_trading_day, get_previous_trading_day
 from llm.sell_advisor import DynamicSellAdvisor
 from notifier.bark import bark_notifier
 from database.services import HoldingManager, RecommendationManager
@@ -293,7 +293,7 @@ class _MonitorAuctionMixin:
                 # 集合竞价阶段 _zt_pool_cache 尚未填充（09:30+ 才刷新），
                 # 回退到昨日涨停池数据以匹配板块成分股
                 try:
-                    yesterday_str = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+                    yesterday_str = get_previous_trading_day()  # 用交易日而非自然日，避免周一取到周日
                     zt_df = self._DF.get_zt_pool(date_str=yesterday_str)
                 except Exception:
                     pass

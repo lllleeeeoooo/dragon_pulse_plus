@@ -27,27 +27,26 @@ class _MonitorStyleMixin:
         return 0
 
 
+    @staticmethod
+    def _compute_true_zhaban_count(zt_df, zhaban_df) -> int:
+        """
+        真炸板数 = 在炸板池但当前不在涨停池（炸了没回封）。
+        全系统唯一口径：startup 日志 / 风格判定 / 炸板率统一走这里，避免三处算法不一致。
+        """
+        if zhaban_df is None or zhaban_df.empty or "code" not in zhaban_df.columns:
+            return 0
+        zhaban_codes = set(zhaban_df["code"].astype(str))
+        if zt_df is not None and not zt_df.empty and "code" in zt_df.columns:
+            zt_codes = set(zt_df["code"].astype(str))
+            return len(zhaban_codes - zt_codes)
+        return len(zhaban_codes)
+
     def _get_market_zhaban_rate(self) -> float:
-        """真炸板率：扣除炸板后回封的股票（涨停池 open_count>0 的视为回封成功）"""
+        """真炸板率 = 真炸板 / (涨停 + 真炸板)。口径与 _compute_true_zhaban_count 一致。"""
         zt_df = self._zt_pool_cache
         zhaban_df = self._zhaban_pool_cache
         zt_count = len(zt_df) if zt_df is not None and not zt_df.empty else 0
-        zhaban_count = len(zhaban_df) if zhaban_df is not None and not zhaban_df.empty else 0
-
-        # 炸板后回封的股票：在涨停池里且 open_count > 0
-        re_sealed_codes = set()
-        if zt_df is not None and not zt_df.empty and "code" in zt_df.columns:
-            if "open_count" in zt_df.columns:
-                re_sealed = zt_df[zt_df["open_count"].astype(int) > 0]
-                re_sealed_codes = set(re_sealed["code"].astype(str))
-
-        # 真炸板 = 在炸板池但不在涨停池（炸了没回封）
-        if zhaban_df is not None and not zhaban_df.empty and "code" in zhaban_df.columns:
-            zhaban_codes = set(zhaban_df["code"].astype(str))
-            true_zhaban = len(zhaban_codes - re_sealed_codes)
-        else:
-            true_zhaban = zhaban_count
-
+        true_zhaban = self._compute_true_zhaban_count(zt_df, zhaban_df)
         total = zt_count + true_zhaban
         if total > 0:
             return round((true_zhaban / total) * 100, 2)
@@ -78,15 +77,7 @@ class _MonitorStyleMixin:
         zt_df = self._zt_pool_cache
         zhaban_df = self._zhaban_pool_cache
         zt_count = len(zt_df) if zt_df is not None and not zt_df.empty else 0
-        zhaban_count_raw = len(zhaban_df) if zhaban_df is not None and not zhaban_df.empty else 0
-        # 真炸板 = 在炸板池但不在涨停池（扣掉回封的）
-        if zt_df is not None and not zt_df.empty and "code" in zt_df.columns and \
-           zhaban_df is not None and not zhaban_df.empty and "code" in zhaban_df.columns:
-            zt_codes = set(zt_df["code"].astype(str))
-            zhaban_codes = set(zhaban_df["code"].astype(str))
-            zhaban_count = len(zhaban_codes - zt_codes)
-        else:
-            zhaban_count = zhaban_count_raw
+        zhaban_count = self._compute_true_zhaban_count(zt_df, zhaban_df)
 
         # 跌停/涨停估算（按板块区分涨跌停线）
         dt_count = 0

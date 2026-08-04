@@ -50,6 +50,7 @@ class Recommendation(Base):
     buy_condition = Column(Text, comment="买入详细条件")
     sell_condition = Column(Text, comment="止盈止损条件")
     status = Column(String(16), default="PENDING", comment="状态: PENDING(待观察), TRIGGERED(已买入), EXPIRED(已失效)")
+    eval_note = Column(Text, comment="复盘评估备注（LLM 对次日表现的一言点评与评分）")
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
@@ -382,6 +383,7 @@ class DatabaseManager:
         _ensure_column(self.engine, "holdings", "sell_price", "FLOAT DEFAULT 0.0")
         _ensure_column(self.engine, "holdings", "prev_close_price", "FLOAT DEFAULT 0.0")
         _ensure_column(self.engine, "daily_sentiment", "total_amount", "FLOAT DEFAULT 0.0")
+        _ensure_column(self.engine, "recommendations", "eval_note", "TEXT")
 
     def get_session(self) -> Session:
         """获取数据库 Session"""

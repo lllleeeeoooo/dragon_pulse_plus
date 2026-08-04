@@ -222,10 +222,11 @@ def data_spot():
     return {"code": 200, "count": len(df), "data": df.head(100).to_dict(orient="records")}
 
 
-@app.get("/data/zt-pool", summary="每日涨停池",
-         description="对应 ak.stock_zt_pool_em(date)，返回涨停股列表含连板数/封板资金/炸板次数等",
+@app.get("/data/zt-pool/live", summary="每日涨停池（实时抓取）",
+         description="对应 ak.stock_zt_pool_em(date)，直接从 AkShare 实时抓取涨停池（含连板数/封板资金/炸板次数等）。"
+                     "注意：/data/zt-pool（不带 /live）查询的是已落库数据，支持不传 date 默认取最新。",
          tags=[AKSHARE_TAG])
-def data_zt_pool(date: str = Query(..., description="日期 YYYYMMDD，如 20260729")):
+def data_zt_pool_live(date: str = Query(..., description="日期 YYYYMMDD，如 20260729")):
     df = DataFetcher.get_zt_pool(date_str=date)
     if df.empty:
         return {"code": 200, "count": 0, "data": []}

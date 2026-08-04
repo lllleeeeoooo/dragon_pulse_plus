@@ -3,6 +3,7 @@ from typing import List, Dict, Optional, Any
 import pandas as pd
 from database.models import MarketIndex, DailyEquitySnapshot, DailyZtPool, SectorStrength
 from database.connection import db_manager
+from config.settings import settings
 logger = logging.getLogger(__name__)
 
 class MarketIndexManager:
@@ -26,9 +27,15 @@ class MarketIndexManager:
             if existing:
                 return
 
-            sh_close, sh_change = MarketIndexManager._fetch_index("sh000001")
-            sz_close, sz_change = MarketIndexManager._fetch_index("sz399001")
-            gem_close, gem_change = MarketIndexManager._fetch_index("sz399006")
+            sh = MarketIndexManager._fetch_index("sh000001")
+            sz = MarketIndexManager._fetch_index("sz399001")
+            gem = MarketIndexManager._fetch_index("sz399006")
+            if sh is None and sz is None and gem is None:
+                logger.warning("三个指数全部获取失败，跳过当日指数落库（避免落 0 值污染看板）")
+                return
+            sh_close, sh_change = sh if sh else (0.0, 0.0)
+            sz_close, sz_change = sz if sz else (0.0, 0.0)
+            gem_close, gem_change = gem if gem else (0.0, 0.0)
 
             # 优先使用传入的全市场未过滤成交额，兜底从快照估算
             if total_amount_yuan > 0:
@@ -61,8 +68,8 @@ class MarketIndexManager:
             session.close()
 
     @staticmethod
-    def _fetch_index(symbol: str) -> tuple:
-        """获取单个指数最新收盘价和涨跌幅，失败返回 (0, 0)"""
+    def _fetch_index(symbol: str):
+        """获取单个指数最新收盘价和涨跌幅，失败返回 None（避免调用方落 0 值污染看板）"""
         try:
             import akshare as ak
             df = ak.stock_zh_index_daily(symbol=symbol)
@@ -77,7 +84,7 @@ class MarketIndexManager:
                 return round(close, 2), change
         except Exception:
             pass
-        return 0.0, 0.0
+        return None
 
     @staticmethod
     def get_latest() -> Optional[Dict[str, Any]]:
@@ -141,11 +148,18 @@ class DailySnapshotManager:
                 return
 
             total_equity = settings.BACKTEST_INITIAL_CAPITAL + pnl_report.get("cumulative_total_pnl", 0)
+            # 持仓市值 = Σ(现价 × 数量)；可用资金 = 总权益 - 持仓市值
+            position_value = 0.0
+            for _h in pnl_report.get("holdings", []) or []:
+                _qty = _h.get("quantity", 0) or 0
+                _cur = _h.get("current_price", 0) or _h.get("cost_price", 0) or 0
+                position_value += _cur * _qty
+            available_cash = total_equity - position_value
             snapshot = DailyEquitySnapshot(
                 trade_date=trade_date,
                 total_equity=round(total_equity, 2),
-                available_cash=round(total_equity - pnl_report.get("total_unrealized_pnl", 0), 2),
-                position_value=round(total_equity - (total_equity - pnl_report.get("total_unrealized_pnl", 0)), 2),
+                available_cash=round(max(available_cash, 0.0), 2),
+                position_value=round(position_value, 2),
                 unrealized_pnl=pnl_report.get("total_unrealized_pnl", 0),
                 today_realized_pnl=pnl_report.get("today_realized_pnl", 0),
                 total_realized_pnl=pnl_report.get("total_realized_pnl", 0),
@@ -169,11 +183,11 @@ class DailySnapshotManager:
         from database.models import DailyEquitySnapshot
         session = db_manager.get_session()
         try:
+            # 取最近 N 条（倒序取 limit 再反转，返回升序序列便于前端画图）
             records = session.query(DailyEquitySnapshot).order_by(
-                DailyEquitySnapshot.trade_date.asc()
-            ).limit(days).all() if days <= 60 else session.query(DailyEquitySnapshot).order_by(
-                DailyEquitySnapshot.trade_date.asc()
-            ).all()
+                DailyEquitySnapshot.trade_date.desc()
+            ).limit(days).all()
+            records = list(reversed(records))
             return [{
                 "date": r.trade_date,
                 "equity": r.total_equity,

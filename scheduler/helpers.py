@@ -12,7 +12,7 @@ from llm.client import llm_client
 from notifier.bark import bark_notifier
 from core.trade_calendar import is_trading_day, is_last_non_trading_day, get_previous_trading_day
 from database.services import RecommendationManager, db_manager
-from database.models import SystemLog, HistoricDragon
+from database.models import SystemLog, HistoricDragon, Recommendation
 from database import SystemLogManager
 
 logger = logging.getLogger(__name__)
@@ -111,21 +111,25 @@ def _parse_and_save_recommendations(trade_date: str, report_text: str):
     if json_text:
         try:
             data = json.loads(json_text)
-            json_parsed = True
-            recs = data.get("recommendations", [])
-            for r in recs:
-                code = str(r.get("code", "")).strip()
-                if not code or len(code) != 6 or not code.isdigit():
-                    continue
-                items.append({
-                    "code": code,
-                    "name": str(r.get("name", "")),
-                    "strategy_type": str(r.get("strategy_type", "AI复盘推荐")),
-                    "open_requirement": str(r.get("open_requirement", "")),
-                    "auction_vol_ratio": str(r.get("auction_vol_ratio", "")),
-                    "buy_condition": str(r.get("buy_condition", "")),
-                    "sell_condition": str(r.get("sell_condition", ""))
-                })
+            recs = data.get("recommendations")
+            if isinstance(recs, list):
+                json_parsed = True
+                for r in recs:
+                    code = str(r.get("code", "")).strip()
+                    if not code or len(code) != 6 or not code.isdigit():
+                        continue
+                    items.append({
+                        "code": code,
+                        "name": str(r.get("name", "")),
+                        "strategy_type": str(r.get("strategy_type", "AI复盘推荐")),
+                        "open_requirement": str(r.get("open_requirement", "")),
+                        "auction_vol_ratio": str(r.get("auction_vol_ratio", "")),
+                        "buy_condition": str(r.get("buy_condition", "")),
+                        "sell_condition": str(r.get("sell_condition", ""))
+                    })
+            else:
+                # JSON 解析成功但结构不符（缺 recommendations 列表），视为格式偏离，走正则兜底
+                logger.warning("推荐 JSON 结构不符合预期（缺少 recommendations 列表），回退到正则匹配")
         except json.JSONDecodeError as e:
             logger.warning(f"JSON 推荐解析失败，回退到正则匹配: {e}")
 
@@ -197,6 +201,22 @@ def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame =
             module="recommendation_eval"
         )
         logger.info(f"昨日推荐复盘评估: {evaluation}")
+        # 落库：评估写回各推荐记录的 eval_note，形成"推荐→买入→复盘打分"闭环
+        if evaluation and pending:
+            session = db_manager.get_session()
+            try:
+                for rec in pending:
+                    row = session.query(Recommendation).filter(
+                        Recommendation.id == rec["id"]
+                    ).first()
+                    if row:
+                        row.eval_note = evaluation[:500]
+                session.commit()
+            except Exception as e2:
+                session.rollback()
+                logger.warning(f"推荐评估落库失败: {e2}")
+            finally:
+                session.close()
     except Exception as e:
         logger.warning(f"LLM 复盘打分失败: {e}")
 

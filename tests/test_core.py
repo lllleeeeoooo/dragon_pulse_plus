@@ -1,3 +1,7 @@
+import os
+# 防止本文件的 test_stock_filtering 触发 database 包导入时绑定生产库（unittest 字母序先于 test_database）
+os.environ.setdefault("DB_PATH", "dragon_pulse_test.db")
+
 import unittest
 import pandas as pd
 from unittest.mock import MagicMock, patch
@@ -32,13 +36,17 @@ class TestQuantCore(unittest.TestCase):
         self.assertGreater(res["sentiment_index"], 0)
 
     def test_active_core_pool_filter(self):
-        """测试动态中军池筛选"""
+        """测试动态中军池筛选（Beta 网络取数已 mock，保持确定性单元测试）"""
+        from core.core_pool import ActiveCorePool
         board_cons = pd.DataFrame([
             {"code": "000001", "name": "中军A", "price": 10.0, "change_pct": 2.0, "amount": 30e8, "total_market_cap": 500e8},
             {"code": "000002", "name": "跟风B", "price": 5.0, "change_pct": 1.0, "amount": 2e8, "total_market_cap": 20e8}
         ])
 
-        results = ActiveCorePool.filter_core_leaders(board_cons)
+        # 无板块指数 + 无个股历史 → beta=None 不参与过滤（只测成交量/市值维度）
+        with patch.object(ActiveCorePool, "_get_market_index_series", return_value=None), \
+             patch("data.fetcher.DataFetcher.get_stock_daily_closes", return_value=[]):
+            results = ActiveCorePool.filter_core_leaders(board_cons)
         self.assertTrue(len(results) >= 1)
         self.assertEqual(results[0]["code"], "000001")
 

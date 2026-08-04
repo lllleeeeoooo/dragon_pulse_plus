@@ -95,6 +95,8 @@ class PostMarketAnalyzer:
         scores = {}
         if zt_df is None or zt_df.empty:
             return scores
+        # 统一索引：_norm 常量分支与换手率用 RangeIndex，若 zt_df 索引不连续会导致对齐 NaN
+        zt_df = zt_df.reset_index(drop=True)
 
         # 提取各维度原始值
         codes = zt_df["code"].astype(str).tolist()
@@ -204,7 +206,9 @@ class PostMarketAnalyzer:
         yidong_warning_lines = []
         if zt_df is not None and not zt_df.empty:
             index_3d_pct, index_10d_pct = cls._get_recent_index_pct()
-            for _, row in zt_df.head(10).iterrows():
+            # 按连板数降序取前 10，否则未排序的 head(10) 会漏掉最高板
+            zt_high = zt_df.sort_values(by="lbc", ascending=False) if "lbc" in zt_df.columns else zt_df
+            for _, row in zt_high.head(10).iterrows():
                 code = str(row.get("code", ""))
                 name = str(row.get("name", ""))
                 lbc = row.get("lbc", 1)
@@ -238,8 +242,13 @@ class PostMarketAnalyzer:
 
                 # ---- 3.1 多维度打分，区分核心标的与杂毛 ----
                 scored = cls._score_stocks(zt_df)
-                # 核心标的：前 15 名，其余为杂毛
-                core_threshold = sorted(scored.values(), reverse=True)[:15][-1] if len(scored) >= 15 else 0
+                # 核心标的：得分 Top15（并列按成交额/连板打破平局），精确限定 15 只，避免并列分导致数量失控
+                _core_df = zt_df.copy()
+                _core_df["_score"] = _core_df["code"].astype(str).map(scored).fillna(0)
+                _core_df = _core_df.sort_values(
+                    by=["_score", "amount", "lbc"], ascending=[False, False, False]
+                )
+                core_codes = set(_core_df.head(15)["code"].astype(str))
 
                 # ---- 3.2 连板梯队：全量输出，标记得分 ----
                 zt_sorted = zt_df.copy()
@@ -253,7 +262,7 @@ class PostMarketAnalyzer:
                         code = str(zrow.get("code", ""))
                         name = str(zrow.get("name", ""))
                         s = scored.get(code, 0)
-                        star = "⭐" if s >= core_threshold else "  "
+                        star = "⭐" if code in core_codes else "  "
                         amt = float(zrow.get("amount", 0)) / 1e8
                         turnover = float(zrow.get("turnover_rate", 0))
                         seal = float(zrow.get("seal_amount", 0)) / 1e8
@@ -277,7 +286,7 @@ class PostMarketAnalyzer:
                     name = str(zrow.get("name", ""))
                     lbc = int(zrow.get("lbc", 1))
                     s = scored.get(code, 0)
-                    is_core = s >= core_threshold
+                    is_core = code in core_codes
 
                     if is_core:
                         try:

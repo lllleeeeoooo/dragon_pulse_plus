@@ -1,6 +1,7 @@
 import time
 import datetime
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 import pandas as pd
 
@@ -8,12 +9,16 @@ from config.settings import settings
 from data.fetcher import DataFetcher
 from core.strategies import StrategyAnalyzer, MarketStyle
 from core.holding_monitor import HoldingMonitor
-from core.trade_calendar import is_trading_day
+from core.trade_calendar import is_trading_day, get_previous_trading_day
 from llm.sell_advisor import DynamicSellAdvisor
 from notifier.bark import bark_notifier
 from database.services import HoldingManager, RecommendationManager
 
 logger = logging.getLogger(__name__)
+
+# LLM 异动润色后台线程池：LLM 调用(拉分时+生成)可能耗时数十秒，
+# 放在后台线程执行，避免阻塞 15 秒盘中轮询导致卖出/炸板监控停摆。
+_llm_alert_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm-alert")
 
 # 全局变量（global 语句写入此模块命名空间，dashboard 直接从此读取）
 _current_market_style_global: Dict[str, str] = {}
@@ -98,7 +103,8 @@ class _MonitorCoreMixin:
             _index_breaker_alerted = False
             self._promotion_rate_cache = None
             HoldingManager.reset_all_limit_up_flags()
-            RecommendationManager.expire_old_recommendations(before_date=today)
+            # 只过期"上一交易日之前"的推荐；昨日复盘生成的推荐(trade_date=上一交易日)今日仍有效
+            RecommendationManager.expire_old_recommendations(before_date=get_previous_trading_day())
             # 加载昨日情绪周期阶段
             self._load_cycle_phase()
             logger.info(f"新交易日 {today}，去重状态已重置")
@@ -129,15 +135,8 @@ class _MonitorCoreMixin:
         zt_df = self._zt_pool_cache
         zhaban_df = self._zhaban_pool_cache
         zt_count = len(zt_df) if zt_df is not None and not zt_df.empty else 0
-        zhaban_count_raw = len(zhaban_df) if zhaban_df is not None and not zhaban_df.empty else 0
-        # 真炸板 = 在炸板池但不在涨停池（扣掉回封的）
-        if zt_df is not None and not zt_df.empty and "code" in zt_df.columns and \
-           zhaban_df is not None and not zhaban_df.empty and "code" in zhaban_df.columns:
-            zt_codes = set(zt_df["code"].astype(str))
-            zhaban_codes = set(zhaban_df["code"].astype(str))
-            zhaban_count = len(zhaban_codes - zt_codes)
-        else:
-            zhaban_count = zhaban_count_raw
+        # 真炸板 = 在炸板池但当前不在涨停池（口径与风格判定/炸板率一致）
+        zhaban_count = self._compute_true_zhaban_count(zt_df, zhaban_df)
 
         # --- 涨跌分布 ---
         up_count = 0
@@ -383,8 +382,10 @@ class _MonitorCoreMixin:
 
         # 3. 从数据库读取当前持仓与待观察推荐标的
         active_holdings = HoldingManager.get_active_holdings()
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
-        pending_recs = RecommendationManager.get_pending_recommendations(trade_date=today_str)
+        # 今日有效的推荐 = 上一交易日 18:01 复盘生成的（trade_date = 上一交易日）
+        pending_recs = RecommendationManager.get_pending_recommendations(
+            trade_date=get_previous_trading_day()
+        )
         pending_codes = {r["code"] for r in pending_recs}
 
         # 4. 扫描全市场抢筹信号（四种类型）
@@ -481,9 +482,11 @@ class _MonitorCoreMixin:
 
                 is_recommended = code in pending_codes
 
-                # 判断是否为一字板（无法买入）
+                # 判断是否为一字板（无法买入）——按板块区分涨停线（主板 10cm / 双创 20cm）
                 pre_close = float(row.get("pre_close", price))
-                is_one_word_board = (price >= pre_close * 1.095) and (float(row.get("low", price)) == price)
+                is_one_word_board = type(self)._is_limit_up(code, change_pct) and (
+                    float(row.get("low", price)) == price
+                )
 
                 # 推荐标的竞价条件验证：检查开盘涨幅是否满足 open_requirement
                 rec_condition_met = True
@@ -541,6 +544,9 @@ class _MonitorCoreMixin:
                             holding_type="AI_AUTO",
                             strategy=f"AI自动跟进({buy_reason})"
                         )
+                        # 复盘推荐被买入 → 推荐状态流转 TRIGGERED，形成胜率闭环
+                        if is_recommended and rec_info:
+                            RecommendationManager.mark_triggered(rec_info["id"])
                         bark_notifier.send(
                             title=f"🤖 [AI 自动买入] {name}({code})",
                             body=f"{buy_reason}标的 {name}({code}) 触发买入信号 (现价:{price}元, +{change_pct}%, 量比{vol_ratio}倍, 成交{amt_billion:.1f}亿)，已自动纳入 AI 持仓追踪！",
@@ -600,34 +606,37 @@ class _MonitorCoreMixin:
                 if row["_signal_amplitude"]:
                     detail += f", 振幅:{float(row['amplitude']):.1f}%"
 
-                # LLM润色：非观望风格且当日调用未超限时才调用，否则用规则化文案
-                llm_call_limit = 10
+                # LLM润色：非观望风格且当日调用未超限时才走 LLM。
+                # LLM 调用(拉分时+生成)可能耗时数十秒，放到后台线程执行，避免阻塞 15 秒轮询。
+                llm_call_limit = settings.MONITOR_LLM_ALERT_LIMIT
                 llm_calls_today = getattr(self, '_llm_alert_calls_today', 0)
+                alert_level = "timeSensitive" if is_recommended or row["_signal_near_limit"] else "active"
                 if market_style["style"] != "观望" and llm_calls_today < llm_call_limit:
-                    alert_msg = DynamicSellAdvisor.format_alert_message(
-                        trigger_type=trigger_title,
-                        stock_code=code,
-                        stock_name=name,
-                        current_price=price,
-                        change_pct=change_pct,
-                        volume_ratio=vol_ratio,
-                        strategy_tag=",".join(tags),
-                        detail_info=detail
-                    )
                     self._llm_alert_calls_today = llm_calls_today + 1
+                    self._submit_llm_alert(
+                        trigger_title=trigger_title,
+                        code=code,
+                        name=name,
+                        price=price,
+                        change_pct=change_pct,
+                        vol_ratio=vol_ratio,
+                        tags=tags,
+                        detail=detail,
+                        emoji=emoji,
+                        level=alert_level,
+                    )
                 else:
                     alert_msg = (
                         f"【{trigger_title}】{name}({code})\n"
                         f"现价:{price}元 (+{change_pct}%) {detail}\n"
                         f"标签:[{','.join(tags)}]"
                     )
-
-                bark_notifier.send(
-                    title=f"{emoji} {trigger_title} {name}({code}) +{change_pct}%",
-                    body=alert_msg,
-                    group="盘中异动",
-                    level="timeSensitive" if is_recommended or row["_signal_near_limit"] else "active"
-                )
+                    bark_notifier.send(
+                        title=f"{emoji} {trigger_title} {name}({code}) +{change_pct}%",
+                        body=alert_msg,
+                        group="盘中异动",
+                        level=alert_level
+                    )
                 self._alerted_burst_codes.add(code)
                 burst_codes_for_fund.append(code)
 
@@ -696,6 +705,7 @@ class _MonitorCoreMixin:
                             level="timeSensitive"
                         )
 
+        price_updates = []  # (code, price, holding_type)，循环内收集、循环后一次性批量写库
         for holding in active_holdings:
             code = holding["code"]
             stock_data = spot_df[spot_df["code"] == code]
@@ -705,12 +715,12 @@ class _MonitorCoreMixin:
                 curr_change_pct = float(row["change_pct"])
                 is_zt = type(self)._is_limit_up(code, curr_change_pct)
 
-                # 实时计算并更新持仓最新价格与收益率 (%)
-                HoldingManager.update_holding_profit_rate(code, curr_price)
+                # 实时更新持仓最新价格与收益率 —— 先收集到列表，循环后一次性批量写库
+                price_updates.append((code, curr_price, holding.get("holding_type")))
 
-                # 如果盘中封过涨停，更新数据库状态
+                # 如果盘中封过涨停，更新数据库状态（按 holding_type 定位，避免同 code 多持仓误更新）
                 if is_zt and not holding.get("was_limit_up_today", False):
-                    HoldingManager.update_was_limit_up(code, True)
+                    HoldingManager.update_was_limit_up(code, True, holding_type=holding.get("holding_type"))
                     holding["was_limit_up_today"] = True  # 本地同步，避免重复调用
 
                 # 获取真实的 MA5 均线价格
@@ -795,4 +805,33 @@ class _MonitorCoreMixin:
                             level="timeSensitive"
                         )
 
+        # 批量写库：一次 session 更新所有持仓价格与收益率（避免每 15 秒逐只开 session）
+        if price_updates:
+            HoldingManager.batch_update_profit_rates(price_updates)
 
+
+    def _submit_llm_alert(self, *, trigger_title: str, code: str, name: str,
+                          price: float, change_pct: float, vol_ratio: float,
+                          tags: list, detail: str, emoji: str, level: str):
+        """后台线程执行 LLM 润色 + Bark 推送，避免同步 LLM 阻塞盘中轮询主循环"""
+        def _task():
+            try:
+                alert_msg = DynamicSellAdvisor.format_alert_message(
+                    trigger_type=trigger_title,
+                    stock_code=code,
+                    stock_name=name,
+                    current_price=price,
+                    change_pct=change_pct,
+                    volume_ratio=vol_ratio,
+                    strategy_tag=",".join(tags),
+                    detail_info=detail
+                )
+                bark_notifier.send(
+                    title=f"{emoji} {trigger_title} {name}({code}) +{change_pct}%",
+                    body=alert_msg,
+                    group="盘中异动",
+                    level=level
+                )
+            except Exception as e:
+                logger.warning(f"LLM 异动推送后台任务异常 ({name}({code})): {e}")
+        _llm_alert_executor.submit(_task)

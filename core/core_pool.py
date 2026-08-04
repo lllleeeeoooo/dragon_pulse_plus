@@ -34,6 +34,20 @@ class ActiveCorePool:
             logger.warning(f"Beta calculation failed: {e}")
             return 0.0
 
+    @staticmethod
+    def _get_market_index_series() -> Optional[pd.Series]:
+        """获取上证指数近30日收盘序列作为市场代理（Beta 过滤的市场基准），失败返回 None（不启用过滤）"""
+        try:
+            import akshare as ak
+            df = ak.stock_zh_index_daily(symbol="sh000001")
+            if df is not None and not df.empty:
+                closes = pd.to_numeric(df["close"], errors="coerce").dropna().tail(30)
+                if len(closes) >= 5:
+                    return closes.reset_index(drop=True)
+        except Exception as e:
+            logger.warning(f"获取上证指数序列失败: {e}")
+        return None
+
     @classmethod
     def filter_core_leaders(
         cls,
@@ -73,12 +87,20 @@ class ActiveCorePool:
             )
         ]
 
+        # 未显式传入板块指数时，用上证指数近30日收盘作为市场代理（Beta 过滤的市场基准）
+        if board_index_series is None:
+            board_index_series = cls._get_market_index_series()
+
         results = []
         for _, row in core_candidates.iterrows():
             beta = None
             if board_index_series is not None:
                 hist_prices = row.get("history_prices")
-                if hist_prices is not None:
+                if hist_prices is None:
+                    # 真实实现：拉取个股近30日收盘价，计算与市场指数的相关性
+                    from data.fetcher import DataFetcher
+                    hist_prices = DataFetcher.get_stock_daily_closes(str(row.get("code")))
+                if hist_prices:
                     beta = cls.calculate_beta(pd.Series(hist_prices), board_index_series)
 
             if beta is not None and beta < settings.CORE_POOL_MIN_BETA:

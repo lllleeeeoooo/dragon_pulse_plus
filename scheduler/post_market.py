@@ -113,7 +113,11 @@ def job_post_market():
                 precomputed_emotion=emotion_res
             )
         except Exception as e:
-            logger.warning(f"LLM 复盘生成失败: {e}，使用定量数据兜底")
+            logger.warning(f"LLM 复盘生成异常: {e}")
+
+        if not review_report:
+            # llm_client.generate 在全部重试与备用模型失败后返回空串而非抛异常，需显式兜底
+            logger.warning("LLM 复盘内容为空，使用定量数据兜底")
             review_report = (
                 f"⚠️ LLM 服务不可用，以下为定量数据摘要：\n\n"
                 f"风格判定: {cycle_stage} | {style_reason}\n"

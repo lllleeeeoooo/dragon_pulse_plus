@@ -2,18 +2,15 @@ import os
 
 # ---------------------------------------------------------------------------
 # 必须在任何项目模块导入之前设置 DB_PATH 环境变量。
-# 注意：如果其他测试文件先于本文件导入了 database 模块（字母序），
-# 生产库会被触碰。确保本文件是唯一导入 database 的测试文件。
-# ---------------------------------------------------------------------------
-# DatabaseManager 单例在 database/services.py 导入时实例化，
-# __init__ 优先读取 os.environ["DB_PATH"] > settings.DB_PATH。
-# 若不在这里设置，test_core.py（字母序先加载）触发 settings 创建时
-# 会缓存生产路径，导致 DatabaseManager 初始化时落到生产库。
+# 但注意：unittest 按字母序执行，test_core.py 可能先于本文件触发 database 包导入，
+# 此时 DB_PATH 尚未设置、db_manager 单例已按生产库初始化。
+# 因此真正的保险在 setUpClass 里显式 switch_to_test_db() 重新指向测试库，
+# 否则 Base.metadata.drop_all() 会清空生产库。此处设置环境变量仅作第一道保险。
 # ---------------------------------------------------------------------------
 os.environ["DB_PATH"] = "dragon_pulse_test.db"
 
 import unittest
-from database.services import HoldingManager, RecommendationManager, SentimentManager, db_manager
+from database.services import HoldingManager, RecommendationManager, SentimentManager, db_manager, switch_to_test_db
 from database.models import Holding, Recommendation, DailySentiment, Base
 from config.settings import settings
 
@@ -28,9 +25,10 @@ class TestDatabaseServices(unittest.TestCase):
     def setUpClass(cls):
         """
         确保测试数据库处于干净状态。
-        注意：db_manager 已在导入时通过 os.environ["DB_PATH"] 初始化到测试库，
-        此处仅重建表结构确保无残留。
+        必须先 switch_to_test_db()：其他测试文件可能在字母序上先导入 database 包，
+        使 db_manager 单例绑定生产库；这里显式重指向测试库后 drop_all 才安全。
         """
+        switch_to_test_db()
         Base.metadata.drop_all(bind=db_manager.engine)
         Base.metadata.create_all(bind=db_manager.engine)
 

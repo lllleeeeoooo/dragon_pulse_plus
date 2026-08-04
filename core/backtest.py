@@ -57,8 +57,14 @@ class AIBacktestEngine:
         if max_daily_buys is None:
             max_daily_buys = settings.MAX_DAILY_BUYS
 
-        dates = pd.date_range(start=start_date, end=end_date, freq="B")
-        date_list = [d.strftime("%Y%m%d") for d in dates]
+        # 用 A 股交易日历而非工作日(freq="B")，否则长假会把非交易日计入持仓天数/净值
+        date_list = AIBacktestEngine._build_trade_date_list(start_date, end_date)
+        if not date_list:
+            return {
+                "total_trades": 0,
+                "message": f"回测区间 {start_date}~{end_date} 无交易日（日历获取失败或区间为空）",
+                "trading_days": 0,
+            }
 
         positions: List[Dict[str, Any]] = []   # 当前持仓
         closed_trades: List[Dict[str, Any]] = []  # 已平仓交易
@@ -120,12 +126,14 @@ class AIBacktestEngine:
             last_date = date_list[-1]
             last_data = AIBacktestEngine._get_day_data(last_date, date_list, len(date_list) - 1, positions)
             for pos in positions:
-                sell_price = AIBacktestEngine._get_close_from_data(
+                close_px = AIBacktestEngine._get_close_from_data(
                     pos["code"], last_date, last_data
                 )
-                if sell_price is None:
+                if close_px is None:
                     sell_price = pos["cost_price"]
-                ret = AIBacktestEngine._calc_return(pos["cost_price"], sell_price, slippage)
+                else:
+                    sell_price = close_px * (1 - slippage / 100)  # 与常规卖出一致，只扣一次卖滑点
+                ret = AIBacktestEngine._calc_return(pos["cost_price"], sell_price)
                 closed_trades.append({
                     "code": pos["code"],
                     "name": pos["name"],
@@ -147,6 +155,23 @@ class AIBacktestEngine:
             start_date, end_date, max_positions, max_daily_buys,
             circuit_breaker_triggered_dates,
         )
+
+    @staticmethod
+    def _build_trade_date_list(start_date: str, end_date: str) -> List[str]:
+        """构建回测区间内的 A 股交易日列表（akshare 交易日历，失败回退工作日）"""
+        import datetime
+        try:
+            import akshare as ak
+            cal = ak.tool_trade_date_hist_sina()
+            if cal is not None and not cal.empty:
+                d0 = datetime.datetime.strptime(start_date, "%Y%m%d").date()
+                d1 = datetime.datetime.strptime(end_date, "%Y%m%d").date()
+                days = [d.date() for d in pd.to_datetime(cal["trade_date"]) if d0 <= d.date() <= d1]
+                if days:
+                    return [d.strftime("%Y%m%d") for d in days]
+        except Exception as e:
+            logger.warning(f"获取交易日历失败，回退到工作日: {e}")
+        return [d.strftime("%Y%m%d") for d in pd.date_range(start=start_date, end=end_date, freq="B")]
 
     # ------------------------------------------------------------------
     # 卖出逻辑
@@ -195,7 +220,7 @@ class AIBacktestEngine:
 
             if sell_reason:
                 sell_price = close_price * (1 - slippage / 100)
-                ret = AIBacktestEngine._calc_return(pos["cost_price"], sell_price, slippage)
+                ret = AIBacktestEngine._calc_return(pos["cost_price"], sell_price)
                 closed.append({
                     "code": code,
                     "name": pos["name"],
@@ -470,11 +495,15 @@ class AIBacktestEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _calc_return(buy_price: float, sell_price: float, slippage: float) -> float:
-        """计算扣除双向滑点后的收益率 (%)"""
-        buy_cost = buy_price * (1 + slippage / 100)
-        sell_revenue = sell_price * (1 - slippage / 100)
-        return round((sell_revenue - buy_cost) / buy_cost * 100, 2)
+    def _calc_return(buy_price: float, sell_price: float) -> float:
+        """
+        计算收益率 (%)。
+        buy_price 传入的是已含买滑点的成本价，sell_price 传入的是已含卖滑点的卖出价，
+        因此这里直接按实际现金口径计算，不再重复应用滑点。
+        """
+        if buy_price <= 0:
+            return 0.0
+        return round((sell_price - buy_price) / buy_price * 100, 2)
 
     # ------------------------------------------------------------------
     # 汇总统计

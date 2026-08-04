@@ -15,7 +15,7 @@ from database import HoldingManager, MarketIndexManager, DailySnapshotManager
 def _push_daily_pnl_report(trade_date: str, spot_df=None):
     """盘后每日盈亏推送：同步收盘价 + 生成盈亏报告 + Bark 推送。"""
 
-    # 1. 用今日收盘价同步持仓
+    # 1. 用今日收盘价刷新持仓当前价（保留 prev_close 昨收基准，供"今日涨跌"计算）
     spot_map = {}
     if spot_df is not None and not spot_df.empty:
         for _, row in spot_df.iterrows():
@@ -23,10 +23,14 @@ def _push_daily_pnl_report(trade_date: str, spot_df=None):
             price = float(row.get("price", 0))
             if code and price > 0:
                 spot_map[code] = price
+    HoldingManager.update_current_prices(spot_map)
+
+    # 2. 生成报告（今日涨跌 = 今日收盘价 - 昨收；必须先于滚存昨收，否则恒≈0）
+    report = HoldingManager.get_daily_pnl_report()
+
+    # 3. 报告完成后，将今日收盘价滚存为 prev_close（供次日"今日涨跌"基准）
     HoldingManager.sync_close_prices(spot_map)
 
-    # 2. 生成报告
-    report = HoldingManager.get_daily_pnl_report()
     if "error" in report:
         logger.warning(f"每日盈亏报告生成失败: {report['error']}")
         return

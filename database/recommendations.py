@@ -15,6 +15,13 @@ class RecommendationManager:
         session = db_manager.get_session()
         try:
             for item in items:
+                # 幂等：同日期同代码已存在则跳过，避免复盘任务重复执行插入重复 PENDING
+                existing = session.query(Recommendation).filter(
+                    Recommendation.trade_date == trade_date,
+                    Recommendation.code == item.get("code"),
+                ).first()
+                if existing:
+                    continue
                 rec = Recommendation(
                     trade_date=trade_date,
                     code=item.get("code"),
@@ -76,5 +83,22 @@ class RecommendationManager:
         except Exception as e:
             session.rollback()
             logger.warning(f"过期旧推荐失败: {e}")
+        finally:
+            session.close()
+
+    @staticmethod
+    def mark_triggered(rec_id: int):
+        """将推荐标的标记为 TRIGGERED（已买入），用于推荐胜率闭环统计"""
+        session = db_manager.get_session()
+        try:
+            rec = session.query(Recommendation).filter(
+                Recommendation.id == rec_id
+            ).first()
+            if rec:
+                rec.status = "TRIGGERED"
+                session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"标记推荐 TRIGGERED 失败: {e}")
         finally:
             session.close()

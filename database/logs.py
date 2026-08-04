@@ -4,6 +4,12 @@ from database.models import PushLog, LLMLog, ErrorLog, SystemLog
 from database.connection import db_manager
 logger = logging.getLogger(__name__)
 
+# 错误日志落库失败时使用的兜底 logger：propagate=False，避免再次进入 DatabaseLogHandler 造成递归
+_db_fallback = logging.getLogger("database.logs.db_fallback")
+_db_fallback.propagate = False
+if not _db_fallback.handlers:
+    _db_fallback.addHandler(logging.StreamHandler())
+
 class PushLogManager:
     """
     推送通知日志数据库管理服务
@@ -162,8 +168,10 @@ class ErrorLogManager:
             )
             session.add(log)
             session.commit()
-        except Exception:
+        except Exception as e:
             session.rollback()
+            # 错误日志自身的落库失败也需可追溯（stderr 兜底，propagate=False 防递归）
+            _db_fallback.error("ErrorLog 落库失败: %s", e)
         finally:
             session.close()
 

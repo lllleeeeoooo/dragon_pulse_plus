@@ -35,12 +35,12 @@ class CallAuctionAnalyzer:
         auction_data_text = "竞价数据为空"
         if auction_df is not None and not auction_df.empty:
             try:
-                records = auction_df.head(15).to_dict(orient="records")
+                # 竞价阶段重点关注高开强度靠前的标的，否则 Top15 基本是无关个股
+                df_sorted = auction_df.sort_values(by="change_pct", ascending=False).head(15)
+                records = df_sorted.to_dict(orient="records")
                 lines = []
                 for r in records:
                     amt_wan = round(float(r.get("amount", 0)) / 1e4, 2)
-                    # 假定昨日全天成交额估算，帮 AI 计算出竞价量能占全天的百分比
-                    pct_str = ""
                     lines.append(
                         f"- {r.get('name')}({r.get('code')}): 竞价开盘价 {r.get('price')}元, 竞价涨幅 {r.get('change_pct')}%, 竞价金额 {amt_wan}万"
                     )

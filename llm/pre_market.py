@@ -27,8 +27,11 @@ class PreMarketAnalyzer:
         news_items = NewsFetcher.get_cls_news(limit=15)
         hot_words = NewsFetcher.get_hot_search_words(limit=15)
 
-        # 格式化文本
-        news_text = "\n".join([f"- [{item['time']}] {item['title']}: {item['content'][:100]}..." for item in news_items]) if news_items else "暂无新闻快讯"
+        # 格式化文本（akshare 返回的 content/time/title 可能为 None，做防御避免 TypeErrors）
+        news_text = "\n".join([
+            f"- [{item.get('time') or ''}] {item.get('title') or ''}: {(item.get('content') or '')[:100]}..."
+            for item in news_items
+        ]) if news_items else "暂无新闻快讯"
         hot_search_text = ", ".join(hot_words) if hot_words else "暂无热搜榜单"
 
         # 2. 组装 Prompt

@@ -44,6 +44,7 @@ class SeatAnalyzer:
         detected_seats = []
         has_a_class = False
         has_b_class = False
+        a_class_net_total = 0.0  # 格局派(A类)席位净买入汇总（万元）
 
         for _, row in lhb_df.iterrows():
             seat_name = str(row.get("seat_name", ""))
@@ -62,6 +63,7 @@ class SeatAnalyzer:
                 if key in seat_name:
                     if "A类" in info["type"]:
                         has_a_class = True
+                        a_class_net_total += net_amt
                     elif "B类" in info["type"]:
                         has_b_class = True
 
@@ -76,8 +78,13 @@ class SeatAnalyzer:
 
         # 生成“神韵”结论
         if has_a_class and not has_b_class:
-            summary = "龙虎榜出现顶级【格局派】游资锁仓，主强买入，主力锁仓意愿极强，属于‘强共识’，明日溢价/高开概率大。"
-            risk = "低"
+            if a_class_net_total < 0:
+                # 顶级格局派席位当日净卖出 → 出货迹象，不再是"强共识"
+                summary = "龙虎榜顶级【格局派】游资席位今日净卖出（出货迹象），主力兑现意愿强，明日谨防高开回落、溢价压缩。"
+                risk = "中"
+            else:
+                summary = "龙虎榜出现顶级【格局派】游资锁仓，主强买入，主力锁仓意愿极强，属于‘强共识’，明日溢价/高开概率大。"
+                risk = "低"
         elif has_b_class and not has_a_class:
             summary = "龙虎榜大量出现【拉萨散户天团/量化砸盘派】，筹码结构极其松动，主力缺乏格局，明日注意低开砸盘风险。"
             risk = "高"
