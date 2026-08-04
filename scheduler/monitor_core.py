@@ -790,6 +790,7 @@ class _MonitorCoreMixin:
 
     def _monitor_holdings(self, spot_df, active_holdings, market_max_lbc, market_zhaban_rate):
         """第7步：持仓卖出/止损信号监控 + 批量更新收益率（从 _check_realtime_market 拆出）"""
+        today = datetime.datetime.now().strftime("%Y-%m-%d")  # A股 T+1：当日买入不可当日卖
         # 7. 从数据库持仓表监控卖出/止损条件
         # 7.0 先处理跌停锁定中已破板的股票
         for code in list(self._pending_sell_codes):
@@ -802,6 +803,10 @@ class _MonitorCoreMixin:
                     hold_match = [h for h in active_holdings if h["code"] == code]
                     if hold_match:
                         h = hold_match[0]
+                        if h.get("buy_date") == today:
+                            # T+1：当日买入即使破板也不能当日卖，等次日再处理
+                            self._pending_sell_codes.discard(code)
+                            continue
                         sell_px = float(row["price"])
                         if h.get("holding_type") == "AI_AUTO":
                             sell_px = round(sell_px * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)  # AI卖出模拟滑点
@@ -831,6 +836,10 @@ class _MonitorCoreMixin:
                 if is_zt and not holding.get("was_limit_up_today", False):
                     HoldingManager.update_was_limit_up(code, True, holding_type=holding.get("holding_type"))
                     holding["was_limit_up_today"] = True  # 本地同步，避免重复调用
+
+                # A股 T+1：当日买入的持仓当日不可卖出，跳过卖出信号检查（价格更新照常进行）
+                if holding.get("buy_date") == today:
+                    continue
 
                 # 获取真实的 MA5 均线价格
                 ma_data = self._get_ma_prices(code)
