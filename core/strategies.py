@@ -95,15 +95,28 @@ class MarketStyle:
             }
 
         # ═══════════════════════════════════════════
-        # 优先级 2：高潮（板块共振）
-        # 涨停多时放宽炸板率容忍度：涨停>60则上限=35%，涨停>80则上限=45%
+        # 优先级 2：一致性过强 → 高潮（顶部风险，优先于共振）
+        # 涨停超打板上限 + 高标 + 情绪热 → 明日必分歧，高位减仓
         # ═══════════════════════════════════════════
+        if height >= 5 and zt_count > zt_daban_max and sentiment_index >= 70:
+            return {
+                "style": "高潮",
+                "reason": f"最高{height}板+涨停{zt_count}家（超上限{zt_daban_max}）且情绪{sentiment_index}分，市场过于一致，明日必分歧。高位减仓，等分歧后做弱转强。",
+                "priority_strategy": "观望/跟随",
+                "capacity_factor": round(k, 2),
+            }
+
+        # ═══════════════════════════════════════════
+        # 优先级 3：高潮（板块共振）
+        # 涨停多时放宽炸板率容忍度；基础值随 K 缩放（放量/缩量一致生效）
+        # ═══════════════════════════════════════════
+        base_zb = zb_resonance_max  # 25/sqrt(K)，随容量因子缩放
         if zt_count >= 80:
-            zb_limit = 45  # 百股涨停，炸板率上限放宽到45%
+            zb_limit = base_zb * 1.8   # 百股涨停 → 约1.8倍（K=1时=45）
         elif zt_count >= 60:
-            zb_limit = 35
+            zb_limit = base_zb * 1.4   # 涨停>60 → 约1.4倍（K=1时=35）
         else:
-            zb_limit = zb_resonance_max
+            zb_limit = base_zb
         if sentiment_index >= 55 and zhaban_rate < zb_limit and zt_count >= zt_dip_min:
             return {
                 "style": "共振",
@@ -153,16 +166,9 @@ class MarketStyle:
                 "capacity_factor": round(k, 2),
             }
 
-        # 高标+涨停超上限 → 一致性过强，明日分歧概率大
+        # 高标+涨停超上限但情绪未过热（≥70 已在前置的高潮分支处理）→ 谨慎接力或观望
         if height >= 5 and zt_count > zt_daban_max:
-            if sentiment_index >= 70:
-                return {
-                    "style": "高潮",
-                    "reason": f"最高{height}板+涨停{zt_count}家+情绪{sentiment_index}分，市场过于一致，明日必分歧。高位减仓，等分歧后做弱转强。",
-                    "priority_strategy": "观望/跟随",
-                    "capacity_factor": round(k, 2),
-                }
-            elif sentiment_index >= 40:
+            if sentiment_index >= 40:
                 return {
                     "style": "打板",
                     "reason": f"最高{height}板+涨停{zt_count}家（超区间上限{zt_daban_max}），情绪{sentiment_index}分，谨慎接力",

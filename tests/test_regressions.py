@@ -186,6 +186,18 @@ class TestPureRegressions(unittest.TestCase):
         self.assertEqual(EmotionVector._score_premium(0), 50)
         self.assertEqual(EmotionVector._score_breadth(0), 40)
 
+    def test_style_extreme_hot_is_gaochao(self):
+        """涨停超打板上限+高标+情绪热 → 高潮，优先于共振（修复共振遮住高潮）"""
+        from core.strategies import MarketStyle
+        # 127 涨停 + 7 板 + 94 情绪 → 高潮(顶部风险)，不再是"共振/全力进攻"
+        r = MarketStyle.classify({"height": 7, "zt_count": 127, "dt_count": 0,
+                                  "zhaban_rate": 3.79, "sentiment_index": 94, "yield_rate": 4.16})
+        self.assertEqual(r["style"], "高潮")
+        # 正常 50 涨停 5 板 60 情绪 → 共振，不误判高潮
+        r2 = MarketStyle.classify({"height": 5, "zt_count": 50, "dt_count": 0,
+                                   "zhaban_rate": 10, "sentiment_index": 60, "yield_rate": 2})
+        self.assertEqual(r2["style"], "共振")
+
     def test_market_style_classify(self):
         """市场风格分类：抱团/共振/打板 三档命中"""
         from core.strategies import MarketStyle
