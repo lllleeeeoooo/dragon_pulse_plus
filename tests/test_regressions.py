@@ -228,6 +228,26 @@ class TestPureRegressions(unittest.TestCase):
                 predicted_sectors_summary="", auction_prediction="")
             self.assertEqual(result, "竞价指令")
 
+    def test_sell_advisor_format_alert(self):
+        """盘中异动润色：LLM 成功返回润色文本；失败降级为规则化文案"""
+        from llm.sell_advisor import DynamicSellAdvisor
+        with patch.object(DynamicSellAdvisor, "_fetch_intraday", return_value="分时数据"), \
+             patch("llm.sell_advisor.llm_client.generate", return_value="润色后的提醒"):
+            msg = DynamicSellAdvisor.format_alert_message(
+                trigger_type="[点火异动]", stock_code="600001", stock_name="测试",
+                current_price=10.0, change_pct=5.0, volume_ratio=3.0,
+                strategy_tag="打板", detail_info="量比3倍")
+            self.assertEqual(msg, "润色后的提醒")
+        # LLM 失败 → 规则化文案兜底（包含代码与触发类型）
+        with patch.object(DynamicSellAdvisor, "_fetch_intraday", return_value="分时数据"), \
+             patch("llm.sell_advisor.llm_client.generate", side_effect=Exception("llm down")):
+            msg2 = DynamicSellAdvisor.format_alert_message(
+                trigger_type="[点火异动]", stock_code="600001", stock_name="测试",
+                current_price=10.0, change_pct=5.0, volume_ratio=3.0,
+                strategy_tag="打板", detail_info="量比3倍")
+            self.assertIn("600001", msg2)
+            self.assertIn("点火异动", msg2)
+
     def test_call_auction_includes_target_auction_data(self):
         """竞价分析：推荐标的 + 昨涨停的真实竞价数据必须进 prompt（修复"未提供具体竞价数据"）"""
         from llm.call_auction import CallAuctionAnalyzer

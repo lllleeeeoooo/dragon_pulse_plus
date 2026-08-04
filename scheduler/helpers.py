@@ -44,8 +44,9 @@ def _record_job_run(job_id: str, job_name: str):
             title=job_name,
             detail=f"{now.strftime('%H:%M:%S')}|{job_id}"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        # 任务状态落库失败也要可追溯（否则看板"今日是否执行"会误显示未执行）
+        logger.warning(f"任务执行记录失败 ({job_name}/{job_id}): {e}")
 
 
 def _get_job_status() -> List[Dict[str, Any]]:

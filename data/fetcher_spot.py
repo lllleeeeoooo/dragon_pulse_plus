@@ -295,6 +295,17 @@ class _SpotMixin:
             "ltsz": "circ_market_cap", "zsz": "total_market_cap",
             "pe_ttm": "pe_ttm",
         })
+        # 腾讯返回的字段多为字符串（涨跌幅/量比等可能带 % 后缀），统一转数值，否则下游运算会崩
+        for col in ["price", "change_pct", "change_amount", "amplitude", "turnover_rate",
+                    "volume_ratio", "volume", "amount", "circ_market_cap", "total_market_cap", "pe_ttm"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.replace("%", "", regex=False), errors="coerce")
+        # 单位统一（实测验证）：腾讯 成交量=手(×100→股)、成交额=万元(×1e4→元)，与新浪/东财口径一致
+        if "volume" in df.columns:
+            df["volume"] = df["volume"] * 100
+        if "amount" in df.columns:
+            df["amount"] = df["amount"] * 1e4
         # 腾讯 code 带前缀 (sh600519 / sz000001 / bj920000),去掉前缀
         if "code" in df.columns:
             df["code"] = df["code"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
