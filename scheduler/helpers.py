@@ -212,60 +212,100 @@ def _parse_and_save_recommendations(trade_date: str, report_text: str):
 
 
 
-def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame = None):
+def _evaluate_yesterday_recommendations(trade_date: str, spot_df: pd.DataFrame = None,
+                                        zt_df: pd.DataFrame = None):
     """
-    LLM 复盘打分：让 LLM 评估昨日推荐标的今日的实际表现，形成闭环反馈。
-    评分存入 recommendations 表的 sell_condition 字段（复用为评分备注）。
+    LLM 复盘打分（断链8修复）：让 LLM 评估昨日推荐标的今日的实际表现，形成闭环反馈。
+    - 逐标的评估：单次 LLM 调用要求输出结构化 JSON {"evaluations":[{code,score,comment}]}，
+      按 code 写入各记录的 eval_note/eval_score（不再整段文本写所有记录）。
+    - spot 为空不跳过：用今日涨停池兜底，保证每只推荐都有评估记录，避免"未经评估就过期"。
+    - 无结构化 JSON 时退化为整段文本写 eval_note（兜底不丢数据）。
     """
     yesterday = get_previous_trading_day(
         datetime.datetime.strptime(trade_date, "%Y%m%d").date()
     )
     # 含已买入(TRIGGERED)/已过期(EXPIRED)——胜率复盘必须把实际买入的也算进去
     pending = RecommendationManager.get_recommendations_by_date(yesterday)
-    if not pending or spot_df is None or spot_df.empty:
+    if not pending:
         return
 
-    # 拼昨日推荐 + 今日表现的评估 Prompt
-    lines = ["评估昨日推荐标的今日表现："]
+    # ---- 构建 每只推荐 今日表现（spot 优先，涨停池兜底）----
+    perf: Dict[str, str] = {}
+    spot_ok = spot_df is not None and not spot_df.empty
+    if spot_ok:
+        for r in pending:
+            m = spot_df[spot_df["code"].astype(str) == str(r["code"])]
+            if not m.empty:
+                row = m.iloc[0]
+                perf[r["code"]] = (f"今日涨幅 {row.get('change_pct', 0)}%, "
+                                   f"现价 {row.get('price', 0)}元")
+            else:
+                perf[r["code"]] = "未获取到当日行情"
+    else:
+        # spot 为空 → 用今日涨停池兜底（至少知道哪些涨停），不跳过整体评估
+        try:
+            today_zt = zt_df if (zt_df is not None and not zt_df.empty) \
+                else DataFetcher.get_zt_pool(date_str=trade_date)
+            zt_codes = set(today_zt["code"].astype(str)) if today_zt is not None and not today_zt.empty else set()
+        except Exception:
+            zt_codes = set()
+        for r in pending:
+            perf[r["code"]] = "今日涨停" if str(r["code"]) in zt_codes else "未获取到完整行情(spot为空)"
+
+    # ---- 单次 LLM 结构化逐票评估 ----
+    lines = ["逐只评估昨日推荐标的今日表现，并给出胜率评分与一句话点评。"]
     for r in pending:
-        code = r["code"]
-        match = spot_df[spot_df["code"].astype(str) == str(code)]
-        if not match.empty:
-            row = match.iloc[0]
-            lines.append(
-                f"- {r['name']}({code}) [{r['strategy_type']}]: "
-                f"今日涨幅 {row.get('change_pct', 0)}%, 现价 {row.get('price', 0)}元"
-            )
-        else:
-            lines.append(f"- {r['name']}({code}) [{r['strategy_type']}]: 未找到今日数据")
+        lines.append(f"- {r['name']}({r['code']}) [{r['strategy_type']}]: {perf.get(r['code'], '')}")
     eval_text = "\n".join(lines)
 
+    score_prompt = (
+        "你是短线交易复盘专家。对昨日推荐的每只标的，基于今日表现给出胜率评分(0-100，越高越准)与一句话点评(≤30字)。\n"
+        "必须只输出 JSON，不要其他文字，格式：\n"
+        '{"evaluations": [{"code": "001208", "score": 80, "comment": "点评"}]}\n'
+        "逐只覆盖全部推荐标的，不得遗漏。"
+    )
     try:
-        score_prompt = "你是短线交易复盘专家。请用一句话评估昨日推荐标的今天的表现（不超过50字），并给出胜率评分（0-100）。"
         evaluation = llm_client.generate(
             system_prompt=score_prompt,
             user_prompt=eval_text,
             module="recommendation_eval"
         )
-        logger.info(f"昨日推荐复盘评估: {evaluation}")
-        # 落库：评估写回各推荐记录的 eval_note，形成"推荐→买入→复盘打分"闭环
-        if evaluation and pending:
-            session = db_manager.get_session()
-            try:
-                for rec in pending:
-                    row = session.query(Recommendation).filter(
-                        Recommendation.id == rec["id"]
-                    ).first()
-                    if row:
-                        row.eval_note = evaluation[:500]
-                session.commit()
-            except Exception as e2:
-                session.rollback()
-                logger.warning(f"推荐评估落库失败: {e2}")
-            finally:
-                session.close()
+        logger.info(f"昨日推荐复盘评估: {str(evaluation)[:200]}")
     except Exception as e:
         logger.warning(f"LLM 复盘打分失败: {e}")
+        evaluation = ""
+
+    # ---- 落库：逐标的写 eval_note/eval_score；无结构化则整段兜底 ----
+    session = db_manager.get_session()
+    try:
+        evals: Dict[str, dict] = {}
+        data = extract_json_block(evaluation) if evaluation else {}
+        if data and data.get("evaluations"):
+            for e in data["evaluations"]:
+                code = str(e.get("code", "")).strip()
+                if code:
+                    evals[code] = e
+        for rec in pending:
+            row = session.query(Recommendation).filter(
+                Recommendation.id == rec["id"]).first()
+            if not row:
+                continue
+            e = evals.get(str(rec["code"]))
+            if e:
+                row.eval_note = str(e.get("comment", ""))[:500]
+                try:
+                    row.eval_score = int(e.get("score"))
+                except (TypeError, ValueError):
+                    pass
+            else:
+                row.eval_note = (evaluation or "评估失败")[:500]  # 兜底
+        session.commit()
+        logger.info(f"推荐评估落库完成: {len(pending)} 条")
+    except Exception as e2:
+        session.rollback()
+        logger.warning(f"推荐评估落库失败: {e2}")
+    finally:
+        session.close()
 
 
 

@@ -130,6 +130,20 @@ def job_call_auction():
         # ---- 4. 抓取实时竞价快照 ----
         spot_df = DataFetcher.get_realtime_spot()
 
+        # ---- 4.5 记录每只推荐标的的 09:26 竞价成交额（断链3：供盘中竞价量能校验）----
+        try:
+            auction_amounts = {}
+            for r in pending_recs:
+                code = str(r.get("code", ""))
+                m = spot_df[spot_df["code"].astype(str) == code] \
+                    if spot_df is not None and not spot_df.empty else None
+                if m is not None and not m.empty:
+                    auction_amounts[code] = float(m.iloc[0].get("amount", 0))
+            if auction_amounts:
+                RecommendationManager.save_auction_amounts(auction_amounts, yesterday_str)
+        except Exception as e:
+            logger.warning(f"保存竞价金额失败: {e}")
+
         # ---- 5. LLM 竞价观察指令 ----
         # 读取 09:25 规则引擎竞价预判作为 LLM 上下文
         from scheduler.monitor_auction import _auction_prediction_cache
@@ -154,7 +168,8 @@ def job_call_auction():
                 verdicts = _extract_verdicts_json(result)
                 if not verdicts:
                     verdicts = _classify_auction_verdicts(result, pending_recs)
-                RecommendationManager.update_auction_verdicts(verdicts)
+                # trade_date 限定昨日推荐，避免多日 PENDING 累积写错（断链7）
+                RecommendationManager.update_auction_verdicts(verdicts, yesterday_str)
                 logger.info(f"竞价结论落库: {verdicts}")
             except Exception as e:
                 logger.warning(f"竞价结论落库失败: {e}")

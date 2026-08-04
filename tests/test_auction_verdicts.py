@@ -93,6 +93,51 @@ class TestRecBuyCondition(unittest.TestCase):
             open_price=10.5, pre_close=10.0, change_pct=4.0)
         self.assertTrue(ok)
 
+    def test_竞价量能不足_非买入_否决(self):
+        """断链3：观察/无verdict 推荐需过竞价量能校验（auction_vol_ratio vs auction_amount）"""
+        ok = self.m._check_rec_buy_condition(
+            {"auction_verdict": "观察", "open_requirement": "高开 +1%~+4%",
+             "auction_vol_ratio": "竞价成交额≥1900万", "auction_amount": 10_000_000},  # 1000万 < 1900万
+            open_price=10.5, pre_close=10.0, change_pct=4.0)
+        self.assertFalse(ok)
+
+    def test_竞价量能达标_非买入_放行(self):
+        ok = self.m._check_rec_buy_condition(
+            {"auction_verdict": "观察", "open_requirement": "高开 +1%~+4%",
+             "auction_vol_ratio": "竞价成交额≥1900万", "auction_amount": 30_000_000},  # 3000万 ≥ 1900万
+            open_price=10.5, pre_close=10.0, change_pct=4.0)
+        self.assertTrue(ok)
+
+    def test_买入verdict跳过量能校验(self):
+        """信任竞价 LLM 前提自证，量能不重复卡"""
+        ok = self.m._check_rec_buy_condition(
+            {"auction_verdict": "买入", "auction_vol_ratio": "竞价成交额≥1900万",
+             "auction_amount": 5_000_000},  # 500万 < 1900万，但买入verdict跳过
+            open_price=10.5, pre_close=10.0, change_pct=4.0)
+        self.assertTrue(ok)
+
+    def test_量能解析失败或无金额则放行(self):
+        self.assertTrue(self.m._check_auction_volume({"auction_vol_ratio": "竞价量足即可"}))
+        self.assertTrue(self.m._check_auction_volume({"auction_vol_ratio": "竞价成交额≥1900万"}))  # 无 amount
+        self.assertTrue(self.m._check_auction_volume({}))
+
+
+class TestCycleFreshness(unittest.TestCase):
+    """断链6：周期数据 freshness 校验"""
+
+    def setUp(self):
+        self.m = _MonitorCoreMixin()
+
+    def test_达到上一交易日为新鲜(self):
+        # 今日 20260804，上一交易日 20260803
+        self.assertTrue(self.m._check_cycle_fresh("20260803", "板块"))
+
+    def test_落后为陈旧(self):
+        self.assertFalse(self.m._check_cycle_fresh("20260801", "板块"))
+
+    def test_空数据为陈旧(self):
+        self.assertFalse(self.m._check_cycle_fresh("", "板块"))
+
 
 class TestClassifyAuctionVerdicts(unittest.TestCase):
 

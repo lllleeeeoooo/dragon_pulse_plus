@@ -9,7 +9,7 @@ from data.fetcher import DataFetcher
 from core.emotion_index import EmotionVector
 from core.strategies import StrategyAnalyzer, MarketStyle
 from core.holding_monitor import HoldingMonitor
-from core.trade_calendar import is_trading_day
+from core.trade_calendar import is_trading_day, get_previous_trading_day
 from llm.sell_advisor import DynamicSellAdvisor
 from notifier.bark import bark_notifier
 from database.services import HoldingManager, RecommendationManager
@@ -206,15 +206,24 @@ class _MonitorStyleMixin:
 
 
     def _load_cycle_phase(self):
-        """每日加载一次前一交易日的情绪周期阶段"""
+        """每日加载一次前一交易日的情绪周期阶段（断链6：落后则告警）"""
         try:
             from database.services import SentimentManager
             from core.cycle_machine import EmotionCycleMachine
             recent = SentimentManager.get_recent_sentiments(days_lookback=1)
             if recent:
                 self._cycle_phase = recent[0].get("cycle_stage", "")
+                # freshness：最新情绪记录应达到上一交易日，落后则告警
+                latest = recent[0].get("trade_date", "")
+                try:
+                    expected = get_previous_trading_day(datetime.date.today())
+                    if latest and latest < expected:
+                        logger.warning(f"情绪周期数据陈旧: 最新 {latest}, 应为 ≥{expected}（盘后任务可能未执行）")
+                except Exception:
+                    pass
             else:
                 self._cycle_phase = ""
+                logger.warning("情绪周期无历史数据（盘后任务可能未执行）")
             self._cycle_stance = EmotionCycleMachine.get_trading_stance(self._cycle_phase or "冰点")
             logger.info(f"情绪周期: {self._cycle_phase or '无历史'} -> 操作: {self._cycle_stance.get('stance', '未知')}")
         except Exception as e:

@@ -821,10 +821,14 @@ class _MonitorCoreMixin:
         self._sector_cycle_date = today
         try:
             from database import SectorCycleManager
-            for r in SectorCycleManager.get_sector_cycle(top=500):
+            records = SectorCycleManager.get_sector_cycle(top=500)
+            for r in records:
                 self._sector_cycle_info[r["sector"]] = {
                     "phase": r["phase"], "is_mainline": r["is_mainline"],
                 }
+            # 断链6：freshness 校验——最新周期未达上一交易日则告警并标记
+            self._sector_cycle_stale = not self._check_cycle_fresh(
+                records[0]["trade_date"] if records else "", "板块")
         except Exception as e:
             logger.warning(f"加载板块阶段缓存失败: {e}")
 
@@ -844,18 +848,54 @@ class _MonitorCoreMixin:
                                  pre_close: float, change_pct: float) -> bool:
         """
         推荐标的是否满足买入条件：
-        - 竞价判定"买入"(前提=满足已自证) → 跳过脆弱的 open_requirement 正则，信任竞价 LLM 实时判断
-        - 观察/无verdict（未获竞价确认）→ 用 open_requirement 正则防御
+        - 竞价判定"买入"(前提=满足已自证) → 跳过 open_requirement/竞价量能正则，信任竞价 LLM 实时判断
+        - 观察/无verdict（未获竞价确认）→ 用 open_requirement + 竞价量能 正则防御
         - 无论哪种：相对开盘回落超过 REC_FADE_MAX（走弱）均不买（活的安全网）
         """
         open_change = round((float(open_price) - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0
         auction_verdict = (rec_info or {}).get("auction_verdict", "")
-        if auction_verdict != "买入" and (rec_info or {}).get("open_requirement"):
-            if not self._check_open_requirement(open_change, rec_info["open_requirement"]):
+        if auction_verdict != "买入":
+            if (rec_info or {}).get("open_requirement"):
+                if not self._check_open_requirement(open_change, rec_info["open_requirement"]):
+                    return False
+            if not self._check_auction_volume(rec_info):
                 return False
         if open_change > 0 and (open_change - change_pct) > settings.REC_FADE_MAX:
             return False
         return True
+
+    def _check_auction_volume(self, rec_info) -> bool:
+        """
+        竞价量能校验（断链3）：auction_vol_ratio 要求 vs 09:26 存储的 auction_amount。
+        无要求/无金额/解析失败 → 放行（不因未知卡死）。
+        """
+        req = (rec_info or {}).get("auction_vol_ratio") or ""
+        amount = (rec_info or {}).get("auction_amount")
+        if not req or not amount:
+            return True
+        import re
+        m = re.search(r"≥\s*([\d.]+)\s*(万|亿)", req)  # "竞价成交额≥1900万" / "≥0.19亿"
+        if not m:
+            return True  # 无法解析 → 放行
+        threshold = float(m.group(1)) * (1e4 if m.group(2) == "万" else 1e8)
+        if float(amount) >= threshold:
+            return True
+        logger.warning(f"竞价量能不足: {rec_info.get('name')}({rec_info.get('code')}) "
+                       f"竞价{float(amount) / 1e4:.0f}万 < 要求[{req}]")
+        return False
+
+    def _check_cycle_fresh(self, latest_date: str, name: str) -> bool:
+        """周期数据 freshness 校验（断链6）：最新周期日期是否达到上一交易日。
+        落后 → 告警（闸门在用旧数据）并返回 False；异常时保守返回 True。"""
+        try:
+            expected = get_previous_trading_day(datetime.date.today())
+            if latest_date and latest_date >= expected:
+                return True
+            logger.warning(f"{name}周期数据陈旧: 最新 {latest_date or '无'}, "
+                           f"应为 ≥{expected}（盘后任务可能未执行，闸门在用旧数据）")
+            return False
+        except Exception:
+            return True
 
     def _merge_auction_buy_candidates(self, spot_df, hit_df, pending_recs) -> pd.DataFrame:
         """
@@ -902,10 +942,14 @@ class _MonitorCoreMixin:
         self._concept_cache_date = today
         try:
             from database import ConceptCycleManager
-            for r in ConceptCycleManager.get_concept_cycle(top=500):
+            records = ConceptCycleManager.get_concept_cycle(top=500)
+            for r in records:
                 self._concept_cycle_info[r["concept"]] = {
                     "phase": r["phase"], "is_mainline": r["is_mainline"],
                 }
+            # 断链6：freshness 校验——最新概念周期未达上一交易日则告警并标记
+            self._concept_cycle_stale = not self._check_cycle_fresh(
+                records[0]["trade_date"] if records else "", "概念")
             from database.connection import db_manager
             from database.models import ConceptMember
             session = db_manager.get_session()

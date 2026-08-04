@@ -152,8 +152,8 @@ def job_post_market():
         # ---- 落库：推荐标的 ----
         _parse_and_save_recommendations(today_str, review_report)
 
-        # ---- LLM 复盘打分：评估昨日推荐胜率 ----
-        _evaluate_yesterday_recommendations(today_str, spot_df)
+        # ---- LLM 复盘打分：评估昨日推荐胜率（spot 空时用 zt_df 兜底，不跳过）----
+        _evaluate_yesterday_recommendations(today_str, spot_df, zt_df)
 
         # ---- 自动填充历史龙头表 ----
         _auto_populate_dragons(today_str, zt_df)
