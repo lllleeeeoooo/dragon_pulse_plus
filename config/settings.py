@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     DAILY_LOSS_CIRCUIT_BREAKER: float = Field(default=-5.0, description="AI持仓当日平均亏损熔断阈值(%)，触发后停止买入")
     INDEX_DROP_CIRCUIT_BREAKER: float = Field(default=-2.0, description="大盘均涨幅跌破此值时触发系统级熔断，停止所有自动买入(%)")
 
+    # ==================== AI 自动买卖模型配置 ====================
+    MAX_AI_SECTOR_POSITIONS: int = Field(default=2, description="同一板块 AI 持仓数量上限（板块集中度控制）")
+    AI_BUY_SLIPPAGE_PCT: float = Field(default=0.3, description="AI 自动买入滑点(%)，模拟真实成交高于快照价")
+    AI_BUY_SLIPPAGE_HOT_PCT: float = Field(default=0.2, description="高位放量信号(逼近封板等)额外滑点(%)")
+    AI_SELL_SLIPPAGE_PCT: float = Field(default=0.3, description="AI 自动卖出滑点(%)，模拟真实成交低于现价")
+
     # ==================== 股票过滤配置 ====================
     EXCLUDE_STAR_MARKET: bool = Field(default=True, description="是否排除科创板股票 (688开头)")
     EXCLUDE_BSE: bool = Field(default=True, description="是否排除北交所股票 (8开头/43/83/87等)")

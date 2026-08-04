@@ -74,6 +74,8 @@ class _MonitorCoreMixin:
         self._job_record_counter: int = 0
         # 分时形态检测缓存 {code: (是否不佳, 时间戳)}，TTL 过期重拉以跟上盘中走势
         self._pattern_cache: Dict[str, tuple] = {}
+        # 个股行业缓存（当日），供板块集中度控制，避免反复查库
+        self._industry_cache: Dict[str, str] = {}
 
 
     def _reset_daily_state(self):
@@ -82,7 +84,8 @@ class _MonitorCoreMixin:
         if self._alert_date != today:
             self._alerted_burst_codes.clear()
             self._alerted_zhaban_codes.clear()
-            self._auto_bought_codes.clear()
+            # 重启/换日后从数据库重建当日已买入集合（避免盘中重启导致 MAX_DAILY_BUYS 计数清零）
+            self._auto_bought_codes = self._load_today_ai_bought_codes()
             self._emotion_top_alerted_today = False
             self._consistency_alerted_today = False
             self._pending_sell_codes.clear()
@@ -90,6 +93,7 @@ class _MonitorCoreMixin:
             self._alert_date = today
             self._ma_cache.clear()
             self._pattern_cache.clear()
+            self._industry_cache.clear()
             self._startup_logged = False  # 允许下一天输出启动日志
             global _circuit_breaker_alerted
             self._circuit_breaker_alerted = False
@@ -599,13 +603,20 @@ class _MonitorCoreMixin:
                         pass  # 当日总亏损熔断，跳过
                     elif amt_billion >= settings.PATTERN_CHECK_MIN_AMOUNT and self._is_bad_intraday_pattern(code):
                         pass  # 分时形态不佳（冲高回落/放量滞涨），跳过
+                    elif self._is_sector_concentrated(code, ai_holdings):
+                        pass  # 板块集中度限制（同板块持仓已达上限），跳过
                     elif not any(h["code"] == code for h in ai_holdings):
                         self._auto_bought_codes.add(code)
                         buy_reason = "复盘推荐" if is_recommended else signal_label
+                        # 成交滑点模型：模拟真实买入成本高于快照价（高位放量信号额外加滑点）
+                        slippage = settings.AI_BUY_SLIPPAGE_PCT
+                        if row["_signal_near_limit"] or vol_ratio >= settings.NEAR_LIMIT_VOL_RATIO:
+                            slippage += settings.AI_BUY_SLIPPAGE_HOT_PCT
+                        cost_price = round(price * (1 + slippage / 100), 2)
                         HoldingManager.add_holding(
                             code=code,
                             name=name,
-                            cost_price=price,
+                            cost_price=cost_price,
                             holding_type="AI_AUTO",
                             strategy=f"AI自动跟进({buy_reason})"
                         )
@@ -614,7 +625,7 @@ class _MonitorCoreMixin:
                             RecommendationManager.mark_triggered(rec_info["id"])
                         bark_notifier.send(
                             title=f"🤖 [AI 自动买入] {name}({code})",
-                            body=f"{buy_reason}标的 {name}({code}) 触发买入信号 (现价:{price}元, +{change_pct}%, 量比{vol_ratio}倍, 成交{amt_billion:.1f}亿)，已自动纳入 AI 持仓追踪！",
+                            body=f"{buy_reason}标的 {name}({code}) 触发买入信号 (现价:{price}元, 成交成本:{cost_price}元含滑点{slippage:.2f}%, +{change_pct}%, 量比{vol_ratio}倍, 成交{amt_billion:.1f}亿)，已自动纳入 AI 持仓追踪！",
                             group="AI自动持仓",
                             level="timeSensitive"
                         )
@@ -716,6 +727,67 @@ class _MonitorCoreMixin:
             self._check_fund_inflow_alert(burst_codes_for_fund[:3], cap_map)
 
 
+    def _load_today_ai_bought_codes(self) -> set:
+        """从数据库恢复今日已 AI 买入的股票代码（buy_date=今天 且 AI_AUTO），保证盘中重启后当日计数不丢"""
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        codes = set()
+        try:
+            from database.services import db_manager
+            from database.models import Holding
+            session = db_manager.get_session()
+            try:
+                rows = session.query(Holding).filter(
+                    Holding.buy_date == today,
+                    Holding.holding_type == "AI_AUTO",
+                ).all()
+                codes = {h.code for h in rows}
+            finally:
+                session.close()
+        except Exception as e:
+            logger.warning(f"恢复今日AI已买集合失败: {e}")
+        if codes:
+            logger.info(f"从数据库恢复今日 AI 已买 {len(codes)} 只")
+        return codes
+
+    def _get_stock_industry(self, code: str) -> str:
+        """查询个股所属行业（当日缓存）：优先涨停池缓存，其次近期 daily_zt_pool"""
+        cached = getattr(self, '_industry_cache', {})
+        if code in cached:
+            return cached[code]
+        industry = ""
+        zt = self._zt_pool_cache
+        if zt is not None and not zt.empty and "industry" in zt.columns:
+            m = zt[zt["code"].astype(str) == code]
+            if not m.empty:
+                industry = str(m.iloc[0].get("industry", "") or "")
+        if not industry:
+            try:
+                from database.services import db_manager
+                from database.models import DailyZtPool
+                session = db_manager.get_session()
+                try:
+                    row = session.query(DailyZtPool).filter(
+                        DailyZtPool.code == code
+                    ).order_by(DailyZtPool.trade_date.desc()).first()
+                    if row and row.industry:
+                        industry = row.industry
+                finally:
+                    session.close()
+            except Exception:
+                pass
+        cached[code] = industry
+        return industry
+
+    def _is_sector_concentrated(self, code: str, ai_holdings: list) -> bool:
+        """板块集中度控制：候选股所属板块在 AI 持仓中已达 MAX_AI_SECTOR_POSITIONS 只则跳过"""
+        if not ai_holdings:
+            return False
+        industry = self._get_stock_industry(code)
+        if not industry:
+            return False  # 查不到行业则不限制
+        same = sum(1 for h in ai_holdings if h["code"] != code and self._get_stock_industry(h["code"]) == industry)
+        return same >= settings.MAX_AI_SECTOR_POSITIONS
+
     def _monitor_holdings(self, spot_df, active_holdings, market_max_lbc, market_zhaban_rate):
         """第7步：持仓卖出/止损信号监控 + 批量更新收益率（从 _check_realtime_market 拆出）"""
         # 7. 从数据库持仓表监控卖出/止损条件
@@ -730,7 +802,10 @@ class _MonitorCoreMixin:
                     hold_match = [h for h in active_holdings if h["code"] == code]
                     if hold_match:
                         h = hold_match[0]
-                        HoldingManager.close_holding(code=code, holding_type=h.get("holding_type"), sell_price=float(row["price"]))
+                        sell_px = float(row["price"])
+                        if h.get("holding_type") == "AI_AUTO":
+                            sell_px = round(sell_px * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)  # AI卖出模拟滑点
+                        HoldingManager.close_holding(code=code, holding_type=h.get("holding_type"), sell_price=sell_px)
                         self._pending_sell_codes.discard(code)
                         bark_notifier.send(
                             title=f"🔓 [破板卖出] {h.get('name')}({code})",
@@ -823,7 +898,10 @@ class _MonitorCoreMixin:
                                 )
                             continue
 
-                        HoldingManager.close_holding(code=code, holding_type=hold_type, sell_price=curr_price)
+                        sell_px = curr_price
+                        if hold_type == "AI_AUTO":
+                            sell_px = round(curr_price * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)  # AI卖出模拟滑点
+                        HoldingManager.close_holding(code=code, holding_type=hold_type, sell_price=sell_px)
                         self._pending_sell_codes.discard(code)
                         bark_notifier.send(
                             title=f"🚨 [{sig['type']}] {holding.get('name')}({code})",

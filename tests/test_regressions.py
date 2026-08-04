@@ -353,6 +353,35 @@ class TestDbRegressions(unittest.TestCase):
         h = HoldingManager.get_active_holdings(holding_type="AI_AUTO")[0]
         self.assertAlmostEqual(h["profit_rate"], 10.0, places=2)
 
+    def test_sector_concentration_gate(self):
+        """板块集中度：同板块 AI 持仓达上限则跳过买入"""
+        from scheduler.monitor_core import _MonitorCoreMixin
+        obj = object.__new__(_MonitorCoreMixin)
+        obj._industry_cache = {}
+        obj._zt_pool_cache = pd.DataFrame([
+            {"code": "600001", "industry": "电力设备"},
+            {"code": "600002", "industry": "电力设备"},
+            {"code": "600003", "industry": "电力设备"},
+            {"code": "000001", "industry": "银行"},
+        ])
+        # 候选 600002 电力设备，已持仓 1 只 < 上限2 → 不集中
+        self.assertFalse(obj._is_sector_concentrated("600002", [{"code": "600001"}]))
+        # 已持仓 2 只 >= 上限2 → 集中，跳过
+        self.assertTrue(obj._is_sector_concentrated(
+            "600002", [{"code": "600001"}, {"code": "600003"}]))
+        # 不同板块不限制
+        self.assertFalse(obj._is_sector_concentrated("000001", [{"code": "600001"}]))
+
+    def test_load_today_ai_bought_codes(self):
+        """重启恢复当日买入计数：今日 AI_AUTO 持仓的 code 进入集合（盘中重启不丢计数）"""
+        from scheduler.monitor_core import _MonitorCoreMixin
+        import datetime
+        from database.services import HoldingManager
+        HoldingManager.add_holding(code="600519", cost_price=100.0, name="茅台", holding_type="AI_AUTO")
+        obj = object.__new__(_MonitorCoreMixin)
+        codes = obj._load_today_ai_bought_codes()
+        self.assertIn("600519", codes)
+
     def test_auction_verdict_roundtrip(self):
         """竞价结论落库 + 按日期查全状态(含 TRIGGERED，胜率复盘用)"""
         from database import RecommendationManager, db_manager
