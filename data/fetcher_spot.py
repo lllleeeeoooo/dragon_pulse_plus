@@ -71,6 +71,31 @@ class _SpotMixin:
 
 
     @staticmethod
+    def _compute_open_premium(codes) -> tuple:
+        """从当日 spot 快照的 开盘价/昨收 计算昨日涨停股的真实开盘溢价与高开>3%占比。
+        开盘价 09:30 后固定，盘中任何时刻启动都能算准（不再依赖 09:00-09:30 启动窗口）。"""
+        try:
+            spot = _SpotMixin.get_realtime_spot()
+            if spot is None or spot.empty:
+                return None, None
+            opens = []
+            for code in codes:
+                m = spot[spot["code"].astype(str) == str(code)]
+                if not m.empty:
+                    r = m.iloc[0]
+                    o = float(r.get("open", 0)); pre = float(r.get("pre_close", 0))
+                    if o > 0 and pre > 0:
+                        opens.append((o - pre) / pre * 100)
+            if not opens:
+                return None, None
+            opening_premium = round(sum(opens) / len(opens), 2)
+            high_open = round(sum(1 for x in opens if x > 3) / len(opens) * 100, 2)
+            return opening_premium, high_open
+        except Exception as e:
+            logger.warning(f"计算真实开盘溢价失败: {e}")
+            return None, None
+
+    @staticmethod
     def get_yesterday_zt_premium() -> dict:
         """
         获取昨日涨停股今日表现,计算竞价溢价和即时溢价.
@@ -98,15 +123,14 @@ class _SpotMixin:
             _last_premium_fallback = intraday_premium
             # 红盘率:当前涨幅>0的比例（盘中会变）
             positive_ratio = round((changes > 0).sum() / total * 100, 2)
-            # 开盘溢价:9:35 前首次有效调用时缓存（此时涨跌幅≈开盘涨幅）
+            # 真实开盘溢价：从当日快照 open/昨收 计算（盘中任何时刻都准，不依赖 09:30 前启动）
             cache_key = f"_open_premium_{today}"
-            now = datetime.datetime.now()
-            is_early = now.hour == 9 and now.minute <= 30  # 9:30 前算开盘窗口
             if not hasattr(_SpotMixin, cache_key) and total > 0:
-                if is_early:
-                    setattr(_SpotMixin, cache_key, ("open", intraday_premium,
-                        round((changes > 3).sum() / total * 100, 2)))
+                true_open, true_high = _SpotMixin._compute_open_premium(df["代码"].astype(str).tolist())
+                if true_open is not None:
+                    setattr(_SpotMixin, cache_key, ("open", true_open, true_high))
                 else:
+                    # 快照不可用时退回即时值（标记为非开盘口径）
                     setattr(_SpotMixin, cache_key, ("snapshot", intraday_premium,
                         round((changes > 3).sum() / total * 100, 2)))
             if hasattr(_SpotMixin, cache_key):
@@ -117,7 +141,7 @@ class _SpotMixin:
                 f"昨日涨停溢价: 开盘{opening_premium}% | 即时{intraday_premium}% | "
                 f"高开>3%占比{high_open_ratio}% | 红盘率{positive_ratio}% | 样本{total}只"
             )
-            premium_tag = "开盘" if tag == "open" else "盘中快照(非开盘时段启动)"
+            premium_tag = "开盘" if tag == "open" else "盘中快照(非开盘口径)"
             return {
                 "opening_premium": opening_premium,
                 "intraday_premium": intraday_premium,
