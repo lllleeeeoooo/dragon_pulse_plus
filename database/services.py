@@ -9,3 +9,4 @@ from database.market_data import MarketIndexManager, DailySnapshotManager, ZtPoo
 from database.calendar import TradeCalendarManager
 from database.system_log import SystemLogManager
 from database.seats import SeatProfileManager
+from database.sector_cycle import SectorCycleManager

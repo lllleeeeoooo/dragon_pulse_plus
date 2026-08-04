@@ -198,6 +198,20 @@ class TestPureRegressions(unittest.TestCase):
                                    "zhaban_rate": 10, "sentiment_index": 60, "yield_rate": 2})
         self.assertIn(r2["style"], ("打板", "共振"))
 
+    def test_sector_cycle_phase(self):
+        """板块阶段状态机：冰点/启动/发酵/高潮/退潮 判定 + 主线分"""
+        from core.sector_cycle import SectorCycleMachine as M
+        self.assertEqual(M.derive_phase(0, 0, []), "冰点")
+        self.assertEqual(M.derive_phase(2, 2, [0, 1]), "启动")
+        self.assertEqual(M.derive_phase(4, 3, [0, 1, 3]), "发酵")
+        self.assertEqual(M.derive_phase(8, 4, [3, 5]), "高潮")
+        self.assertEqual(M.derive_phase(2, 2, [5, 7]), "退潮")
+        # 从发酵/高潮掉到 1 家 → 退潮
+        self.assertEqual(M.derive_phase(1, 1, [4, 5], "高潮"), "退潮")
+        # 主线分
+        self.assertGreater(M.mainline_score(6, 4, 2, 4), 0.5)
+        self.assertLess(M.mainline_score(1, 1, 0, 1), 0.5)
+
     def test_market_style_classify(self):
         """市场风格分类：抱团/共振/打板 三档命中"""
         from core.strategies import MarketStyle
@@ -531,6 +545,27 @@ class TestDbRegressions(unittest.TestCase):
         self.assertEqual(len(all_recs), 1)
         self.assertEqual(all_recs[0]["status"], "TRIGGERED")
         self.assertEqual(all_recs[0]["auction_verdict"], "买入")
+
+    def test_sector_cycle_sync(self):
+        """板块周期落库：从涨停池聚合出阶段与主线分"""
+        from database import SectorCycleManager
+        zt = pd.DataFrame([
+            {"code": "600001", "name": "A", "industry": "电网设备", "lbc": 3},
+            {"code": "600002", "name": "B", "industry": "电网设备", "lbc": 2},
+            {"code": "600003", "name": "C", "industry": "电网设备", "lbc": 1},
+            {"code": "000001", "name": "D", "industry": "电池", "lbc": 1},
+        ])
+        SectorCycleManager.sync_from_zt_pool("20260804", zt)
+        recs = SectorCycleManager.get_sector_cycle(trade_date="20260804")
+        sectors = {r["sector"]: r for r in recs}
+        # 电网设备 3 家涨停 + 3 板龙头 → 发酵
+        self.assertIn("电网设备", sectors)
+        self.assertEqual(sectors["电网设备"]["phase"], "发酵")
+        self.assertEqual(sectors["电网设备"]["zt_count"], 3)
+        # 电池 1 家 → 启动
+        self.assertEqual(sectors["电池"]["phase"], "启动")
+        # 电网设备主线分高于电池
+        self.assertGreater(sectors["电网设备"]["mainline_score"], sectors["电池"]["mainline_score"])
 
     def test_seat_profile_sync_and_classify(self):
         """龙虎榜席位画像：名席位种子 + 行为自动分类 + DB 查询"""

@@ -477,6 +477,18 @@ def data_seats_stats():
     return {"code": 200, "data": SeatProfileManager.get_stats()}
 
 
+@app.get("/data/sectors/cycle", summary="板块情绪周期",
+         description="查看板块阶段（冰点/启动/发酵/高潮/退潮）与主线分。示例：/data/sectors/cycle?top=10",
+         tags=["板块"])
+def data_sectors_cycle(
+    date: Optional[str] = Query(None, description="日期 YYYYMMDD，默认最新"),
+    top: int = Query(20, description="返回前N个(按主线分降序)"),
+):
+    from database import SectorCycleManager
+    result = SectorCycleManager.get_sector_cycle(trade_date=date, top=top)
+    return {"code": 200, "count": len(result), "data": result}
+
+
 @app.get("/data/source-status", summary="数据源熔断状态",
          description="查看各数据源当日异常次数与熔断状态。某源当日异常达 SOURCE_FAIL_CIRCUIT_LIMIT 次后，当天不再调用该源（次日自动重置）",
          tags=["AkShare 数据"])

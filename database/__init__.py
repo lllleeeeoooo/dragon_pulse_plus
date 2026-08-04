@@ -19,6 +19,7 @@ from database.calendar import TradeCalendarManager
 from database.system_log import SystemLogManager
 from database.investigation import InvestigationManager
 from database.seats import SeatProfileManager
+from database.sector_cycle import SectorCycleManager
 
 __all__ = [
     "db_manager",
@@ -40,4 +41,5 @@ __all__ = [
     "SystemLogManager",
     "InvestigationManager",
     "SeatProfileManager",
+    "SectorCycleManager",
 ]

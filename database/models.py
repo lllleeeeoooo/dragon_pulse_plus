@@ -182,6 +182,27 @@ class SectorStrength(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
+class SectorCycle(Base):
+    """
+    板块情绪周期阶段表（"主线板块 → 板块阶段 → 个股机会"三层的板块层）
+    每日从涨停池按行业聚合：判定每个活跃板块处于 冰点/启动/发酵/高潮/退潮 哪个阶段，
+    并计算主线分（涨停×持续×加速×高度），主线板块供盘中个股机会打分使用。
+    """
+    __tablename__ = "sector_cycle"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(String(10), nullable=False, index=True, comment="交易日期 YYYYMMDD")
+    sector_name = Column(String(64), nullable=False, index=True, comment="板块名称(东财行业)")
+    phase = Column(String(16), default="冰点", comment="板块阶段: 冰点/启动/发酵/高潮/退潮")
+    zt_count = Column(Integer, default=0, comment="当日板块涨停家数")
+    max_lbc = Column(Integer, default=0, comment="板块内最高连板")
+    prev_zt_count = Column(Integer, default=0, comment="上一交易日涨停家数")
+    prev_phase = Column(String(16), comment="上一交易日阶段")
+    is_mainline = Column(Boolean, default=False, comment="是否主线板块")
+    mainline_score = Column(Float, default=0.0, comment="主线分(涨停×持续×加速×高度归一化)")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
 class InvestigationRecord(Base):
     """
     立案调查记录表

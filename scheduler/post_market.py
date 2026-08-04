@@ -174,6 +174,13 @@ def job_post_market():
         # ---- 板块强度落库 ----
         SectorStrengthManager.save_daily_sectors(today_str, zt_df)
 
+        # ---- 板块情绪周期计算（主线板块识别 + 板块阶段）----
+        try:
+            from database import SectorCycleManager
+            SectorCycleManager.sync_from_zt_pool(today_str, zt_df)
+        except Exception as e:
+            logger.warning(f"板块周期同步失败: {e}")
+
         # ---- 每日盈亏报告（同步收盘价 + 净值快照 + 推送） ----
         _push_daily_pnl_report(today_str, spot_df)
 
