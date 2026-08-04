@@ -32,7 +32,8 @@ class Settings(BaseSettings):
 
     # ==================== 情绪到顶/退潮预警阈值 ====================
     EMOTION_TOP_MAX_LBC: int = Field(default=8, description="全市场连板高度触发情绪到顶预警的最低板数")
-    EMOTION_TOP_ZHABAN_RATE: float = Field(default=35.0, description="全市场炸板率触发情绪到顶预警的最低百分比(%)")
+    EMOTION_TOP_ZHABAN_RATE: float = Field(default=35.0, description="全市场炸板率触发情绪到顶预警的最低百分比(%)——顶部裂纹信号")
+    EMOTION_TOP_SENTIMENT_MIN: float = Field(default=75.0, description="情绪到顶预警要求的最低情绪分（顶部时情绪仍热，而非崩溃后）")
 
     # ==================== 止损配置 ====================
     ABSOLUTE_STOP_LOSS_PCT: float = Field(default=-7.0, description="绝对止损线(%)，亏损超过此值无条件触发卖出")

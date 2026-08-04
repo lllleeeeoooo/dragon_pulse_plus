@@ -420,18 +420,19 @@ class _MonitorCoreMixin:
         return index_breaker_triggered
 
     def _check_emotion_top_alert(self, market_max_lbc, market_zhaban_rate):
-        """全市场情绪到顶预警（每日仅一次）（从 _check_realtime_market 拆出）"""
+        """真正的情绪到顶预警：连板极高 + 情绪仍热 + 炸板率异常（顶部裂纹出现时提醒，非崩溃后）"""
         # 6. 全市场情绪到顶预警（全局层面，每日仅推送一次）
-        # 必须同时满足：连板极高 + 炸板率高 + 情绪崩塌（涨停多时炸板率高属于正常分歧）
+        # 必须同时满足：连板极高 + 情绪仍热 + 炸板率异常（顶部出现裂纹时预警，而非情绪崩塌后）
+        sentiment = self._current_market_style.get("sentiment_index", 50)
         if (not self._emotion_top_alerted_today and
                 market_max_lbc >= settings.EMOTION_TOP_MAX_LBC and
-                market_zhaban_rate > settings.EMOTION_TOP_ZHABAN_RATE and
-                self._current_market_style.get("sentiment_index", 50) < 40):
+                sentiment >= settings.EMOTION_TOP_SENTIMENT_MIN and
+                market_zhaban_rate > settings.EMOTION_TOP_ZHABAN_RATE):
             self._emotion_top_alerted_today = True
-            style_info = self._current_market_style
             bark_notifier.send(
-                title="🚨 [情绪到顶预警] 全市场退潮风险",
-                body=f"最高连板{market_max_lbc}板+炸板率{market_zhaban_rate}%+情绪仅{style_info.get('sentiment_index',0)}分，退潮前兆，建议落袋为安。",
+                title="🚨 [情绪到顶预警] 高潮末端风险",
+                body=(f"最高连板{market_max_lbc}板+情绪{sentiment}分+炸板率{market_zhaban_rate}%，"
+                      f"市场处于高潮末端/顶部区间，警惕次日分歧，高位标的逢高减仓、不打加速板。"),
                 group="卖出提醒",
                 level="timeSensitive"
             )

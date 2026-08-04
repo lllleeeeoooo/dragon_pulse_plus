@@ -48,7 +48,7 @@ def main():
     logger.info(f"LLM 模型: {settings.LLM_MODEL} | BaseURL: {settings.LLM_BASE_URL}")
     logger.info(f"Bark 推送状态: {'已启用' if settings.BARK_ENABLED else '未启用'}")
     logger.info(f"盘中轮询间隔: {settings.MONITOR_INTERVAL_SECONDS} 秒")
-    logger.info(f"情绪到顶预警阈值: 连板>={settings.EMOTION_TOP_MAX_LBC}板 & 炸板率>{settings.EMOTION_TOP_ZHABAN_RATE}%")
+    logger.info(f"情绪到顶预警阈值: 连板>={settings.EMOTION_TOP_MAX_LBC}板 & 情绪>={settings.EMOTION_TOP_SENTIMENT_MIN}分 & 炸板率>{settings.EMOTION_TOP_ZHABAN_RATE}%")
 
     # 0. 启动时同步交易日历 + 建表，确保后续任务不会在假期触发
     from database import TradeCalendarManager
