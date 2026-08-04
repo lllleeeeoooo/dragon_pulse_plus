@@ -28,14 +28,22 @@ class EmotionVector:
 
     @staticmethod
     def _score_premium(premium: float) -> float:
-        """溢价得分：0%=50分(中性锚点), -3%=0分, +4%=100分"""
+        """溢价得分：0%=50分(中性锚点), -3%=0分。
+        正溢价前 4% 斜率较陡(10分/%)，4% 后放缓(1.25分/%)，约 +12% 封顶——
+        避免原公式 +4% 即满分导致热行情饱和、无法区分极端热度。"""
         p = float(premium)
-        return max(min((p + 3) * (100 / 7), 100), 0) if p < 0 else max(min(50 + p * (50 / 4), 100), 50)
+        if p < 0:
+            return max(min((p + 3) * (100 / 7), 100), 0)
+        return max(min(50 + min(p, 4.0) * 10.0 + max(0.0, p - 4.0) * 1.25, 100), 50)
 
     @staticmethod
     def _score_breadth(breadth: int) -> float:
-        """宽度得分：中性(涨停=跌停)≈40，涨停越多越高"""
-        return max(min((float(breadth) + 40) * 1.0, 100), 0)
+        """宽度得分：中性(涨停=跌停)≈40，涨停越多越高。
+        前 90 家线性到 100，之后封顶——避免原公式 60 家就满分、无法区分热度。"""
+        b = float(breadth)
+        if b < 0:
+            return max(40 + b, 0)
+        return max(min(40 + b * (60.0 / 90.0), 100), 0)
 
     @staticmethod
     def _score_support(zhaban_rate: float) -> float:

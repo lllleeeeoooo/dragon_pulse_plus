@@ -173,6 +173,19 @@ class TestPureRegressions(unittest.TestCase):
         self.assertFalse(obj._is_bad_intraday_pattern("600001"))
         self.assertEqual(calls, ["600001"])
 
+    def test_sentiment_score_anti_saturation(self):
+        """情绪分反饱和：溢价/宽度不再顶格，能区分热度；中性锚点保持"""
+        from core.emotion_index import EmotionVector
+        # 溢价 4% 不再满分（原公式 +4% 就 100），8% 明显更高
+        self.assertLess(EmotionVector._score_premium(4.0), 100)
+        self.assertGreater(EmotionVector._score_premium(8.0), EmotionVector._score_premium(4.0))
+        # 宽度 60 家不再满分（原公式 60 家就 100），127 家更高
+        self.assertLess(EmotionVector._score_breadth(60), 100)
+        self.assertGreater(EmotionVector._score_breadth(127), EmotionVector._score_breadth(60))
+        # 中性锚点保持
+        self.assertEqual(EmotionVector._score_premium(0), 50)
+        self.assertEqual(EmotionVector._score_breadth(0), 40)
+
     def test_market_style_classify(self):
         """市场风格分类：抱团/共振/打板 三档命中"""
         from core.strategies import MarketStyle
