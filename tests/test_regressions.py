@@ -157,6 +157,42 @@ class TestPureRegressions(unittest.TestCase):
                 predicted_sectors_summary="", auction_prediction="")
             self.assertEqual(result, "竞价指令")
 
+    def test_call_auction_includes_target_auction_data(self):
+        """竞价分析：推荐标的 + 昨涨停的真实竞价数据必须进 prompt（修复"未提供具体竞价数据"）"""
+        from llm.call_auction import CallAuctionAnalyzer
+        df = pd.DataFrame([
+            {"code": "001208", "name": "华菱线缆", "price": 10.0, "change_pct": 2.5, "amount": 8e7, "volume_ratio": 3.2},
+            {"code": "002879", "name": "长缆科技", "price": 20.0, "change_pct": -1.0, "amount": 5e7, "volume_ratio": 1.1},
+            {"code": "600396", "name": "华电辽能", "price": 5.0, "change_pct": 3.0, "amount": 2e7, "volume_ratio": 2.0},
+            {"code": "000001", "name": "平安银行", "price": 12.0, "change_pct": 8.0, "amount": 3e8, "volume_ratio": 5.0},
+        ])
+        recs = [
+            {"code": "001208", "name": "华菱线缆", "strategy_type": "打板", "open_requirement": "+1%~+4%"},
+            {"code": "002879", "name": "长缆科技", "strategy_type": "低吸", "open_requirement": "平开或低开"},
+            {"code": "600396", "name": "华电辽能", "strategy_type": "打板", "open_requirement": "+1%~+4%"},
+        ]
+        captured = {}
+        def fake_generate(**kwargs):
+            captured["prompt"] = kwargs.get("user_prompt", "")
+            return "竞价指令"
+        with patch("llm.call_auction.llm_client.generate", side_effect=fake_generate):
+            CallAuctionAnalyzer.run_auction_analysis(
+                trade_date="20260804", auction_df=df,
+                recommended_targets=recs, recommended_targets_summary="",
+                yesterday_zt_targets=[{"code": "000001", "name": "平安银行", "lbc": 1}])
+        p = captured["prompt"]
+        # 推荐标的具体竞价数据必须在 prompt 中（不再是"未提供具体竞价数据"）
+        self.assertIn("华菱线缆", p)
+        self.assertIn("2.5", p)   # 华菱线缆实际竞价涨幅
+        self.assertIn("长缆科技", p)
+        self.assertIn("-1.0", p)  # 长缆科技实际竞价涨幅
+        self.assertIn("华电辽能", p)
+        # 昨涨停标的竞价数据也在
+        self.assertIn("平安银行", p)
+        self.assertIn("8.0", p)
+        # 三个推荐都在快照里，不应出现"未找到竞价数据"
+        self.assertNotIn("未找到竞价数据", p)
+
 
 class TestDbRegressions(unittest.TestCase):
     """数据库相关回归（使用独立测试库，防清空生产库）"""

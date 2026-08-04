@@ -40,6 +40,7 @@ def job_call_auction():
                              f" | 要求: {r['open_requirement']}")
 
         # ---- 2. 昨日涨停池中连板/首板标的（修复 #1）----
+        yesterday_zt_targets = []  # 结构化 {code,name,lbc}，供 LLM 逐只匹配真实竞价数据
         try:
             yesterday_zt = DataFetcher.get_zt_pool(date_str=yesterday_str)
             if yesterday_zt is not None and not yesterday_zt.empty and "lbc" in yesterday_zt.columns:
@@ -49,6 +50,7 @@ def job_call_auction():
                     zcode = str(zrow.get("code", ""))
                     zname = str(zrow.get("name", ""))
                     zlbc = int(zrow.get("lbc", 1))
+                    yesterday_zt_targets.append({"code": zcode, "name": zname, "lbc": zlbc})
                     tag = f"{zlbc}连板" if zlbc >= 2 else "首板"
                     lines.append(f"- [昨涨停-{tag}] {zname}({zcode})")
         except Exception as e:
@@ -74,6 +76,8 @@ def job_call_auction():
             auction_df=spot_df,
             yesterday_zt_auction_yield=premium_info.get("intraday_premium", 1.5),
             recommended_targets_summary=recs_summary,
+            recommended_targets=pending_recs,
+            yesterday_zt_targets=yesterday_zt_targets,
             predicted_sectors_summary=predicted_summary,
             auction_prediction=auction_prediction
         )
