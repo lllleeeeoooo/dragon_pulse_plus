@@ -84,7 +84,143 @@ class DynamicSellAdvisor:
                     parts.append(f"主力净流入{net / 1e8:+.2f}亿")
         except Exception:
             pass
+        # 4. 市场情绪周期（高潮/退潮/冰点——决定卖出敏感度）
+        try:
+            from database import SentimentManager
+            recent = SentimentManager.get_recent_sentiments(days_lookback=1)
+            if recent:
+                stage = recent[0].get("cycle_stage", "")
+                if stage:
+                    parts.append(f"市场情绪[{stage}]")
+        except Exception:
+            pass
+        # 5. 板块强弱 + 该股连板高度 + 市场最高板（今日涨停池）
+        try:
+            import datetime as _dt
+            from data.fetcher import DataFetcher
+            zt = DataFetcher.get_zt_pool(date_str=_dt.date.today().strftime("%Y%m%d"))
+            if zt is not None and not zt.empty and "code" in zt.columns:
+                code6 = str(code).zfill(6)
+                m = zt[zt["code"].astype(str) == code6]
+                if not m.empty:
+                    lbc = int(m.iloc[0].get("lbc", 1))
+                    parts.append(f"今日{lbc}板")
+                    ind = str(m.iloc[0].get("industry", "") or "")
+                    if ind:
+                        ind_cnt = int((zt["industry"].astype(str) == ind).sum())
+                        parts.append(f"板块[{ind}]涨停{ind_cnt}家")
+                if "lbc" in zt.columns:
+                    max_lbc = int(pd.to_numeric(zt["lbc"], errors="coerce").max())
+                    parts.append(f"市场最高{max_lbc}板")
+        except Exception:
+            pass
+        # 6. 概念（题材）—— A股短线炒的是概念，行业仅供参考
+        try:
+            from database.connection import db_manager
+            from database.models import ConceptMember
+            from database import ConceptCycleManager
+            code6 = str(code).zfill(6)
+            session = db_manager.get_session()
+            try:
+                concepts = [r[0] for r in session.query(ConceptMember.concept_name).filter(
+                    ConceptMember.stock_code == code6).all()]
+            finally:
+                session.close()
+            if concepts:
+                cycle = ConceptCycleManager.get_concept_cycle(top=500)
+                cycle_map = {r["concept"]: r for r in cycle}
+                mine = [c for c in concepts if c in cycle_map]
+                # 按主线分(涨停×持续×加速×高度)排序——主线分高 = 当下最可能炒的概念
+                mine.sort(key=lambda c: (cycle_map[c].get("mainline_score", 0),
+                                         cycle_map[c].get("zt_count", 0)), reverse=True)
+                # 退潮/冰点概念不是当下主线，优先展示活跃概念（无活跃则回退全部）
+                active = [c for c in mine if cycle_map[c].get("phase") not in ("退潮", "冰点")]
+                top_n = (active or mine)[:2]
+                if top_n:
+                    parts.append("概念:" + "/".join(
+                        (("★" if cycle_map[c].get("is_mainline") else "") +
+                         f"{c}[{cycle_map[c].get('phase', '')}]{cycle_map[c].get('zt_count', 0)}家")
+                        for c in top_n))
+                else:
+                    parts.append(f"概念:{','.join(concepts[:3])}")
+        except Exception:
+            pass
         return " | ".join(parts) if parts else "暂无额外上下文"
+
+    @staticmethod
+    def _parse_verdict(text: str) -> str:
+        """从 LLM 首行提取结论：🔥买入 / 👀观望 / 💀出货。无法识别返回空串。"""
+        if not text:
+            return ""
+        first = text.strip().splitlines()[0] if text.strip() else ""
+        if "🔥" in first or "买入" in first[:12]:
+            return "买入"
+        if "💀" in first or "出货" in first[:12] or "卖出" in first[:12]:
+            return "出货"
+        return "观望"
+
+    @classmethod
+    def format_sell_decision(cls, holding: dict, sig: dict, current_price: float,
+                             change_pct: float) -> str:
+        """
+        B方案：卖出 LLM 决策（数据补全）。
+        喂 持仓状态(成本/盈亏/天数/策略) + 规则触发信号 + 今日分时 + 位置/环境/资金，
+        LLM 输出 💀卖出 / 👀持有。失败返回空串（调用方降级回规则）。
+        """
+        code = str(holding.get("code", ""))
+        name = str(holding.get("name", code))
+        cost = float(holding.get("cost_price", 0) or 0)
+        days = int(holding.get("hold_days", 0) or 0)
+        strategy = str(holding.get("buy_strategy", "") or "")
+        profit = round((current_price - cost) / cost * 100, 2) if cost > 0 else 0.0
+        intraday = cls._fetch_intraday(code)
+        context = cls._fetch_context(code, current_price)
+        user = (
+            f"【持仓状态】{name}({code}) 成本{cost} 现价{current_price} 盈亏{profit:+.2f}% "
+            f"持仓{days}天 策略[{strategy}]\n"
+            f"【规则触发】{sig.get('type', '')}: {sig.get('reason', '')}\n"
+            f"【今日分时OHLCV（O开 H高 L低 C收 V万）】\n{intraday}\n"
+            f"【位置/大盘/资金上下文】{context}\n\n"
+            "请判断是否卖出。首行必须输出：💀卖出 / 👀持有，并给出≤80字理由。"
+        )
+        system = (
+            "你是A股持仓风控操盘手。基于持仓盈亏、规则触发信号与今日分时量价，判断是否卖出。\n"
+            "注意：规则信号只是提示，你要用分时与位置/资金综合判断是真风险还是假摔。\n"
+            "首行输出 💀卖出 或 👀持有，第二行起给理由。"
+        )
+        try:
+            return llm_client.generate(system_prompt=system, user_prompt=user, module="sell_advisor")
+        except Exception as e:
+            logger.warning(f"卖出 LLM 决策失败: {e}")
+            return ""
+
+    @classmethod
+    def format_buy_decision(cls, code, name, current_price, change_pct, volume_ratio,
+                            signal_label, tags, detail="") -> str:
+        """
+        B方案：买入 LLM 决策。
+        喂 候选信息 + 今日分时 + 位置/环境/资金，LLM 输出 🔥买入/👀观望/💀放弃。
+        失败返回空串（调用方降级回规则）。
+        """
+        code, name = str(code), str(name)
+        intraday = cls._fetch_intraday(code)
+        context = cls._fetch_context(code, current_price)
+        user = (
+            f"【候选信息】{name}({code}) 现价{current_price} 涨幅{change_pct}% "
+            f"量比{volume_ratio} 信号[{signal_label}] 标签[{','.join(tags or [])}]\n"
+            f"【今日分时OHLCV（O开 H高 L低 C收 V万）】\n{intraday}\n"
+            f"【位置/大盘/资金上下文】{context}\n\n"
+            "判断是否值得买入。首行必须输出：🔥买入 / 👀观望 / 💀放弃，并给出≤80字理由。"
+        )
+        system = (
+            "你是A股短线买入决策操盘手。基于候选信号、分时量价与位置/环境/资金综合判断是否买入。\n"
+            "注意：高位放量可能出货、大盘弱势可能逆势陷阱。首行输出 🔥买入 / 👀观望 / 💀放弃，第二行起给理由。"
+        )
+        try:
+            return llm_client.generate(system_prompt=system, user_prompt=user, module="sell_advisor")
+        except Exception as e:
+            logger.warning(f"买入 LLM 决策失败: {e}")
+            return ""
 
     @classmethod
     def format_alert_message(

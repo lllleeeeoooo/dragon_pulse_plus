@@ -48,9 +48,10 @@ class HoldingManager:
         quantity: int = 100,
         buy_date: str = "",
         strategy: str = "低吸战法",
-        holding_type: str = "MANUAL"
+        holding_type: str = "MANUAL",
+        decision_source: str = "rule"
     ) -> bool:
-        """添加新持仓记录 (若未传入名称则自动匹配)"""
+        """添加新持仓记录 (若未传入名称则自动匹配)。decision_source: B方案 决策来源 llm/rule。"""
         session = db_manager.get_session()
         try:
             import datetime
@@ -68,6 +69,7 @@ class HoldingManager:
                 buy_date=buy_dt,
                 buy_strategy=strategy,
                 holding_type=holding_type,
+                decision_source=decision_source,
                 status="HOLDING"
             )
             session.add(holding)

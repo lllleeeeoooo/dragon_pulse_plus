@@ -274,6 +274,19 @@ class TestAuctionBuyExecution(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(list(merged["code"]), ["600001"])
 
+    def test_一次性评估_二次调用不再进池(self):
+        """推荐标的 09:26 竞价后只评估一次，盘中第二次调用不再进池"""
+        spot = self._spot([("600002", "推荐股", 20.0, 4.0, 1.2, 2e8),
+                           ("600001", "信号股", 10.0, 7.0, 3.0, 5e8)])
+        hit = self._spot([("600001", "信号股", 10.0, 7.0, 3.0, 5e8)])
+        pending = [{"code": "600002", "name": "推荐股",
+                    "auction_verdict": "买入", "auction_premise": "满足"}]
+        m1 = self.m._merge_auction_buy_candidates(spot, hit, pending)
+        self.assertIn("600002", set(m1["code"]))
+        m2 = self.m._merge_auction_buy_candidates(spot, hit, pending)
+        self.assertNotIn("600002", set(m2["code"]))
+        self.assertEqual(list(m2["code"]), ["600001"])
+
 
 if __name__ == "__main__":
     unittest.main()

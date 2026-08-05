@@ -204,6 +204,41 @@ class ConceptCycleManager:
             session.close()
 
     @staticmethod
+    def get_stock_concepts(stock_code: str) -> List[Dict[str, Any]]:
+        """
+        个股 → 所属概念（含各概念阶段/涨停家数/主线分，按主线分排序）。
+        供 API /data/stocks/{code}/concepts 与 LLM 上下文使用。
+        """
+        session = db_manager.get_session()
+        try:
+            code6 = str(stock_code).zfill(6)
+            concepts = [r[0] for r in session.query(ConceptMember.concept_name).filter(
+                ConceptMember.stock_code == code6).all()]
+            if not concepts:
+                return []
+            cycle_map = {r["concept"]: r for r in ConceptCycleManager.get_concept_cycle(top=500)}
+            result = []
+            for c in concepts:
+                info = cycle_map.get(c)
+                if info:
+                    result.append({
+                        "concept": c,
+                        "phase": info.get("phase", ""),
+                        "zt_count": info.get("zt_count", 0),
+                        "is_mainline": bool(info.get("is_mainline", False)),
+                        "mainline_score": info.get("mainline_score", 0),
+                    })
+                else:
+                    result.append({
+                        "concept": c, "phase": "", "zt_count": 0,
+                        "is_mainline": False, "mainline_score": 0,
+                    })
+            result.sort(key=lambda x: (x["mainline_score"], x["zt_count"]), reverse=True)
+            return result
+        finally:
+            session.close()
+
+    @staticmethod
     def _recent_zt_by_concept(session, trade_date: str, lookback: int = 5) -> Dict[str, List[int]]:
         """近 N 个交易日（不含当日）每个概念的涨停家数序列（来自 concept_cycle 历史）"""
         d0 = datetime.datetime.strptime(trade_date, "%Y%m%d").date()

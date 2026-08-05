@@ -483,6 +483,15 @@ def data_concepts_cycle(
     return {"code": 200, "count": len(result), "data": result}
 
 
+@app.get("/data/stocks/{code}/concepts", summary="个股所属概念",
+         description="查个股身上有哪些概念，含各概念阶段/涨停家数/主线分（按主线分降序）。示例：/data/stocks/000815/concepts",
+         tags=["概念"])
+def data_stock_concepts(code: str):
+    from database import ConceptCycleManager
+    result = ConceptCycleManager.get_stock_concepts(code)
+    return {"code": 200, "count": len(result), "data": result}
+
+
 @app.get("/data/mainlines", summary="概念/行业双维度主线对照",
          description="概念主线(题材) vs 行业主线(东财) 并排对照，均含阶段/涨停/最高连板/主线分。",
          tags=["概念"])
