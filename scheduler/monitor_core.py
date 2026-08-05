@@ -50,6 +50,7 @@ class _MonitorCoreMixin:
         self._consistency_alerted_today: bool = False
         self._pending_sell_codes: set = set()  # 跌停中待卖出的股票
         self._alerted_sell_signals: Dict[str, set] = {}  # code -> {signal_type, ...}
+        self._llm_sell_hold_until: Dict[str, float] = {}  # code -> 卖出 LLM 判"持有"冷却到期时间戳
         self._alert_date: str = ""
         # 市场风格缓存（供 API 查询）
         self._current_market_style: Dict[str, str] = {}
@@ -90,6 +91,7 @@ class _MonitorCoreMixin:
             self._consistency_alerted_today = False
             self._pending_sell_codes.clear()
             self._alerted_sell_signals.clear()
+            self._llm_sell_hold_until.clear()
             self._rec_auction_buy_evaluated = set()  # 推荐标的 09:26 一次性评估标记（新交易日重置）
             self._alert_date = today
             self._ma_cache.clear()
@@ -543,8 +545,8 @@ class _MonitorCoreMixin:
                 vol_ratio = float(row["volume_ratio"])
                 amt_billion = float(row["amt_billion"])
 
-                # 当日已推送过该股，跳过（推荐标的除外——需持续评估买入机会，
-                # 避免观望窗口错过买入后被"当日去重"锁死一整天）
+                # 当日已推送过该股，跳过（推荐标的同样锁：09:26 竞价一次性评估
+                # 由 _merge_auction_buy_candidates 负责，推过一次后盘中不再重复评估/推送）
                 if self._skip_alerted_burst(code, pending_codes):
                     continue
 
@@ -624,28 +626,20 @@ class _MonitorCoreMixin:
                 ) and not is_sealed
                 buy_reason = ""
                 if should_buy and code not in self._auto_bought_codes:
-                    # B方案：规则候选已通过，LLM 最终买入决定（失败降级回 rule）
-                    decision_source, llm_allow = self._llm_confirm_buy(
-                        code, name, price, change_pct, vol_ratio, signal_label, [signal_label])
-                    if llm_allow:
-                        # LLM 等待期间价格可能变化：买前用最新快照复核（封板/跌停/回落）
-                        price, recheck_ok = self._recheck_buy_after_llm(code, price)
-                        if not recheck_ok:
-                            logger.info(f"买前复核不通过(已封板/跌停/回落): {name}({code})，放弃买入")
-                        else:
-                            # 仓位管理检查
-                            ai_holdings = HoldingManager.get_active_holdings(holding_type="AI_AUTO")
-                            if len(ai_holdings) >= settings.MAX_AI_POSITIONS:
-                                pass  # 超出最大持仓数，跳过
-                            elif len(self._auto_bought_codes) >= settings.MAX_DAILY_BUYS:
-                                pass  # 超出当日最大买入次数，跳过
-                            elif self._is_daily_loss_breaker_triggered(ai_holdings):
-                                pass  # 当日总亏损熔断，跳过
-                            elif amt_billion >= settings.PATTERN_CHECK_MIN_AMOUNT and self._is_bad_intraday_pattern(code):
-                                pass  # 分时形态不佳（冲高回落/放量滞涨），跳过
-                            elif self._is_sector_concentrated(code, ai_holdings):
-                                pass  # 板块集中度限制（同板块持仓已达上限），跳过
-                            elif not any(h["code"] == code for h in ai_holdings):
+                    # 廉价仓位闸门前置：先过闸门再调 LLM/复核，避免满仓时白烧
+                    # LLM 决策 + 全市场快照复核阻塞 15s 监控主循环（审计#2）
+                    ai_holdings = HoldingManager.get_active_holdings(holding_type="AI_AUTO")
+                    if self._buy_gates_open(code, ai_holdings, amt_billion):
+                        # B方案：规则候选已通过，LLM 最终买入决定（失败降级回 rule）
+                        decision_source, llm_allow = self._llm_confirm_buy(
+                            code, name, price, change_pct, vol_ratio, signal_label, [signal_label])
+                        if llm_allow:
+                            # LLM 等待期间价格可能变化：买前用最新快照复核（封板/跌停/回落）
+                            price, recheck_ok = self._recheck_buy_after_llm(code, price)
+                            if not recheck_ok:
+                                logger.info(f"买前复核不通过(已封板/跌停/回落): {name}({code})，放弃买入")
+                            elif self._buy_gates_open(code, HoldingManager.get_active_holdings(holding_type="AI_AUTO"), amt_billion):
+                                # LLM/复核耗时数秒，期间其他候选可能已买入 → 二次过闸门后再执行
                                 self._auto_bought_codes.add(code)
                                 buy_reason = "复盘推荐" if is_recommended else signal_label
                                 # 成交滑点模型：模拟真实买入成本高于快照价（高位放量信号额外加滑点）
@@ -920,6 +914,26 @@ class _MonitorCoreMixin:
         except Exception:
             return True
 
+    def _buy_gates_open(self, code: str, ai_holdings: list, amt_billion: float) -> bool:
+        """买入闸门是否全部通过（True=可买入）。
+
+        廉价检查集中在 LLM 调用之前：满仓/熔断/形态不佳时直接跳过，
+        不白烧 LLM 决策 + 全市场快照复核（避免阻塞 15s 监控主循环，审计#2）。
+        """
+        if len(ai_holdings) >= settings.MAX_AI_POSITIONS:
+            return False  # 超出最大持仓数
+        if len(self._auto_bought_codes) >= settings.MAX_DAILY_BUYS:
+            return False  # 超出当日最大买入次数
+        if self._is_daily_loss_breaker_triggered(ai_holdings):
+            return False  # 当日总亏损熔断
+        if amt_billion >= settings.PATTERN_CHECK_MIN_AMOUNT and self._is_bad_intraday_pattern(code):
+            return False  # 分时形态不佳（冲高回落/放量滞涨）
+        if self._is_sector_concentrated(code, ai_holdings):
+            return False  # 板块集中度限制
+        if any(h["code"] == code for h in ai_holdings):
+            return False  # 已持仓
+        return True
+
     def _llm_confirm_buy(self, code, name, price, change_pct, vol_ratio,
                          signal_label, tags) -> tuple:
         """
@@ -1011,11 +1025,15 @@ class _MonitorCoreMixin:
             # 矛盾记录只报一次（避免每轮刷屏）
             for c in contradicted - evaluated:
                 logger.warning(f"竞价矛盾: {c} 判断=买入但前提不满足/未声明，不执行")
-            # 一次性：已评估过的推荐标的盘中不再重复进池
+            # 一次性：已评估过的推荐标的盘中不再重复进池。
+            # 注意：买入代码需确认存在于当前快照后才标记"已评估"——避免代码暂缺快照
+            # (停牌/快照不全)时把 09:26 买入指令提前锁死，当天再出现也无法进池（审计#5）
             _new = _auction_buy_codes - evaluated
             if not _new:
+                # 无新候选时也标记矛盾代码，避免每轮重复告警
+                if contradicted - evaluated:
+                    self._rec_auction_buy_evaluated = evaluated | contradicted
                 return hit_df
-            self._rec_auction_buy_evaluated = evaluated | _new | contradicted
         except Exception as _e:
             logger.warning(f"解析竞价买入判定失败: {_e}")
             return hit_df
@@ -1024,7 +1042,10 @@ class _MonitorCoreMixin:
         try:
             _rec_buy_df = spot_df[spot_df["code"].astype(str).isin(_new)].copy()
             if _rec_buy_df.empty:
+                # 新候选不在当前快照：不标记已评估，下轮快照齐全时再进池
                 return hit_df
+            # 仅对确实存在于快照的代码标记"已评估"（含矛盾代码，避免重复告警）
+            self._rec_auction_buy_evaluated = evaluated | set(_rec_buy_df["code"].astype(str)) | contradicted
             for _col in ("_signal_burst", "_signal_near_limit",
                          "_signal_low_open_rally", "_signal_amplitude"):
                 _rec_buy_df[_col] = False
@@ -1202,12 +1223,13 @@ class _MonitorCoreMixin:
 
                 for sig in signals:
                     sig_type = sig["type"]
-                    # 去重：同股同类型卖出信号当日仅推送一次
+                    # 去重：同股同类型卖出信号当日仅推送一次。
+                    # 注意：标记必须放在"实际采取动作(卖出/推送)"之后——LLM 判"持有"不落标记，
+                    # 下轮携带最新行情重新复核，避免一条陈旧判断把该信号锁死一整天（风控缺口）
                     if code not in self._alerted_sell_signals:
                         self._alerted_sell_signals[code] = set()
                     if sig_type in self._alerted_sell_signals[code]:
                         continue
-                    self._alerted_sell_signals[code].add(sig_type)
 
                     # 触发卖出信号 → 自动平仓（跌停时不卖，等破板）
                     hold_type = holding.get("holding_type", "MANUAL")
@@ -1219,6 +1241,7 @@ class _MonitorCoreMixin:
                             self._pending_sell_codes.add(code)
                             if code not in self._alerted_sell_signals.get("__dt_pending__", set()):
                                 self._alerted_sell_signals.setdefault("__dt_pending__", set()).add(code)
+                                self._alerted_sell_signals[code].add(sig_type)
                                 bark_notifier.send(
                                     title=f"🔒 [跌停锁定] {holding.get('name')}({code})",
                                     body=f"触发 {sig['type']} 但当前跌停({curr_change_pct}%)，暂不平仓，等破跌停板后自动卖出。",
@@ -1230,12 +1253,19 @@ class _MonitorCoreMixin:
                         # B方案：除绝对止损(硬护栏)外，断板/破位/止盈/时间止损 由 LLM 复核决定
                         decision_source = "rule"
                         if sig_type != "绝对止损":
+                            # LLM 复核冷却：判"持有"后 N 秒内不重复咨询，避免持续信号每 15s
+                            # 轮询都阻塞调 LLM(20-60s)；冷却到期后携最新行情重新复核（审计#3风控缺口的另一面）
+                            if time.time() < self._llm_sell_hold_until.get(code, 0):
+                                continue
                             decision_source, do_sell = self._llm_confirm_sell(
                                 holding, sig, curr_price, curr_change_pct, holding_days)
                             if not do_sell:
-                                logger.info(f"LLM 判持有: {holding.get('name')}({code}) {sig_type} 不卖出")
-                                continue  # LLM 判持有 → 不卖
+                                self._llm_sell_hold_until[code] = time.time() + settings.LLM_SELL_HOLD_COOLDOWN_SECONDS
+                                logger.info(f"LLM 判持有: {holding.get('name')}({code}) {sig_type} 不卖出，"
+                                            f"{settings.LLM_SELL_HOLD_COOLDOWN_SECONDS}s 内不重复咨询")
+                                continue  # LLM 判持有 → 不卖（不落去重标记，冷却到期后重新复核）
 
+                        self._alerted_sell_signals[code].add(sig_type)
                         sell_px = curr_price
                         if hold_type == "AI_AUTO":
                             sell_px = round(curr_price * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)  # AI卖出模拟滑点
@@ -1249,6 +1279,7 @@ class _MonitorCoreMixin:
                             level="timeSensitive"
                         )
                     else:
+                        self._alerted_sell_signals[code].add(sig_type)
                         bark_notifier.send(
                             title=f"🚨 [{sig['type']}] {holding.get('name')}",
                             body=sig["reason"],

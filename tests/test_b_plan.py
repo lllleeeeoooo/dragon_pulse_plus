@@ -126,6 +126,60 @@ class TestRecheckBuy(unittest.TestCase):
         self.assertEqual(price, 10.0)
 
 
+class TestSellHoldCooldown(unittest.TestCase):
+    """卖出 LLM 判「持有」后冷却：持续信号不每 15s 重复咨询 LLM（审计#3 补充）"""
+
+    def setUp(self):
+        self.m = _MonitorCoreMixin()
+        self.m._pending_sell_codes = set()
+        self.holding = {
+            "code": "600001", "name": "A", "cost_price": 10.0,
+            "current_price": 9.0, "holding_type": "AI_AUTO",
+            "buy_date": "2026-01-01", "was_limit_up_today": False,
+        }
+        self.spot = pd.DataFrame([{
+            "code": "600001", "price": 9.0, "change_pct": -10.0,
+            "open": 9.5, "high": 9.6, "low": 9.0, "volume": 1000000, "amount": 9000000,
+        }])
+        self._sell = patch("scheduler.monitor_core.DynamicSellAdvisor.format_sell_decision",
+                           return_value="👀持有：缩量假摔")
+        self._patches = [
+            patch.object(self.m, "_get_ma_prices", return_value={"ma5": 9.5}),
+            patch("scheduler.monitor_core.HoldingMonitor.check_sell_signals",
+                  return_value=[{"type": "破位止损", "level": "HIGH", "reason": "跌破MA5"}]),
+            patch("scheduler.monitor_core.HoldingManager.batch_update_profit_rates"),
+            patch("scheduler.monitor_core.HoldingManager.update_was_limit_up"),
+            patch("scheduler.monitor_core.HoldingManager.close_holding"),
+            patch("scheduler.monitor_core.bark_notifier.send"),
+            patch.object(_MonitorCoreMixin, "_is_limit_up", staticmethod(lambda c, chg: False), create=True),
+            patch.object(_MonitorCoreMixin, "_is_limit_down", staticmethod(lambda c, chg: False), create=True),
+            self._sell,
+        ]
+        self._sell_mock = None
+        for _p in self._patches:
+            m = _p.start()
+            if _p is self._sell:
+                self._sell_mock = m
+        self.addCleanup(self._teardown)
+
+    def _teardown(self):
+        for _p in self._patches:
+            _p.stop()
+
+    def test_判持有后冷却期不重复咨询(self):
+        self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
+        self.assertEqual(self._sell_mock.call_count, 1)
+        # 冷却未到期：再轮询不应重新咨询 LLM
+        self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
+        self.assertEqual(self._sell_mock.call_count, 1)
+
+    def test_冷却到期后重新复核(self):
+        self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
+        self.m._llm_sell_hold_until["600001"] = 0.0  # 手动拨到已过期
+        self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
+        self.assertEqual(self._sell_mock.call_count, 2)
+
+
 class TestDecisionSourceRecord(unittest.TestCase):
     """买入决策来源落库"""
 

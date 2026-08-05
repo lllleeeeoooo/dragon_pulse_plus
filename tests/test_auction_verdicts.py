@@ -133,9 +133,10 @@ class TestAlertedSkip(unittest.TestCase):
         # 600999 已推送过且不是推荐 → 跳过
         self.assertTrue(self.m._skip_alerted_burst("600999", {"600001"}))
 
-    def test_推荐已推送不跳过(self):
-        # 600001 是推荐（在 pending_codes）即使已推送 → 不跳过，持续评估买入
-        self.assertFalse(self.m._skip_alerted_burst("600001", {"600001", "600999"}))
+    def test_推荐已推送同样锁(self):
+        # B方案：推荐标的只做 09:26 竞价一次性评估，推过后同样锁（盘中不再重复评估/推送）
+        self.m._alerted_burst_codes.add("600001")
+        self.assertTrue(self.m._skip_alerted_burst("600001", {"600001", "600999"}))
 
     def test_未推送不跳过(self):
         self.assertFalse(self.m._skip_alerted_burst("600002", set()))

@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     MONITOR_INTERVAL_SECONDS: int = Field(default=15, description="盘中实时快照轮询间隔(秒)")
     MONITOR_POOL_CACHE_SECONDS: int = Field(default=60, description="涨停/炸板池缓存刷新间隔(秒)")
     MONITOR_LLM_ALERT_LIMIT: int = Field(default=10, description="每日 LLM 润色异动推送次数上限")
+    LLM_SELL_HOLD_COOLDOWN_SECONDS: int = Field(default=1800, description="卖出 LLM 判「持有」后冷却(秒)，冷却期内不重复咨询，避免持续信号每 15s 阻塞调 LLM（默认 30 分钟）")
     MONITOR_NEAR_LIMIT_RATIO: float = Field(default=0.84, description="逼近封板区间 = 涨停线 × 比值")
     NEAR_LIMIT_VOL_RATIO: float = Field(default=5.0, description="逼近封板信号：量比下限")
     RALLY_VOL_RATIO: float = Field(default=3.0, description="低开猛拉/振幅放量信号：量比下限")

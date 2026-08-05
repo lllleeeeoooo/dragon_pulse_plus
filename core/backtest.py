@@ -508,22 +508,29 @@ class AIBacktestEngine:
         try:
             import akshare as ak
             end_dt = datetime.datetime.strptime(date_str, "%Y%m%d")
-            start_dt = end_dt - datetime.timedelta(days=10)
-            df = ak.stock_zh_a_hist(
-                symbol=code, period="daily",
-                start_date=start_dt.strftime("%Y%m%d"),
-                end_date=date_str, adjust="qfq"
-            )
-            if df is not None and not df.empty:
-                close_col = "收盘" if "收盘" in df.columns else (
-                    df.columns[2] if len(df.columns) > 2 else df.columns[0]
+            closes = None
+            # 自适应放宽窗口：长假（春节/国庆≈8-9个连续休市日）后 10 个自然日
+            # 可能不足 5 个交易日 → MA5 缺失 → 破位止损在回测中静默失效。
+            # 逐档放宽直到凑够 5 根日线（仅长假邻近日多一次请求，日常取第一档即中）。
+            for days in (10, 25, 60):
+                start_dt = end_dt - datetime.timedelta(days=days)
+                df = ak.stock_zh_a_hist(
+                    symbol=code, period="daily",
+                    start_date=start_dt.strftime("%Y%m%d"),
+                    end_date=date_str, adjust="qfq"
                 )
-                closes = pd.to_numeric(df[close_col], errors="coerce").dropna()
-                if closes.empty:
-                    return None, None
-                close = float(closes.iloc[-1])
-                ma5 = float(closes.tail(5).mean()) if len(closes) >= 5 else None
-                return close, ma5
+                if df is not None and not df.empty:
+                    close_col = "收盘" if "收盘" in df.columns else (
+                        df.columns[2] if len(df.columns) > 2 else df.columns[0]
+                    )
+                    closes = pd.to_numeric(df[close_col], errors="coerce").dropna()
+                    if len(closes) >= 5:
+                        break
+            if closes is None or closes.empty:
+                return None, None
+            close = float(closes.iloc[-1])
+            ma5 = float(closes.tail(5).mean()) if len(closes) >= 5 else None
+            return close, ma5
         except Exception:
             pass
         return None, None

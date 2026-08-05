@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Dict, Any
 import pandas as pd
 
@@ -6,6 +7,22 @@ from llm.client import llm_client
 from config.prompt_templates import DYNAMICS_SYSTEM_PROMPT, DYNAMICS_USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
+
+# 全市场快照短 TTL 缓存：同一监控周期内多个候选股共用一份 LLM 上下文，
+# 避免每只股票都重下全市场资金流/涨停池/指数快照（审计#7 性能）
+_CTX_CACHE_TTL = 30  # 秒：覆盖一个 15s 监控周期 + LLM 决策耗时，数据变化可忽略
+_ctx_cache = {}
+
+
+def _ctx_cached(key: str, fetcher):
+    """TTL 缓存包装：命中且未过期直接复用；过期/未命中则重新拉取并缓存。fetcher 返回 DataFrame。"""
+    now = time.time()
+    hit = _ctx_cache.get(key)
+    if hit is not None and now - hit[0] < _CTX_CACHE_TTL:
+        return hit[1]
+    val = fetcher()
+    _ctx_cache[key] = (now, val)
+    return val
 
 
 class DynamicSellAdvisor:
@@ -58,9 +75,10 @@ class DynamicSellAdvisor:
                 ma5 = sum(real[-5:]) / 5 if len(real) >= 5 else None
                 ma10 = sum(real[-10:]) / min(10, len(real)) if len(real) >= 10 else None
                 ma20 = sum(real[-20:]) / min(20, len(real)) if len(real) >= 20 else None
-                # 近5日累计：现价 vs 5个交易日前收盘（含今日实时）
-                if len(closes) >= 6 and closes[-6]:
-                    recent_5d = round((float(current_price) - closes[-6]) / closes[-6] * 100, 2)
+                # 近5日累计：现价 vs 5个交易日前收盘（含今日实时）。
+                # closes 不含今日（closes[-1]=昨收），5个交易日前 = closes[-5]，勿用 closes[-6]（那是 6 日跨度）
+                if len(closes) >= 5 and closes[-5]:
+                    recent_5d = round((float(current_price) - closes[-5]) / closes[-5] * 100, 2)
                     parts.append(f"个股近5日累计{recent_5d:+.1f}%")
                 if ma5:
                     pos = "高于" if current_price >= ma5 else "低于"
@@ -74,7 +92,7 @@ class DynamicSellAdvisor:
         try:
             # 上证实时涨跌（新浪实时指数快照；勿用 stock_zh_index_daily——盘中只更新到昨日）
             import akshare as ak
-            idx = ak.stock_zh_index_spot_sina()
+            idx = _ctx_cached("index_spot", ak.stock_zh_index_spot_sina)
             if idx is not None and not idx.empty:
                 m = idx[idx["代码"].astype(str) == "sh000001"]
                 if not m.empty:
@@ -84,7 +102,7 @@ class DynamicSellAdvisor:
             pass
         try:
             from data.fetcher import DataFetcher
-            instant = DataFetcher.get_fund_flow_instant()
+            instant = _ctx_cached("fund_flow_instant", DataFetcher.get_fund_flow_instant)
             if instant is not None and not instant.empty:
                 m = instant[instant["code"].astype(str) == str(code).zfill(6)]
                 if not m.empty:
@@ -106,7 +124,9 @@ class DynamicSellAdvisor:
         try:
             import datetime as _dt
             from data.fetcher import DataFetcher
-            zt = DataFetcher.get_zt_pool(date_str=_dt.date.today().strftime("%Y%m%d"))
+            _zt_date = _dt.date.today().strftime("%Y%m%d")
+            zt = _ctx_cached(f"zt_pool_{_zt_date}",
+                             lambda: DataFetcher.get_zt_pool(date_str=_zt_date))
             if zt is not None and not zt.empty and "code" in zt.columns:
                 code6 = str(code).zfill(6)
                 m = zt[zt["code"].astype(str) == code6]
@@ -122,35 +142,26 @@ class DynamicSellAdvisor:
                     parts.append(f"市场最高{max_lbc}板")
         except Exception:
             pass
-        # 6. 概念（题材）—— A股短线炒的是概念，行业仅供参考
+        # 6. 概念（题材）—— A股短线炒的是概念，行业仅供参考。
+        # 复用 ConceptCycleManager.get_stock_concepts（个股→概念+阶段/涨停家数/主线分，已按主线分排序），
+        # 避免与 /data/stocks/{code}/concepts 接口各自实现、日后字段/过滤逻辑漂移（审计#10）
         try:
-            from database.connection import db_manager
-            from database.models import ConceptMember
             from database import ConceptCycleManager
-            code6 = str(code).zfill(6)
-            session = db_manager.get_session()
-            try:
-                concepts = [r[0] for r in session.query(ConceptMember.concept_name).filter(
-                    ConceptMember.stock_code == code6).all()]
-            finally:
-                session.close()
-            if concepts:
-                cycle = ConceptCycleManager.get_concept_cycle(top=500)
-                cycle_map = {r["concept"]: r for r in cycle}
-                mine = [c for c in concepts if c in cycle_map]
-                # 按主线分(涨停×持续×加速×高度)排序——主线分高 = 当下最可能炒的概念
-                mine.sort(key=lambda c: (cycle_map[c].get("mainline_score", 0),
-                                         cycle_map[c].get("zt_count", 0)), reverse=True)
+            stock_concepts = ConceptCycleManager.get_stock_concepts(code)
+            if stock_concepts:
+                # 有周期记录的概念才参与主线展示（无记录=冷门/新题材，phase/score 均空 → 自然排除；
+                # get_stock_concepts 已按主线分降序，无需重排）
+                mine = [r for r in stock_concepts if r["phase"] or r["mainline_score"] or r["zt_count"] or r["is_mainline"]]
                 # 退潮/冰点概念不是当下主线，优先展示活跃概念（无活跃则回退全部）
-                active = [c for c in mine if cycle_map[c].get("phase") not in ("退潮", "冰点")]
+                active = [r for r in mine if r["phase"] not in ("退潮", "冰点")]
                 top_n = (active or mine)[:2]
                 if top_n:
                     parts.append("概念:" + "/".join(
-                        (("★" if cycle_map[c].get("is_mainline") else "") +
-                         f"{c}[{cycle_map[c].get('phase', '')}]{cycle_map[c].get('zt_count', 0)}家")
-                        for c in top_n))
+                        (("★" if r["is_mainline"] else "") +
+                         f"{r['concept']}[{r['phase']}]{r['zt_count']}家")
+                        for r in top_n))
                 else:
-                    parts.append(f"概念:{','.join(concepts[:3])}")
+                    parts.append(f"概念:{','.join(r['concept'] for r in stock_concepts[:3])}")
         except Exception:
             pass
         return " | ".join(parts) if parts else "暂无额外上下文"

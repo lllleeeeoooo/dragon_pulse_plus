@@ -235,9 +235,11 @@ class _MonitorSignalsMixin:
             if prev > 0 and cur > 0:
                 changes.append((cur - prev) / prev * 100)
             else:
-                # 昨收缺失（当日新买/数据未同步）：当日盈亏无基准，按中性 0 计
-                # （不混入持仓总盈亏口径，审计🟡①：避免污染当日平均盈亏）
-                changes.append(0.0)
+                # 昨收缺失（当日新买/存量行迁移后 prev_close=0）：优先用监控实时刷新的
+                # change_pct（股票当日市场涨跌幅），避免当日重亏持仓被按 0 计导致熔断盲区；
+                # 两者皆无才按中性 0 计（不混入持仓总盈亏口径，审计🟡①）
+                chg = float(h.get("change_pct") or 0)
+                changes.append(chg)
         if not changes:
             return False
         avg_profit = sum(changes) / len(changes)
