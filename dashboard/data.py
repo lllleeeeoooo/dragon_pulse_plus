@@ -169,16 +169,19 @@ def _build_portfolio_section(
         "cumulative_pnl_pct": pnl_report.get("cumulative_total_pnl_pct", 0),
         "profit_count": pnl_report.get("profit_count", 0),
         "loss_count": pnl_report.get("loss_count", 0),
+        # 持仓表 = 全部活跃持仓（AI+手动，监控用）；盈亏金额统计 = AI 专属报告
         "positions": [{
             "code": h["code"], "name": h["name"],
-            "profit_pct": h["profit_pct"],
-            "today_change": h.get("today_change_pct", 0),
+            "profit_pct": h.get("profit_rate", 0),
+            "today_change": round((h.get("current_price", 0) - h.get("prev_close_price", 0))
+                                  / h.get("prev_close_price", 0) * 100, 2)
+                                if h.get("prev_close_price", 0) and h.get("current_price", 0) else 0,
             "cost_price": h["cost_price"],
             "current_price": h["current_price"],
-            "strategy": h.get("strategy", ""),
-            "type": h.get("type", ""),
+            "strategy": h.get("buy_strategy", ""),
+            "type": h.get("holding_type", ""),
             "buy_date": h.get("buy_date", ""),
-        } for h in pnl_report.get("holdings", [])[:20]],
+        } for h in holdings[:20]],
     }
 
 

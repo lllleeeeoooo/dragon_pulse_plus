@@ -83,7 +83,7 @@ def job_post_market():
         k_factor = market_style.get("capacity_factor", 1.0)
         logger.info(
             f"盘后周期判定: [{cycle_stage}] {cycle_reason} | "
-            f"风格:{market_style.get('style')} K={k_factor:.2f}(今日{total_amount:.0f}亿/均{baseline:.0f}亿) | "
+            f"风格:{market_style.get('style')} K={k_factor:.2f}(今日{total_amount_billion:.0f}亿/均{baseline:.0f}亿) | "
             f"涨停{emotion_res['zt_count']}/跌停{emotion_res['dt_count']}/"
             f"溢价{emotion_res['yield_rate']}%/情绪{emotion_res['sentiment_index']}"
         )
@@ -101,7 +101,7 @@ def job_post_market():
         # 生成深度复盘分析（传入风格判定供 LLM 参考）
         style_info = (
             f"周期={cycle_stage}({cycle_reason}) "
-            f"风格={market_style.get('style')} K={k_factor:.2f}(今日{total_amount:.0f}亿/均{baseline:.0f}亿) "
+            f"风格={market_style.get('style')} K={k_factor:.2f}(今日{total_amount_billion:.0f}亿/均{baseline:.0f}亿) "
             f"推荐战法={market_style.get('priority_strategy', '')} {style_reason}"
         )
         review_report = ""

@@ -60,6 +60,7 @@ class HoldingManager:
                 name=stock_name,
                 cost_price=cost_price,
                 current_price=cost_price,
+                prev_close_price=cost_price,  # 买入日以成本为"昨收"基准，当日盈亏=(今收-成本)/成本
                 profit_rate=0.0,
                 quantity=quantity,
                 buy_date=buy_dt,
@@ -353,8 +354,11 @@ class HoldingManager:
         try:
             today_str = _dt.datetime.now().strftime("%Y-%m-%d")
 
-            # ----- 当前持仓（浮动盈亏）-----
-            active = session.query(Holding).filter(Holding.status == "HOLDING").all()
+            # ----- 当前持仓（浮动盈亏，仅 AI 自动持仓——手动持仓只用于监控不入报告）-----
+            active = session.query(Holding).filter(
+                Holding.status == "HOLDING",
+                Holding.holding_type == "AI_AUTO"
+            ).all()
             holdings_detail = []
             total_unrealized_pnl = 0.0
             total_today_pnl = 0.0
@@ -395,9 +399,10 @@ class HoldingManager:
             # 按浮动盈亏排序
             holdings_detail.sort(key=lambda x: x["profit_pct"], reverse=True)
 
-            # ----- 今日平仓（已实现盈亏）-----
+            # ----- 今日平仓（已实现盈亏，仅 AI 自动持仓）-----
             today_closed = session.query(Holding).filter(
                 Holding.status == "CLOSED",
+                Holding.holding_type == "AI_AUTO",
                 Holding.updated_at >= today_str
             ).all()
 
@@ -419,8 +424,11 @@ class HoldingManager:
                     "strategy": h.buy_strategy or "",
                 })
 
-            # ----- 全部已实现盈亏（累计）-----
-            all_closed = session.query(Holding).filter(Holding.status == "CLOSED").all()
+            # ----- 全部已实现盈亏（累计，仅 AI 自动持仓）-----
+            all_closed = session.query(Holding).filter(
+                Holding.status == "CLOSED",
+                Holding.holding_type == "AI_AUTO"
+            ).all()
             total_realized_pnl = 0.0
             total_closed_count = len(all_closed)
             closed_wins = 0

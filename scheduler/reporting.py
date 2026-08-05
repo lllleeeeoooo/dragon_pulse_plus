@@ -15,6 +15,21 @@ from database import HoldingManager, MarketIndexManager, DailySnapshotManager
 def _push_daily_pnl_report(trade_date: str, spot_df=None):
     """盘后每日盈亏推送：同步收盘价 + 生成盈亏报告 + Bark 推送。"""
 
+    # 幂等守卫：当日已有净值快照则整体跳过（防止手动/定时重复跑导致 prev_close 二次滚存、今日涨跌归零）
+    try:
+        from database.models import DailyEquitySnapshot
+        from database.connection import db_manager
+        session = db_manager.get_session()
+        try:
+            if session.query(DailyEquitySnapshot).filter(
+                    DailyEquitySnapshot.trade_date == trade_date).first():
+                logger.info(f"{trade_date} 盈亏报告已生成过，跳过重复执行")
+                return
+        finally:
+            session.close()
+    except Exception as e:
+        logger.warning(f"检查盈亏报告幂等失败: {e}")
+
     # 1. 用今日收盘价刷新持仓当前价（保留 prev_close 昨收基准，供"今日涨跌"计算）
     spot_map = {}
     if spot_df is not None and not spot_df.empty:

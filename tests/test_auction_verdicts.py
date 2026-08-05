@@ -127,13 +127,18 @@ class TestCycleFreshness(unittest.TestCase):
 
     def setUp(self):
         self.m = _MonitorCoreMixin()
+        from core.trade_calendar import get_previous_trading_day
+        import datetime
+        self._expected = get_previous_trading_day(datetime.date.today())  # 动态取上一交易日
 
     def test_达到上一交易日为新鲜(self):
-        # 今日 20260804，上一交易日 20260803
-        self.assertTrue(self.m._check_cycle_fresh("20260803", "板块"))
+        self.assertTrue(self.m._check_cycle_fresh(self._expected, "板块"))
 
     def test_落后为陈旧(self):
-        self.assertFalse(self.m._check_cycle_fresh("20260801", "板块"))
+        import datetime
+        stale = (datetime.datetime.strptime(self._expected, "%Y%m%d")
+                 - datetime.timedelta(days=3)).strftime("%Y%m%d")
+        self.assertFalse(self.m._check_cycle_fresh(stale, "板块"))
 
     def test_空数据为陈旧(self):
         self.assertFalse(self.m._check_cycle_fresh("", "板块"))
