@@ -49,8 +49,8 @@ class LLMClient:
         self.base_url = base_url or settings.LLM_BASE_URL
         self.model = model or settings.LLM_MODEL
         self.temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
-        self.timeout = timeout or settings.LLM_TIMEOUT
-        self.max_retries = max_retries or settings.LLM_MAX_RETRIES
+        self.timeout = timeout if timeout is not None else settings.LLM_TIMEOUT  # 审计🟡⑥：允许显式传 0
+        self.max_retries = max_retries if max_retries is not None else settings.LLM_MAX_RETRIES
 
         # 初始化 OpenAI 客户端（SDK 层重试设为 0，由 generate() 方法统一控制重试次数）
         self.client = OpenAI(
@@ -144,6 +144,8 @@ class LLMClient:
                 return content.strip()
             except Exception as e:
                 logger.error(f"备用模型 [{backup_model}] 也失败: {e}")
+                self._persist_llm_log(module, system_prompt, user_prompt, "",
+                                      0, False, f"主备均失败 fallback:{backup_model} {str(e)[:200]}")  # 审计🟡⑦
 
         return ""
 

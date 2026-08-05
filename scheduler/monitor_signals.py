@@ -235,8 +235,9 @@ class _MonitorSignalsMixin:
             if prev > 0 and cur > 0:
                 changes.append((cur - prev) / prev * 100)
             else:
-                # 昨收缺失（当日新买/数据未同步），退用持仓总收益率近似
-                changes.append(float(h.get("profit_rate") or 0))
+                # 昨收缺失（当日新买/数据未同步）：当日盈亏无基准，按中性 0 计
+                # （不混入持仓总盈亏口径，审计🟡①：避免污染当日平均盈亏）
+                changes.append(0.0)
         if not changes:
             return False
         avg_profit = sum(changes) / len(changes)

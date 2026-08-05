@@ -331,7 +331,8 @@ class _HistoryMixin:
             mid_close = closes.iloc[mid_start:mid_end]
             mid_high = highs.iloc[mid_start:mid_end]
             mid_low = lows.iloc[mid_start:mid_end]
-            mid_range = (mid_high.max() - mid_low.min()) / mid_close.mean() * 100
+            mid_mean = mid_close.mean()
+            mid_range = (mid_high.max() - mid_low.min()) / mid_mean * 100 if mid_mean > 0 else 0.0  # 审计🟡⑤：除零防御
             breakout = (closes.iloc[-1] - closes.iloc[mid_end]) / closes.iloc[mid_end] * 100
             if mid_range < 1.5 and breakout > 2:
                 patterns.append("横盘突破")

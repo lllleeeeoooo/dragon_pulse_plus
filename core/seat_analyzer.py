@@ -40,7 +40,8 @@ class SeatAnalyzer:
             return {
                 "summary": "今日无龙虎榜数据或数据为空",
                 "seat_types": [],
-                "risk_warning": "无"
+                "risk_warning": "无",
+                "detected_seats": []  # 审计🟡④：空/非空分支返回结构统一
             }
 
         from database import SeatProfileManager  # 延迟导入避免循环依赖

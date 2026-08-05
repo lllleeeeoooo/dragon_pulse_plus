@@ -21,11 +21,22 @@ class ActiveCorePool:
 
     @staticmethod
     def calculate_beta(stock_prices: pd.Series, index_prices: pd.Series) -> float:
-        """Calculate Pearson correlation between stock and sector index."""
+        """Calculate Pearson correlation between stock and sector index.
+        审计🟡③：两序列若带日期索引则按日期对齐；否则按"最近 N 天"对齐，
+        避免停牌/新股天数不足时按位置从头错位导致相关性失真。"""
         if len(stock_prices) < 5 or len(index_prices) < 5:
             return 0.0
         try:
-            df = pd.DataFrame({"stock": stock_prices, "index": index_prices}).dropna()
+            s_idx = getattr(stock_prices, "index", None)
+            i_idx = getattr(index_prices, "index", None)
+            if isinstance(s_idx, pd.DatetimeIndex) and isinstance(i_idx, pd.DatetimeIndex):
+                df = pd.DataFrame({"stock": stock_prices, "index": index_prices}).dropna()
+            else:
+                n = min(len(stock_prices), len(index_prices))
+                df = pd.DataFrame({
+                    "stock": stock_prices.tail(n).reset_index(drop=True),
+                    "index": index_prices.tail(n).reset_index(drop=True),
+                }).dropna()
             if len(df) < 5:
                 return 0.0
             corr = df["stock"].corr(df["index"])

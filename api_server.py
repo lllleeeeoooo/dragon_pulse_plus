@@ -84,26 +84,7 @@ def add_holding(
         raise HTTPException(status_code=500, detail="添加持仓失败，请检查数据库")
 
 
-# 兼容旧版 GET 请求（保留灵活性，但标记为 deprecated）
-@app.get("/holdings/add", summary="[已弃用] 添加新持仓股票 - 请使用 POST")
-def add_holding_get(
-    code: str = Query(..., description="股票代码"),
-    price: float = Query(..., description="买入成本价"),
-    quantity: int = Query(100, description="持仓数量"),
-    strategy: str = Query("低吸战法", description="买入战法标签"),
-    buy_date: str = Query("", description="买入日期 YYYY-MM-DD")
-):
-    """向后兼容的 GET 接口，建议迁移至 POST"""
-    return add_holding(
-        x_api_key=None,  # GET 兼容模式下不强制鉴权
-        code=code,
-        price=price,
-        quantity=quantity,
-        strategy=strategy,
-        buy_date=buy_date
-    )
-
-
+# 兼容旧版 GET 请求（已移除：与鉴权矛盾——配置 API Key 后必 403，且无鉴权写入口有安全风险，审计🟡⑧）
 @app.post("/holdings/close", summary="平仓/卖出指定股票")
 def close_holding(
     x_api_key: Optional[str] = Header(None),
@@ -125,13 +106,7 @@ def close_holding(
         raise HTTPException(status_code=404, detail=f"未找到代码为 {code} 的活跃持仓")
 
 
-# 兼容旧版 GET 请求
-@app.get("/holdings/close", summary="[已弃用] 平仓/卖出指定股票 - 请使用 POST")
-def close_holding_get(code: str = Query(..., description="股票代码")):
-    """向后兼容的 GET 接口，建议迁移至 POST"""
-    return close_holding(x_api_key=None, code=code)
-
-
+# 兼容旧版 GET 请求已移除（见 /holdings/add 注释，审计🟡⑧）
 @app.get("/push-logs", summary="查询推送历史记录")
 def get_push_logs(
     date: Optional[str] = Query(None, description="查询日期，格式 YYYY-MM-DD，不填返回最近50条"),

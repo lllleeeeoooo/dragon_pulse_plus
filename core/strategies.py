@@ -224,8 +224,13 @@ class StrategyAnalyzer:
             tags.append("避险抱团")
 
         # ====== 5. 打板战法：涨停板接力 ======
-        # 条件：涨幅达到涨停线（主板9.5%/双创19.5%，按代码前缀自动区分）
-        limit_line = 19.5 if str(stock_code).startswith(("30", "688")) else 9.5
+        # 条件：涨幅达到涨停线（主板10%/双创20%/北交所30%，按代码前缀自动区分，审计🟡②）
+        if str(stock_code).startswith(("43", "83", "87", "92")):
+            limit_line = 30.0    # 北交所 30cm
+        elif str(stock_code).startswith(("30", "688")):
+            limit_line = 19.5    # 双创 20cm
+        else:
+            limit_line = 9.5     # 主板 10cm
         if change_pct >= limit_line:
             tags.append("打板接力")
 
