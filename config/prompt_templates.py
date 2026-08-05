@@ -201,4 +201,7 @@ DYNAMICS_USER_TEMPLATE = """
 
 【今日实时分时OHLCV（时间 O开盘 H最高 L最低 C收盘 V成交额）】
 {intraday_data}
+
+【个股/大盘/资金上下文】
+{context_data}
 """

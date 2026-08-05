@@ -40,6 +40,53 @@ class DynamicSellAdvisor:
             return f"分时数据获取失败: {e}"
 
     @classmethod
+    def _fetch_context(cls, code: str, current_price: float) -> str:
+        """
+        补充 LLM 判断上下文（数据不足修复）：
+        1. 个股位置：近5日累计涨跌 + MA5/MA10/MA20 + 现价 vs MA5
+        2. 大盘环境：上证指数今日涨跌（新浪日线兜底）
+        3. 主力资金：同花顺全市场净流入（东财限流时的替代源）
+        任一项失败则省略该项，不影响主流程。
+        """
+        parts = []
+        try:
+            from data.fetcher import DataFetcher
+            ma = DataFetcher.get_stock_ma_prices(code, lookback=30)
+            closes = DataFetcher.get_stock_daily_closes(code, lookback=6)
+            if len(closes) >= 2 and closes[0]:
+                recent_5d = round((closes[-1] - closes[0]) / closes[0] * 100, 2)
+                parts.append(f"近5日累计{recent_5d:+.1f}%")
+            if ma.get("ma5"):
+                pos = "高于" if current_price >= ma["ma5"] else "低于"
+                parts.append(f"现价{pos}MA5({ma['ma5']:.2f})")
+                if ma.get("ma10"):
+                    parts.append(f"MA10={ma['ma10']:.2f}")
+                if ma.get("ma20"):
+                    parts.append(f"MA20={ma['ma20']:.2f}")
+        except Exception:
+            pass
+        try:
+            import akshare as ak
+            idx = ak.stock_zh_index_daily(symbol="sh000001")
+            if idx is not None and not idx.empty and len(idx) >= 2:
+                closes = pd.to_numeric(idx["close"], errors="coerce").dropna()
+                idx_chg = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100
+                parts.append(f"上证今日{idx_chg:+.2f}%")
+        except Exception:
+            pass
+        try:
+            from data.fetcher import DataFetcher
+            instant = DataFetcher.get_fund_flow_instant()
+            if instant is not None and not instant.empty:
+                m = instant[instant["code"].astype(str) == str(code).zfill(6)]
+                if not m.empty:
+                    net = float(m.iloc[0].get("net_amount", 0) or 0)
+                    parts.append(f"主力净流入{net / 1e8:+.2f}亿")
+        except Exception:
+            pass
+        return " | ".join(parts) if parts else "暂无额外上下文"
+
+    @classmethod
     def format_alert_message(
         cls,
         trigger_type: str,
@@ -67,7 +114,8 @@ class DynamicSellAdvisor:
             volume_ratio=volume_ratio,
             strategy_tag=strategy_tag,
             detail_info=detail_info,
-            intraday_data=intraday_raw
+            intraday_data=intraday_raw,
+            context_data=cls._fetch_context(stock_code, current_price)
         )
 
         try:
