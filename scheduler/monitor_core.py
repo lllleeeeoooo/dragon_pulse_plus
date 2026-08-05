@@ -98,6 +98,12 @@ class _MonitorCoreMixin:
             global _circuit_breaker_alerted
             self._circuit_breaker_alerted = False
             _circuit_breaker_alerted = False
+            # 审计①：清空竞价预判缓存，避免跨日读到前一天预判喂给 09:26 竞价 LLM
+            try:
+                import scheduler.monitor_auction as _ma
+                _ma._auction_prediction_cache = ""
+            except Exception:
+                pass
             self._prev_seal_amounts.clear()
             self._alerted_seal_decay_codes.clear()
             self._prev_sector_counts.clear()
@@ -536,8 +542,9 @@ class _MonitorCoreMixin:
                 vol_ratio = float(row["volume_ratio"])
                 amt_billion = float(row["amt_billion"])
 
-                # 当日已推送过该股，跳过
-                if code in self._alerted_burst_codes:
+                # 当日已推送过该股，跳过（推荐标的除外——需持续评估买入机会，
+                # 避免观望窗口错过买入后被"当日去重"锁死一整天）
+                if self._skip_alerted_burst(code, pending_codes):
                     continue
 
                 # 归类信号
@@ -681,6 +688,10 @@ class _MonitorCoreMixin:
                 is_quality = is_recommended or is_high_signal
                 if not is_quality:
                     self._alerted_burst_codes.add(code)
+                    continue
+
+                # 已推送过的推荐标的：不再重复推送（买入评估已在更早位置完成）
+                if code in self._alerted_burst_codes:
                     continue
 
                 # 推送标题按信号类型区分
@@ -897,6 +908,15 @@ class _MonitorCoreMixin:
         except Exception:
             return True
 
+    def _skip_alerted_burst(self, code: str, pending_codes) -> bool:
+        """
+        当日已推送过的股票是否跳过本轮候选：
+        - 非推荐标的：已推送过 → 跳过（避免 15 秒重复推送）
+        - 推荐标的：即使推送过也**不跳过**——需持续评估买入机会，
+          避免在观望窗口错过买入后被"当日去重"锁死一整天（08-05 实证教训）
+        """
+        return code in self._alerted_burst_codes and code not in pending_codes
+
     def _merge_auction_buy_candidates(self, spot_df, hit_df, pending_recs) -> pd.DataFrame:
         """
         竞价"买入"指令执行权：仅 判断=买入 且 前提=满足 的推荐标的并入候选池（无信号也进），且置顶评估。
@@ -1049,7 +1069,7 @@ class _MonitorCoreMixin:
                 is_zt = type(self)._is_limit_up(code, curr_change_pct)
 
                 # 实时更新持仓最新价格与收益率 —— 先收集到列表，循环后一次性批量写库
-                price_updates.append((code, curr_price, holding.get("holding_type")))
+                price_updates.append((code, curr_price, holding.get("holding_type"), curr_change_pct))
 
                 # 如果盘中封过涨停，更新数据库状态（按 holding_type 定位，避免同 code 多持仓误更新）
                 if is_zt and not holding.get("was_limit_up_today", False):

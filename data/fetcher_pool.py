@@ -295,6 +295,39 @@ class _PoolMixin:
 
     @staticmethod
     @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    def get_fund_flow_instant() -> pd.DataFrame:
+        """
+        全市场即时资金流快照（同花顺，东财 push2 限流时的替代源）。
+        stock_fund_flow_individual(symbol='即时') 一次返回全市场主力净额，无需逐只查询。
+        统一输出: code(6位), name, net_amount(元), inflow(元), outflow(元), amount(元)
+        """
+        def _to_yuan(v):
+            s = str(v).strip()
+            try:
+                if s.endswith("亿"):
+                    return float(s[:-1]) * 1e8
+                if s.endswith("万"):
+                    return float(s[:-1]) * 1e4
+                return float(s)
+            except Exception:
+                return 0.0
+
+        df = ak.stock_fund_flow_individual(symbol="即时")
+        if df is None or df.empty:
+            return pd.DataFrame()
+        out = pd.DataFrame({
+            "code": df["股票代码"].astype(str).str.zfill(6),
+            "name": df["股票简称"].astype(str),
+            "net_amount": df["净额"].map(_to_yuan),
+            "inflow": df["流入资金"].map(_to_yuan),
+            "outflow": df["流出资金"].map(_to_yuan),
+            "amount": df["成交额"].map(_to_yuan),
+        })
+        return out
+
+
+    @staticmethod
+    @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
     def get_individual_fund_flow(stock_code: str = "600519", market: str = "sh") -> pd.DataFrame:
         """
         获取个股主力资金流向 (stock_individual_fund_flow)

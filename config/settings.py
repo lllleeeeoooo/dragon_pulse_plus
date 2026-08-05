@@ -118,6 +118,7 @@ class Settings(BaseSettings):
     # ==================== 板块联动监控配置 ====================
     SECTOR_LINKAGE_MIN_COUNT: int = Field(default=3, description="板块涨停家数达到此值时触发联动预警")
     SECTOR_LINKAGE_ACCEL_DELTA: int = Field(default=2, description="板块涨停家数较上轮增加此值时触发加速预警")
+    SECTOR_LINKAGE_PUSH_ENABLED: bool = Field(default=True, description="板块联动预警是否推送(Bark)。关闭后仍记录日志与数据，仅不推送")
 
     # ==================== 概念主线识别配置（切片3） ====================
     CONCEPT_MEMBER_REFRESH_INTERVAL_DAYS: int = Field(default=1, description="概念成分股映射刷新间隔(天)。成分股变化慢，可调大省请求(新浪约175次/刷新)")

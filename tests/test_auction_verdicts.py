@@ -122,6 +122,25 @@ class TestRecBuyCondition(unittest.TestCase):
         self.assertTrue(self.m._check_auction_volume({}))
 
 
+class TestAlertedSkip(unittest.TestCase):
+    """08-05 教训修复：推荐标的推送后不被'当日去重'锁死，仍持续评估买入"""
+
+    def setUp(self):
+        self.m = _MonitorCoreMixin()
+        self.m._alerted_burst_codes = {"600999"}  # 已推送过一只非推荐
+
+    def test_非推荐已推送则跳过(self):
+        # 600999 已推送过且不是推荐 → 跳过
+        self.assertTrue(self.m._skip_alerted_burst("600999", {"600001"}))
+
+    def test_推荐已推送不跳过(self):
+        # 600001 是推荐（在 pending_codes）即使已推送 → 不跳过，持续评估买入
+        self.assertFalse(self.m._skip_alerted_burst("600001", {"600001", "600999"}))
+
+    def test_未推送不跳过(self):
+        self.assertFalse(self.m._skip_alerted_burst("600002", set()))
+
+
 class TestCycleFreshness(unittest.TestCase):
     """断链6：周期数据 freshness 校验"""
 

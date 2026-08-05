@@ -60,6 +60,8 @@ class _MonitorSignalsMixin:
 
                 stocks_text = " / ".join(stock_details[:6])
                 logger.info(f"板块联动预警: [{sector}] 涨停{count}家(+{delta}) -> {stocks_text}")
+                if not settings.SECTOR_LINKAGE_PUSH_ENABLED:
+                    continue  # 开关关闭：只记录日志/数据，不推送
                 bark_notifier.send(
                     title=f"🔗 [板块联动] {sector} {count}家涨停",
                     body=(
@@ -125,9 +127,9 @@ class _MonitorSignalsMixin:
 
     def _check_fund_inflow_alert(self, hot_codes: list = None, cap_map: dict = None):
         """
-        大单抱团监控（修复 #3+#4）：对点火异动个股逐只查询主力资金流向。
-        新版 akshare 的 stock_individual_fund_flow 需要指定个股代码，
-        因此仅对当前已触发的点火标的做资金校验。
+        大单抱团监控：对点火异动个股验证主力资金流向。
+        优先用同花顺全市场即时资金流快照（一次调用覆盖全部候选，东财 push2 限流时的替代源），
+        失败再回退东财逐只查询（stock_individual_fund_flow）。
 
         阈值按流通市值动态分级：max(FUND_INFLOW_MIN, 流通市值 * FUND_INFLOW_CAP_RATIO)
         小盘股 ≈2000万起，大盘股随市值递增，避免一刀切。
@@ -136,6 +138,33 @@ class _MonitorSignalsMixin:
             return
         cap_map = cap_map or {}
 
+        # ---- 优先：同花顺全市场即时资金流快照（一次调用，东财限流替代源）----
+        try:
+            instant = self._DF.get_fund_flow_instant()
+            if instant is not None and not instant.empty:
+                for code in hot_codes[:3]:
+                    row = instant[instant["code"].astype(str) == str(code).zfill(6)]
+                    if row.empty:
+                        continue
+                    r = row.iloc[0]
+                    main_inflow = float(r.get("net_amount", 0) or 0)
+                    name = str(r.get("name", code))
+                    circ_cap = float(cap_map.get(str(code), 0))
+                    if circ_cap > 0:
+                        dynamic_threshold = max(
+                            settings.FUND_INFLOW_MIN * 1e4,
+                            circ_cap * settings.FUND_INFLOW_CAP_RATIO)
+                    else:
+                        dynamic_threshold = settings.FUND_INFLOW_MIN * 1e4
+                    if main_inflow > dynamic_threshold:
+                        cap_desc = f" 流通市值:{circ_cap/1e8:.0f}亿" if circ_cap > 0 else ""
+                        logger.info(f"主力合力扫货: {name}({code}) 主力净流入 {main_inflow/1e8:.2f}亿 "
+                                    f"(阈值 {dynamic_threshold/1e8:.2f}亿{cap_desc})")
+                return
+        except Exception as e:
+            logger.debug(f"同花顺资金流快照失败，回退东财: {e}")
+
+        # ---- 兜底：东财逐只查询 ----
         for code in hot_codes[:3]:  # 最多查 3 只，避免 API 调用过频
             try:
                 market = "sh" if str(code).startswith(("6", "5")) else "sz"
