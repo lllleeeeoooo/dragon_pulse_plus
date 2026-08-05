@@ -103,36 +103,47 @@ class InvestigationManager:
         if df is None or df.empty:
             return []
 
-        # 2. 解析列索引（东方财富 API 返回中文列名，直接按位置读取）
-        #    列顺序：序号, 代码, 名称, 事件类型, 事件内容, 公告日期
-        try:
-            code_col = df.columns[1]      # 股票代码（如 000001）
-            name_col = df.columns[2]      # 股票名称
-            type_col = df.columns[3]      # 事件类型（如"立案调查"）
-            content_col = df.columns[4]   # 事件详细内容（公告全文）
-            date_col = df.columns[5]      # 公告日期（datetime.date 对象）
-        except IndexError:
-            logger.warning("个股风险提示返回格式异常，跳过同步")
+        # 2. 解析列（列名优先、位置兜底——akshare 列名/顺序可能随版本调整，
+        #    硬编码位置索引会导致静默失败、表一直空）
+        cols = {str(c): c for c in df.columns}
+
+        def _pick(names, pos):
+            for n in names:
+                if n in cols:
+                    return cols[n]
+            if pos < len(df.columns):
+                return df.columns[pos]
+            return None
+
+        code_col = _pick(["代码", "股票代码"], 1)      # 000001
+        name_col = _pick(["名称", "简称", "股票名称"], 2)  # 接口实为"简称"
+        type_col = _pick(["事件类型", "类型"], 3)       # 如"立案调查"
+        content_col = _pick(["具体事项", "事件内容", "内容"], 4)  # 公告全文
+        date_col = _pick(["交易日", "公告日期", "日期"], 5)
+        if any(c is None for c in (code_col, name_col, type_col, content_col, date_col)):
+            logger.warning(f"个股风险提示返回格式异常(列={list(df.columns)})，跳过同步")
             return []
 
         new_records = []
         session = db_manager.get_session()
         try:
             for _, row in df.iterrows():
-                event_type = str(row[type_col])
+                event_type = str(row[type_col] or "")
 
                 # 3. 仅保留风险类事件（立案/处罚/监管等），
                 #    过滤掉资产出售、股份质押等与风险无关的事件
                 if not any(kw in event_type for kw in _RISK_KEYWORDS):
                     continue
 
-                # 4. 数据清洗
-                code = str(row[code_col]).zfill(6)          # 补齐 6 位
-                name = str(row[name_col])
-                content = str(row[content_col])
+                # 4. 数据清洗（None 防御：字段缺失的行跳过，避免 str(None) 污染）
+                code = str(row[code_col] or "").zfill(6)     # 补齐 6 位
+                announce_date = str(row[date_col] or "")[:10].replace("-", "")
+                if not code or not announce_date or code == "000000":
+                    continue
+                name = str(row[name_col] or "")
+                content = str(row[content_col] or "")
                 if len(content) > 2000:
                     content = content[:2000]                 # 截断防超长
-                announce_date = str(row[date_col])[:10].replace("-", "")
 
                 # 5. 幂等检查：同一股票的同一类型、同一公告日期不重复落库
                 existing = session.query(InvestigationRecord).filter(
