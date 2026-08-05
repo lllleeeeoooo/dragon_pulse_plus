@@ -51,27 +51,35 @@ class DynamicSellAdvisor:
         parts = []
         try:
             from data.fetcher import DataFetcher
-            ma = DataFetcher.get_stock_ma_prices(code, lookback=30)
-            closes = DataFetcher.get_stock_daily_closes(code, lookback=6)
-            if len(closes) >= 2 and closes[0]:
-                recent_5d = round((closes[-1] - closes[0]) / closes[0] * 100, 2)
-                parts.append(f"近5日累计{recent_5d:+.1f}%")
-            if ma.get("ma5"):
-                pos = "高于" if current_price >= ma["ma5"] else "低于"
-                parts.append(f"现价{pos}MA5({ma['ma5']:.2f})")
-                if ma.get("ma10"):
-                    parts.append(f"MA10={ma['ma10']:.2f}")
-                if ma.get("ma20"):
-                    parts.append(f"MA20={ma['ma20']:.2f}")
+            closes = DataFetcher.get_stock_daily_closes(code, lookback=30)
+            if closes:
+                # 实时均线：昨收日线序列 + 今日现价 合成（保证 MA 含今日，非昨收口径）
+                real = [float(x) for x in closes] + [float(current_price)]
+                ma5 = sum(real[-5:]) / 5 if len(real) >= 5 else None
+                ma10 = sum(real[-10:]) / min(10, len(real)) if len(real) >= 10 else None
+                ma20 = sum(real[-20:]) / min(20, len(real)) if len(real) >= 20 else None
+                # 近5日累计：现价 vs 5个交易日前收盘（含今日实时）
+                if len(closes) >= 6 and closes[-6]:
+                    recent_5d = round((float(current_price) - closes[-6]) / closes[-6] * 100, 2)
+                    parts.append(f"个股近5日累计{recent_5d:+.1f}%")
+                if ma5:
+                    pos = "高于" if current_price >= ma5 else "低于"
+                    parts.append(f"现价{pos}MA5({ma5:.2f})")
+                    if ma10:
+                        parts.append(f"MA10={ma10:.2f}")
+                    if ma20:
+                        parts.append(f"MA20={ma20:.2f}")
         except Exception:
             pass
         try:
+            # 上证实时涨跌（新浪实时指数快照；勿用 stock_zh_index_daily——盘中只更新到昨日）
             import akshare as ak
-            idx = ak.stock_zh_index_daily(symbol="sh000001")
-            if idx is not None and not idx.empty and len(idx) >= 2:
-                closes = pd.to_numeric(idx["close"], errors="coerce").dropna()
-                idx_chg = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100
-                parts.append(f"上证今日{idx_chg:+.2f}%")
+            idx = ak.stock_zh_index_spot_sina()
+            if idx is not None and not idx.empty:
+                m = idx[idx["代码"].astype(str) == "sh000001"]
+                if not m.empty:
+                    idx_chg = float(m.iloc[0].get("涨跌幅", 0) or 0)
+                    parts.append(f"上证今日{idx_chg:+.2f}%")
         except Exception:
             pass
         try:
@@ -81,7 +89,7 @@ class DynamicSellAdvisor:
                 m = instant[instant["code"].astype(str) == str(code).zfill(6)]
                 if not m.empty:
                     net = float(m.iloc[0].get("net_amount", 0) or 0)
-                    parts.append(f"主力净流入{net / 1e8:+.2f}亿")
+                    parts.append(f"个股主力净流入{net / 1e8:+.2f}亿")
         except Exception:
             pass
         # 4. 市场情绪周期（高潮/退潮/冰点——决定卖出敏感度）
