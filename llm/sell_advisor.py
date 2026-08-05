@@ -36,7 +36,9 @@ class DynamicSellAdvisor:
         """拉取个股今日 5 分钟 OHLCV（多源降级），压缩为文本供 LLM 分析"""
         try:
             from data.fetcher import DataFetcher
-            df = DataFetcher._fetch_intraday_5min(code)
+            # per-code 短 TTL 缓存：同一监控周期内多只候选共享分时数据，避免重复网络拉取（审查#8）
+            df = _ctx_cached(f"intraday:{code}",
+                             lambda: DataFetcher._fetch_intraday_5min(code))
             if df is None or df.empty:
                 return "分时数据暂不可用"
 
@@ -68,7 +70,9 @@ class DynamicSellAdvisor:
         parts = []
         try:
             from data.fetcher import DataFetcher
-            closes = DataFetcher.get_stock_daily_closes(code, lookback=30)
+            # per-code 短 TTL 缓存：多候选共享日线，避免每只重复拉取（审查#8）
+            closes = _ctx_cached(f"daily_closes:{code}",
+                                 lambda: DataFetcher.get_stock_daily_closes(code, lookback=30))
             if closes:
                 # 实时均线：昨收日线序列 + 今日现价 合成（保证 MA 含今日，非昨收口径）
                 real = [float(x) for x in closes] + [float(current_price)]

@@ -43,9 +43,6 @@ def _push_daily_pnl_report(trade_date: str, spot_df=None):
     # 2. 生成报告（今日涨跌 = 今日收盘价 - 昨收；必须先于滚存昨收，否则恒≈0）
     report = HoldingManager.get_daily_pnl_report()
 
-    # 3. 报告完成后，将今日收盘价滚存为 prev_close（供次日"今日涨跌"基准）
-    HoldingManager.sync_close_prices(spot_map)
-
     if "error" in report:
         logger.warning(f"每日盈亏报告生成失败: {report['error']}")
         return
@@ -120,5 +117,10 @@ def _push_daily_pnl_report(trade_date: str, spot_df=None):
     # 净值快照落库
     sh_pct = idx.get("sh_change_pct", 0) if idx else 0.0
     DailySnapshotManager.save_snapshot(trade_date, report, sh_change_pct=sh_pct)
+
+    # 3. 快照安全落库后，才将今日收盘价滚存为 prev_close（供次日"今日涨跌"基准）。
+    # 顺序保证：若快照落库前任何步骤失败（幂等守卫只认快照存在），prev_close 未被滚存，
+    # 重跑不会二次滚存导致"今日涨跌≈0"（审查#5 幂等守卫空窗）。
+    HoldingManager.sync_close_prices(spot_map)
 
 

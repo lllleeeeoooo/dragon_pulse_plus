@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """竞价 verdict 闭环（逐票下判 + 前提声明 + 盘中执行权）单元测试"""
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -123,7 +124,8 @@ class TestRecBuyCondition(unittest.TestCase):
 
 
 class TestAlertedSkip(unittest.TestCase):
-    """08-05 教训修复：推荐标的推送后不被'当日去重'锁死，仍持续评估买入"""
+    """当日去重锁：非推荐标的推过一次后当日跳过；推荐标的按 B方案走 09:26 竞价一次性评估，推过后同样锁。
+    注：早期"推荐推送后不被锁死、仍持续评估"的设计已被 B方案 一次性评估 取代（见 test_推荐已推送同样锁）"""
 
     def setUp(self):
         self.m = _MonitorCoreMixin()
@@ -213,6 +215,16 @@ class TestAuctionBuyExecution(unittest.TestCase):
 
     def setUp(self):
         self.m = _MonitorCoreMixin()
+        # _is_limit_up/_is_limit_down 定义于 _MonitorStyleMixin（生产经 MRO 组合）；
+        # 单测的裸 mixin 需手动补齐，默认视为未封板
+        self._p_up = patch.object(_MonitorCoreMixin, "_is_limit_up",
+                                  staticmethod(lambda c, chg: False), create=True)
+        self._p_down = patch.object(_MonitorCoreMixin, "_is_limit_down",
+                                    staticmethod(lambda c, chg: False), create=True)
+        self._p_up.start()
+        self._p_down.start()
+        self.addCleanup(self._p_up.stop)
+        self.addCleanup(self._p_down.stop)
 
     def _spot(self, rows):
         df = pd.DataFrame(rows, columns=["code", "name", "price", "change_pct",
@@ -287,6 +299,28 @@ class TestAuctionBuyExecution(unittest.TestCase):
         m2 = self.m._merge_auction_buy_candidates(spot, hit, pending)
         self.assertNotIn("600002", set(m2["code"]))
         self.assertEqual(list(m2["code"]), ["600001"])
+
+    def test_封板首轮不标记已评估_破板后重新进池(self):
+        """审查#3：开盘封死(涨停)的买入候选暂不标记"已评估"，破板后须能重新进池"""
+        spot = self._spot([("600002", "推荐股", 20.0, 10.0, 1.2, 2e8),
+                           ("600001", "信号股", 10.0, 7.0, 3.0, 5e8)])
+        hit = self._spot([("600001", "信号股", 10.0, 7.0, 3.0, 5e8)])
+        pending = [{"code": "600002", "name": "推荐股",
+                    "auction_verdict": "买入", "auction_premise": "满足"}]
+
+        with patch.object(_MonitorCoreMixin, "_is_limit_up",
+                          staticmethod(lambda c, chg: c == "600002")):
+            m1 = self.m._merge_auction_buy_candidates(spot, hit, pending)
+            self.assertIn("600002", set(m1["code"]))
+            # 600002 封板中：不应标记已评估 → 第二次调用仍进池
+            m2 = self.m._merge_auction_buy_candidates(spot, hit, pending)
+            self.assertIn("600002", set(m2["code"]))
+
+        # 破板后（不再封板）：首次进池即标记已评估，之后不再重复进池
+        m3 = self.m._merge_auction_buy_candidates(spot, hit, pending)
+        self.assertIn("600002", set(m3["code"]))
+        m4 = self.m._merge_auction_buy_candidates(spot, hit, pending)
+        self.assertNotIn("600002", set(m4["code"]))
 
 
 if __name__ == "__main__":

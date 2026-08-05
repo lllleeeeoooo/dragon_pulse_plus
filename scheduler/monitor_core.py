@@ -50,7 +50,9 @@ class _MonitorCoreMixin:
         self._consistency_alerted_today: bool = False
         self._pending_sell_codes: set = set()  # 跌停中待卖出的股票
         self._alerted_sell_signals: Dict[str, set] = {}  # code -> {signal_type, ...}
-        self._llm_sell_hold_until: Dict[str, float] = {}  # code -> 卖出 LLM 判"持有"冷却到期时间戳
+        # "code:sig_type" -> 卖出 LLM 判"持有"冷却到期时间戳。
+        # 按 (code, sig_type) 键控：一条信号判持有只冷却该信号，不蒙住同股更严重的新信号（审查#2）
+        self._llm_sell_hold_until: Dict[str, float] = {}
         self._alert_date: str = ""
         # 市场风格缓存（供 API 查询）
         self._current_market_style: Dict[str, str] = {}
@@ -374,6 +376,10 @@ class _MonitorCoreMixin:
         )
         pending_codes = {r["code"] for r in pending_recs}
 
+        # 7. 持仓卖出/止损信号监控 + 批量更新收益率（已拆到 _monitor_holdings）。
+        # 前置到买入扫描之前：绝对止损等硬护栏不因买入 LLM 同步调用(20-60s)被拖后（审查#1）
+        self._monitor_holdings(spot_df, active_holdings, market_max_lbc, market_zhaban_rate)
+
         # 4. 扫描全市场抢筹信号 + 自动买入 + 推送（已拆到 _scan_signals）
         self._scan_signals(spot_df, market_style, pending_recs, pending_codes, index_breaker_triggered)
 
@@ -383,9 +389,6 @@ class _MonitorCoreMixin:
         self._check_emotion_top_alert(market_max_lbc, market_zhaban_rate)
 
         self._check_consistency_alert()
-
-        # 7. 持仓卖出/止损信号监控 + 批量更新收益率（已拆到 _monitor_holdings）
-        self._monitor_holdings(spot_df, active_holdings, market_max_lbc, market_zhaban_rate)
 
 
     def _notify_style_change(self, market_style):
@@ -537,6 +540,8 @@ class _MonitorCoreMixin:
             if not _total_amt or _total_amt <= 0:
                 _total_amt = float(spot_df["amount"].sum()) if "amount" in spot_df.columns else 1e12
             _index_pct = float(spot_df["change_pct"].mean()) if "change_pct" in spot_df.columns else 0.0
+            # 每轮买入 LLM 确认预算：控制同步 LLM(20-60s)对 15s 主循环的阻塞（审查#1）
+            self._llm_buy_confirms_this_cycle = 0
             for _, row in hit_df.head(5).iterrows():
                 code = str(row["code"])
                 name = str(row["name"])
@@ -630,6 +635,12 @@ class _MonitorCoreMixin:
                     # LLM 决策 + 全市场快照复核阻塞 15s 监控主循环（审计#2）
                     ai_holdings = HoldingManager.get_active_holdings(holding_type="AI_AUTO")
                     if self._buy_gates_open(code, ai_holdings, amt_billion):
+                        # 预算用尽：本轮不再同步调 LLM，候选留待下轮评估（不降级规则裸买），
+                        # 把同步阻塞控制在每轮 N 次 LLM 以内（审查#1）
+                        if self._llm_buy_confirms_this_cycle >= settings.LLM_BUY_CONFIRM_PER_CYCLE:
+                            logger.debug(f"本轮买入 LLM 确认预算已用尽，{name}({code}) 留待下轮评估")
+                            continue  # 未标记 → 下轮 15s 后重新评估
+                        self._llm_buy_confirms_this_cycle += 1
                         # B方案：规则候选已通过，LLM 最终买入决定（失败降级回 rule）
                         decision_source, llm_allow = self._llm_confirm_buy(
                             code, name, price, change_pct, vol_ratio, signal_label, [signal_label])
@@ -954,12 +965,14 @@ class _MonitorCoreMixin:
         """
         LLM 决策等待(~20s)期间价格可能变化：买前用最新快照复核。
         返回 (fresh_price, ok)：ok=False 表示已封板/跌停/回落，不该买。
-        复核失败(拿不到最新价) → 用原价放行（原规则+LLM 已通过，复核是额外保险）。
+        复核拿不到最新价(快照源故障) → 同样不买（fail-closed）。未落买入标记，
+        下轮监控重新评估，避免用 LLM 前的旧价记录不可达成交（审查#4）。
         """
         try:
             fresh = DataFetcher.get_realtime_spot()
             if fresh is None or fresh.empty:
-                return prev_price, True
+                logger.warning(f"买前复核快照不可用({code})，放弃买入（下轮重新评估）")
+                return prev_price, False
             m = fresh[fresh["code"].astype(str) == str(code).zfill(6)]
             if m.empty:
                 return prev_price, False  # 最新快照查不到该股 → 不买
@@ -977,8 +990,8 @@ class _MonitorCoreMixin:
                 return fresh_price, False
             return fresh_price, True
         except Exception as e:
-            logger.warning(f"买前复核失败({code}): {e}")
-            return prev_price, True  # 复核异常 → 原价放行
+            logger.warning(f"买前复核失败({code}): {e}，放弃买入（下轮重新评估）")
+            return prev_price, False  # 复核异常 → 不买（fail-closed）
 
     def _llm_confirm_sell(self, holding: dict, sig: dict, curr_price: float,
                           curr_change_pct: float, holding_days: int) -> tuple:
@@ -1044,8 +1057,16 @@ class _MonitorCoreMixin:
             if _rec_buy_df.empty:
                 # 新候选不在当前快照：不标记已评估，下轮快照齐全时再进池
                 return hit_df
-            # 仅对确实存在于快照的代码标记"已评估"（含矛盾代码，避免重复告警）
-            self._rec_auction_buy_evaluated = evaluated | set(_rec_buy_df["code"].astype(str)) | contradicted
+            # 封板标的暂不标记"已评估"：开盘一字封死买不进，若当天就锁死会把 09:26
+            # 买入指令永久丢弃；破板后须能重新进池（审查#3）。
+            _sealed_codes = {
+                str(c) for c, chg in zip(_rec_buy_df["code"].astype(str),
+                                         _rec_buy_df["change_pct"].astype(float))
+                if type(self)._is_limit_up(c, chg)
+            }
+            _markable = set(_rec_buy_df["code"].astype(str)) - _sealed_codes
+            # 仅对确实存在于快照且未封板的代码标记"已评估"（含矛盾代码，避免重复告警）
+            self._rec_auction_buy_evaluated = evaluated | _markable | contradicted
             for _col in ("_signal_burst", "_signal_near_limit",
                          "_signal_low_open_rally", "_signal_amplitude"):
                 _rec_buy_df[_col] = False
@@ -1255,12 +1276,13 @@ class _MonitorCoreMixin:
                         if sig_type != "绝对止损":
                             # LLM 复核冷却：判"持有"后 N 秒内不重复咨询，避免持续信号每 15s
                             # 轮询都阻塞调 LLM(20-60s)；冷却到期后携最新行情重新复核（审计#3风控缺口的另一面）
-                            if time.time() < self._llm_sell_hold_until.get(code, 0):
+                            _hold_key = f"{code}:{sig_type}"  # 冷却按信号类型区分（审查#2）
+                            if time.time() < self._llm_sell_hold_until.get(_hold_key, 0):
                                 continue
                             decision_source, do_sell = self._llm_confirm_sell(
                                 holding, sig, curr_price, curr_change_pct, holding_days)
                             if not do_sell:
-                                self._llm_sell_hold_until[code] = time.time() + settings.LLM_SELL_HOLD_COOLDOWN_SECONDS
+                                self._llm_sell_hold_until[_hold_key] = time.time() + settings.LLM_SELL_HOLD_COOLDOWN_SECONDS
                                 logger.info(f"LLM 判持有: {holding.get('name')}({code}) {sig_type} 不卖出，"
                                             f"{settings.LLM_SELL_HOLD_COOLDOWN_SECONDS}s 内不重复咨询")
                                 continue  # LLM 判持有 → 不卖（不落去重标记，冷却到期后重新复核）
@@ -1271,6 +1293,9 @@ class _MonitorCoreMixin:
                             sell_px = round(curr_price * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)  # AI卖出模拟滑点
                         HoldingManager.close_holding(code=code, holding_type=hold_type, sell_price=sell_px)
                         self._pending_sell_codes.discard(code)
+                        # 该持仓已卖出：同轮剩余信号一并落去重标记，避免同持仓多信号
+                        # 重复咨询 LLM + 对已平仓持仓重复"已自动标记为卖出"推送（审查#6）
+                        self._alerted_sell_signals.setdefault(code, set()).update(s["type"] for s in signals)
                         src_tag = "LLM" if decision_source == "llm" else "规则"
                         bark_notifier.send(
                             title=f"🚨 [{sig['type']}] {holding.get('name')}({code})",

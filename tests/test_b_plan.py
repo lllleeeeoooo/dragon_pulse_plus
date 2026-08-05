@@ -118,12 +118,12 @@ class TestRecheckBuy(unittest.TestCase):
         self.assertTrue(ok)
         self.assertAlmostEqual(price, 10.6)
 
-    def test_快照失败用原价(self):
+    def test_快照失败不买(self):
+        # 审查#4：复核拿不到最新快照 → fail-closed 不买，避免用 LLM 前旧价记录不可达成交
         with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot",
                    return_value=pd.DataFrame()):
             price, ok = self.m._recheck_buy_after_llm("600001", 10.0)
-        self.assertTrue(ok)
-        self.assertEqual(price, 10.0)
+        self.assertFalse(ok)
 
 
 class TestSellHoldCooldown(unittest.TestCase):
@@ -175,9 +175,22 @@ class TestSellHoldCooldown(unittest.TestCase):
 
     def test_冷却到期后重新复核(self):
         self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
-        self.m._llm_sell_hold_until["600001"] = 0.0  # 手动拨到已过期
+        # 冷却键为 "code:sig_type"（审查#2），统一拨到已过期
+        for _k in self.m._llm_sell_hold_until:
+            self.m._llm_sell_hold_until[_k] = 0.0
         self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
         self.assertEqual(self._sell_mock.call_count, 2)
+
+    def test_冷却按信号类型区分(self):
+        """审查#2：破位止损判持有的冷却，不拦截同股更严重的断板必卖"""
+        # setUp 已 patch 好 _sell/close_holding/_is_limit_up 等，此处只需覆盖信号列表
+        with patch("scheduler.monitor_core.HoldingMonitor.check_sell_signals",
+                   return_value=[
+                       {"type": "破位止损", "level": "HIGH", "reason": "跌破MA5"},
+                       {"type": "断板必卖", "level": "CRITICAL", "reason": "断板"},
+                   ]):
+            self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
+            self.assertEqual(self._sell_mock.call_count, 2)  # 两个信号各咨询一次，未互相拦截
 
 
 class TestDecisionSourceRecord(unittest.TestCase):
