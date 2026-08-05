@@ -15,6 +15,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("DragonPulsePlus")
 
+# 文件日志 Handler：logs/dragon_pulse.log，7 天滚动保留（完整 INFO 历史）
+try:
+    import logging.handlers
+    os.makedirs("logs", exist_ok=True)
+    _file_handler = logging.handlers.TimedRotatingFileHandler(
+        "logs/dragon_pulse.log", when="midnight", backupCount=7, encoding="utf-8")
+    _file_handler.setLevel(logging.INFO)
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(_file_handler)
+    logger.info("文件日志已就绪: logs/dragon_pulse.log (保留7天)")
+except Exception as _e:
+    logger.warning(f"文件日志初始化失败: {_e}")
+
 # 注册数据库日志 Handler：自动将 WARNING+ 级别日志写入 error_logs 表
 from database.log_handler import DatabaseLogHandler
 logging.getLogger().addHandler(DatabaseLogHandler(level=logging.WARNING))
