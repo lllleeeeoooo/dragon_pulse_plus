@@ -31,7 +31,9 @@ class HoldingManager:
                     "buy_strategy": h.buy_strategy,
                     "holding_type": h.holding_type,
                     "was_limit_up_today": h.was_limit_up_today,
-                    "prev_close_price": h.prev_close_price
+                    "prev_close_price": h.prev_close_price,
+                    "change_pct": h.change_pct or 0,
+                    "today_change": h.change_pct or 0,  # 股票当日市场涨跌幅（监控实时更新），非成本盈亏
                 }
                 for h in holdings
             ]
@@ -101,15 +103,17 @@ class HoldingManager:
     @staticmethod
     def batch_update_profit_rates(updates: List[tuple]):
         """
-        批量更新持仓当前价与收益率（一次 session 写库）。
+        批量更新持仓当前价/当日涨跌幅/收益率（一次 session 写库）。
         盘中轮询每 15 秒调用一次，避免逐只开 session 造成的写放大。
-        :param updates: [(code, current_price, holding_type), ...]
+        :param updates: [(code, current_price, holding_type, change_pct), ...]
         """
         if not updates:
             return
         session = db_manager.get_session()
         try:
-            for code, current_price, holding_type in updates:
+            for item in updates:
+                code, current_price, holding_type = item[0], item[1], item[2]
+                change_pct = item[3] if len(item) > 3 else 0.0
                 query = session.query(Holding).filter(
                     Holding.code == code, Holding.status == "HOLDING"
                 )
@@ -118,6 +122,7 @@ class HoldingManager:
                 holding = query.first()
                 if holding and holding.cost_price > 0:
                     holding.current_price = current_price
+                    holding.change_pct = change_pct  # 股票当日市场涨跌幅
                     holding.profit_rate = round(((current_price - holding.cost_price) / holding.cost_price) * 100, 2)
             session.commit()
         except Exception as e:

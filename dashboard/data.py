@@ -173,9 +173,7 @@ def _build_portfolio_section(
         "positions": [{
             "code": h["code"], "name": h["name"],
             "profit_pct": h.get("profit_rate", 0),
-            "today_change": round((h.get("current_price", 0) - h.get("prev_close_price", 0))
-                                  / h.get("prev_close_price", 0) * 100, 2)
-                                if h.get("prev_close_price", 0) and h.get("current_price", 0) else 0,
+            "today_change": h.get("today_change", 0),  # 股票当日市场涨跌幅（监控实时更新）
             "cost_price": h["cost_price"],
             "current_price": h["current_price"],
             "strategy": h.get("buy_strategy", ""),

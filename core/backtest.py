@@ -209,11 +209,24 @@ class AIBacktestEngine:
             if profit_pct <= settings.ABSOLUTE_STOP_LOSS_PCT:
                 sell_reason = f"绝对止损({profit_pct}% <= {settings.ABSOLUTE_STOP_LOSS_PCT}%)"
 
-            # 规则 1：强止盈
+            # 规则 1：断板必卖（审计③修复，对齐实盘 CRITICAL 规则）——
+            # 连板(打板接力)股今日不在涨停池 = 炸板，不再等待回封
+            elif ("打板接力" in pos.get("strategy", "")
+                  and AIBacktestEngine._not_in_zt(code, day_data)):
+                sell_reason = f"断板必卖(连板股{pos.get('strategy','')}今日未封板)"
+
+            # 规则 2：破位止损（审计③修复，对齐实盘 HIGH 规则）——
+            # 收盘跌破 5 日均线（无分时 VWAP，用 MA5 近似）
+            elif (day_data.get("ma5_cache", {}).get(str(code)) is not None
+                  and close_price < day_data["ma5_cache"][str(code)]):
+                ma5_val = day_data["ma5_cache"][str(code)]
+                sell_reason = f"破位止损(收盘{close_price:.2f} < MA5 {ma5_val:.2f})"
+
+            # 规则 3：强止盈
             elif profit_pct >= settings.TAKE_PROFIT_CRITICAL_PCT:
                 sell_reason = f"强止盈({profit_pct}% >= {settings.TAKE_PROFIT_CRITICAL_PCT}%)"
 
-            # 规则 2：时间止损
+            # 规则 4：时间止损
             elif pos["hold_days"] >= settings.TIME_STOP_LOSS_DAYS and profit_pct <= 0:
                 sell_reason = f"时间止损(持仓{pos['hold_days']}天仍亏损)"
 
@@ -278,10 +291,20 @@ class AIBacktestEngine:
 
             code = str(row.get("code", ""))
             name = str(row.get("name", ""))
-            buy_price = float(row.get("price", 0))
-            lbc = int(row.get("lbc", 1)) if "lbc" in row.index else 1
+            # 审计④修复：NaN/空值防御，坏数据行跳过而不是让整个回测崩溃
+            try:
+                buy_price = float(row.get("price", 0))
+            except (TypeError, ValueError):
+                buy_price = 0.0
+            if pd.isna(buy_price):
+                buy_price = 0.0
+            lbc_raw = row.get("lbc", 1) if "lbc" in row.index else 1
+            try:
+                lbc = int(float(lbc_raw)) if pd.notna(lbc_raw) else 1
+            except (TypeError, ValueError):
+                lbc = 1
 
-            if buy_price <= 0 or not code:
+            if buy_price <= 0 or not code or pd.isna(buy_price):
                 continue
 
             # 买入成本（含滑点）
@@ -442,18 +465,22 @@ class AIBacktestEngine:
             for c in zt_df["code"].astype(str).head(20):
                 codes_to_fetch.add(c)
 
-        # 批量获取历史日线（用于收盘价）
+        # 批量获取历史日线（收盘价 + MA5，一次请求，审计③破位止损用）
         close_cache = {}
+        ma5_cache = {}
         for code in codes_to_fetch:
-            price = AIBacktestEngine._fetch_close_price(code, date_str)
-            if price is not None:
-                close_cache[code] = price
+            close, ma5 = AIBacktestEngine._fetch_close_and_ma5(code, date_str)
+            if close is not None:
+                close_cache[code] = close
+            if ma5 is not None:
+                ma5_cache[code] = ma5
 
         return {
             "date_str": date_str,
             "zt_df": zt_df,
             "spot_df": spot_df,
             "close_cache": close_cache,
+            "ma5_cache": ma5_cache,
         }
 
     @staticmethod
@@ -472,10 +499,16 @@ class AIBacktestEngine:
     @staticmethod
     def _fetch_close_price(code: str, date_str: str) -> Optional[float]:
         """获取个股历史收盘价（日线），失败不影响主流程"""
+        close, _ = AIBacktestEngine._fetch_close_and_ma5(code, date_str)
+        return close
+
+    @staticmethod
+    def _fetch_close_and_ma5(code: str, date_str: str):
+        """一次日线请求返回 (收盘价, MA5)。审计③修复：破位止损需要 MA5。失败返回 (None, None)。"""
         try:
             import akshare as ak
             end_dt = datetime.datetime.strptime(date_str, "%Y%m%d")
-            start_dt = end_dt - datetime.timedelta(days=7)
+            start_dt = end_dt - datetime.timedelta(days=10)
             df = ak.stock_zh_a_hist(
                 symbol=code, period="daily",
                 start_date=start_dt.strftime("%Y%m%d"),
@@ -485,10 +518,23 @@ class AIBacktestEngine:
                 close_col = "收盘" if "收盘" in df.columns else (
                     df.columns[2] if len(df.columns) > 2 else df.columns[0]
                 )
-                return float(pd.to_numeric(df[close_col].iloc[-1]))
+                closes = pd.to_numeric(df[close_col], errors="coerce").dropna()
+                if closes.empty:
+                    return None, None
+                close = float(closes.iloc[-1])
+                ma5 = float(closes.tail(5).mean()) if len(closes) >= 5 else None
+                return close, ma5
         except Exception:
             pass
-        return None
+        return None, None
+
+    @staticmethod
+    def _not_in_zt(code: str, day_data: dict) -> bool:
+        """该股今日是否不在涨停池（无涨停池数据时保守返回 False，不误断板）"""
+        zt = day_data.get("zt_df")
+        if zt is None or zt.empty or "code" not in zt.columns:
+            return False
+        return str(code) not in set(zt["code"].astype(str))
 
     # ------------------------------------------------------------------
     # 工具函数

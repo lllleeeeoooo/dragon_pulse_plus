@@ -108,6 +108,9 @@ class _HistoryMixin:
         if "change_pct" not in df.columns and "close" in df.columns:
             closes = pd.to_numeric(df["close"], errors="coerce")
             df["change_pct"] = closes.pct_change().fillna(0) * 100
+        # 新浪分钟线成交量单位=股（保持，审计②修复：统一后续 /1e4 标"万"的口径）
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
         return df
 
 
@@ -132,6 +135,9 @@ class _HistoryMixin:
                 col_map[raw] = target
         if col_map:
             df = df.rename(columns=col_map)
+        # 东财分钟线成交量单位=手(×100→股)，与新浪统一（审计②修复：避免喂给 LLM 的量能差100倍）
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce") * 100
         return df
 
 

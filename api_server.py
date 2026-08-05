@@ -226,31 +226,38 @@ def data_spot():
          description="对应 ak.stock_zt_pool_em(date)，直接从 AkShare 实时抓取涨停池（含连板数/封板资金/炸板次数等）。"
                      "注意：/data/zt-pool（不带 /live）查询的是已落库数据，支持不传 date 默认取最新。",
          tags=[AKSHARE_TAG])
+def _safe_pool_df(fetch_func):
+    """池类端点统一兜底：上游异常不裸 500，返回空 + 提示（审计⑤修复）"""
+    try:
+        df = fetch_func()
+        if df is None or df.empty:
+            return {"code": 200, "count": 0, "data": []}
+        return {"code": 200, "count": len(df), "data": df.to_dict(orient="records")}
+    except Exception as e:
+        logger.warning(f"池数据抓取失败: {e}")
+        return {"code": 200, "count": 0, "data": [], "warning": str(e)[:200]}
+
+
+@app.get("/data/zt-pool/live", summary="每日涨停池（实时抓取）",
+         description="对应 ak.stock_zt_pool_em(date)，直接从 AkShare 实时抓取涨停池（含连板数/封板资金/炸板次数等）。"
+                     "注意：/data/zt-pool（不带 /live）查询的是已落库数据，支持不传 date 默认取最新。",
+         tags=[AKSHARE_TAG])
 def data_zt_pool_live(date: str = Query(..., description="日期 YYYYMMDD，如 20260729")):
-    df = DataFetcher.get_zt_pool(date_str=date)
-    if df.empty:
-        return {"code": 200, "count": 0, "data": []}
-    return {"code": 200, "count": len(df), "data": df.to_dict(orient="records")}
+    return _safe_pool_df(lambda: DataFetcher.get_zt_pool(date_str=date))
 
 
 @app.get("/data/zhaban-pool", summary="每日炸板观察池",
          description="对应 ak.stock_zt_pool_zbgc_em(date)，返回炸板观察池",
          tags=[AKSHARE_TAG])
 def data_zhaban_pool(date: str = Query(..., description="日期 YYYYMMDD")):
-    df = DataFetcher.get_zhaban_pool(date_str=date)
-    if df.empty:
-        return {"code": 200, "count": 0, "data": []}
-    return {"code": 200, "count": len(df), "data": df.to_dict(orient="records")}
+    return _safe_pool_df(lambda: DataFetcher.get_zhaban_pool(date_str=date))
 
 
 @app.get("/data/dt-pool", summary="每日跌停池",
          description="对应 ak.stock_zt_pool_dtgc_em(date)",
          tags=[AKSHARE_TAG])
 def data_dt_pool(date: str = Query(..., description="日期 YYYYMMDD")):
-    df = DataFetcher.get_dt_pool(date_str=date)
-    if df.empty:
-        return {"code": 200, "count": 0, "data": []}
-    return {"code": 200, "count": len(df), "data": df.to_dict(orient="records")}
+    return _safe_pool_df(lambda: DataFetcher.get_dt_pool(date_str=date))
 
 
 @app.get("/data/lhb-detail", summary="龙虎榜个股明细",
