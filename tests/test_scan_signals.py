@@ -150,5 +150,30 @@ class TestBudgetExhaustedDeferredPush(ScanSignalsHarness):
         self.assertIn("600002", self.m._alerted_burst_codes)
 
 
+class TestBuyBlockDiagnostics(ScanSignalsHarness):
+    """可观测性：候选未过买入闸门时，_scan_signals 输出具体拦截原因 INFO 日志"""
+
+    def test_板块否决输出原因日志(self):
+        row = self._row("600001", "信号A", 9.0, 6.0)
+        self.m._get_stock_industry = Mock(return_value="测试板块")
+        self.m._get_sector_phase = Mock(return_value="退潮")
+        self.m._get_sector_is_mainline = Mock(return_value=False)
+        with self.assertLogs("scheduler.monitor_core", level="INFO") as cm:
+            self._scan([row], [])
+        self.assertTrue(
+            any("[买入评估]" in m and "600001" in m and "跳过买入" in m and "板块否决" in m
+                for m in cm.output),
+            f"应输出板块否决拦截日志，实际输出: {cm.output}")
+
+    def test_LLM判观望输出日志(self):
+        row = self._row("600001", "信号A", 9.0, 6.0)
+        self.m._llm_confirm_buy = Mock(return_value=("llm", False))  # 观望
+        with self.assertLogs("scheduler.monitor_core", level="INFO") as cm:
+            self._scan([row], [])
+        self.assertTrue(
+            any("[买入评估]" in m and "600001" in m and "LLM 判观望" in m for m in cm.output),
+            f"应输出 LLM 观望日志，实际输出: {cm.output}")
+
+
 if __name__ == "__main__":
     unittest.main()

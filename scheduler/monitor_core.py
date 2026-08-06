@@ -47,6 +47,8 @@ class _MonitorCoreMixin:
         # 『买入决策被推迟』的候选独立去重：封板/复核失败/LLM预算用尽时推送一次"待重评"提醒，
         # 但不锁 _alerted_burst_codes——破板/快照恢复/预算空出后下轮仍可重新评估买入（审查#3/#4）
         self._deferred_alerted_codes: set = set()
+        # 盘前简报盘中自愈每日标记：交易时段首轮检查当日简报是否缺失（08:30 定时任务未跑时补发一次）
+        self._pre_market_self_heal_done: bool = False
         self._alerted_zhaban_codes: set = set()
         self._auto_bought_codes: set = set()
         self._emotion_top_alerted_today: bool = False
@@ -91,6 +93,7 @@ class _MonitorCoreMixin:
             self._alerted_burst_codes.clear()
             self._deferred_alerted_codes.clear()
             self._alerted_zhaban_codes.clear()
+            self._pre_market_self_heal_done = False  # 盘前简报自愈每日一次（新交易日重置）
             # 重启/换日后从数据库重建当日已买入集合（避免盘中重启导致 MAX_DAILY_BUYS 计数清零）
             self._auto_bought_codes = self._load_today_ai_bought_codes()
             self._emotion_top_alerted_today = False
@@ -341,12 +344,43 @@ class _MonitorCoreMixin:
             time.sleep(settings.MONITOR_INTERVAL_SECONDS)
 
 
+    def _self_heal_pre_market_report(self):
+        """
+        盘中自愈兜底：当日 08:30 盘前简报若因进程未运行/系统睡眠等错过定时任务而未生成
+        （pre_market_report 无当日记录），交易时段首次轮询时补生成+落库+推送，并告警说明。
+        每日仅尝试一次（_pre_market_self_heal_done 标记，新交易日重置）。
+        补发复用 job_pre_market（内部幂等落库 + 更新内存缓存，09:26 竞价/复盘仍能读到当日盘前上下文）。
+        """
+        if getattr(self, '_pre_market_self_heal_done', False):
+            return
+        self._pre_market_self_heal_done = True  # 先置位：当日只尝试一次，避免每轮轮询重复触发
+        try:
+            from database import PreMarketReportManager
+            today = datetime.datetime.now().strftime("%Y%m%d")
+            if PreMarketReportManager.get(today):
+                return  # 当日已生成，无需自愈
+            logger.warning("当日 08:30 盘前简报缺失，交易时段盘中补发...")
+            from scheduler.pre_market import job_pre_market
+            job_pre_market()
+            bark_notifier.send(
+                title="⚠️ [盘前简报补发] 08:30 未生成，已盘中补发",
+                body="检测到今日盘前简报 08:30 未生成（可能因进程未运行或系统睡眠错过定时任务），"
+                     "已自动补发并落库，竞价/复盘可正常读取。",
+                group="盘前简报",
+                level="timeSensitive",
+            )
+        except Exception as e:
+            logger.error(f"盘中补发盘前简报失败: {e}")
+
     def _check_realtime_market(self):
         """
         单次轮询检测逻辑
         """
         # 交易日切换时重置去重状态
         self._reset_daily_state()
+
+        # 0.5 盘中自愈：08:30 盘前简报缺失时补发一次（每日仅一次，不依赖 APScheduler 定时器）
+        self._self_heal_pre_market_report()
 
         # 0. 刷新涨停/炸板池缓存（内部自带 60 秒间隔控制）
         self._refresh_pool_cache()
@@ -644,6 +678,27 @@ class _MonitorCoreMixin:
                 should_buy = (not sector_blocks_buy) and (not concept_blocks_buy) and (not style_blocks_buy) and (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
                     (is_recommended and rec_condition_met) or is_high_signal
                 ) and not is_sealed
+                # 可观测性：候选未过买入闸门时，落 INFO 日志标注具体拦截原因，便于排查"为什么没买"
+                if not should_buy:
+                    if sector_blocks_buy:
+                        _block = f"板块否决[{sector_industry or '-'} {sector_phase or '-'}{'·主线' if sector_mainline else '非主线'}]"
+                    elif concept_blocks_buy:
+                        _block = f"概念否决[{concept_brief or '全部负向'}]"
+                    elif style_blocks_buy:
+                        _block = "市场风格观望"
+                    elif verdict_blocked:
+                        _block = f"竞价判定放弃[{auction_verdict}]"
+                    elif not cycle_allow:
+                        _block = f"情绪周期[{self._cycle_stance.get('stance', '')}]禁止自动买入"
+                    elif index_breaker_triggered:
+                        _block = "大盘熔断"
+                    elif is_recommended and not rec_condition_met:
+                        _block = "推荐买点不满足(开盘/回落)"
+                    elif not is_high_signal:
+                        _block = "非高质量信号"
+                    else:
+                        _block = "其他(含封板)"
+                    logger.info(f"[买入评估] {name}({code}) 跳过买入: {_block}")
                 buy_reason = ""
                 if should_buy and code not in self._auto_bought_codes:
                     # 廉价仓位闸门前置：先过闸门再调 LLM/复核，避免满仓时白烧
@@ -667,6 +722,8 @@ class _MonitorCoreMixin:
                         # B方案：规则候选已通过，LLM 最终买入决定（失败降级回 rule）
                         decision_source, llm_allow = self._llm_confirm_buy(
                             code, name, price, change_pct, vol_ratio, signal_label, [signal_label])
+                        if not llm_allow:
+                            logger.info(f"[买入评估] {name}({code}) LLM 判观望/放弃，不买入")
                         if llm_allow:
                             # LLM 等待期间价格可能变化：买前用最新快照复核（封板/跌停/回落）
                             price, recheck_ok, recheck_retry = self._recheck_buy_after_llm(code, price)
@@ -973,16 +1030,22 @@ class _MonitorCoreMixin:
         不白烧 LLM 决策 + 全市场快照复核（避免阻塞 15s 监控主循环，审计#2）。
         """
         if len(ai_holdings) >= settings.MAX_AI_POSITIONS:
+            logger.info(f"[买入评估] {code} 闸门拦截: AI持仓已达上限({len(ai_holdings)}/{settings.MAX_AI_POSITIONS})")
             return False  # 超出最大持仓数
         if len(self._auto_bought_codes) >= settings.MAX_DAILY_BUYS:
+            logger.info(f"[买入评估] {code} 闸门拦截: 当日买入次数已达上限({len(self._auto_bought_codes)}/{settings.MAX_DAILY_BUYS})")
             return False  # 超出当日最大买入次数
         if self._is_daily_loss_breaker_triggered(ai_holdings):
+            logger.info(f"[买入评估] {code} 闸门拦截: 当日亏损熔断")
             return False  # 当日总亏损熔断
         if amt_billion >= settings.PATTERN_CHECK_MIN_AMOUNT and self._is_bad_intraday_pattern(code):
+            logger.info(f"[买入评估] {code} 闸门拦截: 分时形态不佳(冲高回落/放量滞涨)")
             return False  # 分时形态不佳（冲高回落/放量滞涨）
         if self._is_sector_concentrated(code, ai_holdings):
+            logger.info(f"[买入评估] {code} 闸门拦截: 板块集中度达上限")
             return False  # 板块集中度限制
         if any(h["code"] == code for h in ai_holdings):
+            logger.info(f"[买入评估] {code} 闸门拦截: 已持仓")
             return False  # 已持仓
         return True
 

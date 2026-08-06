@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """低优先审计 8 项的可测部分单元测试"""
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -20,6 +21,11 @@ class TestLossBreaker(unittest.TestCase):
 
     def setUp(self):
         self.m = _TestMonitor()
+        # 熔断触发会真实 bark 推送（外部副作用）：测试必须隔离，避免跑全量测试时
+        # 给用户手机推送假的"当日亏损熔断"告警（曾真发生，见 2026-08-06 09:29）
+        self._bark = patch("scheduler.monitor_signals.bark_notifier.send")
+        self._bark.start()
+        self.addCleanup(self._bark.stop)
 
     def test_昨收缺失按0计不触发(self):
         # prev=0(当日新买), profit_rate=-10% 但不应混入 → avg=0 > -5 不触发
