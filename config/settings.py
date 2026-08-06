@@ -145,6 +145,11 @@ class Settings(BaseSettings):
     SECOND_WAVE_RETREAT_MIN: float = Field(default=0.30, description="二波战法龙头回撤最小比例 (30%)")
     SECOND_WAVE_RETREAT_MAX: float = Field(default=0.50, description="二波战法龙头回撤最大比例 (50%)")
     SECOND_WAVE_LOOKBACK_DAYS: int = Field(default=30, description="二波战法追溯人气龙头的天数")
+    SECOND_WAVE_CHANGE_MIN: float = Field(default=3.0, description="二波战法止跌信号：当日涨幅下限(%)")
+    SW_MAX_DAILY_BUYS: int = Field(default=2, description="二波战法当日最大买入次数(独立预算)")
+    SW_MAX_POSITIONS: int = Field(default=2, description="二波战法最大持仓数量(独立)")
+    SW_LLM_PER_CYCLE: int = Field(default=1, description="二波战法每轮监控周期最多 LLM 买入确认次数")
+    SW_HOLD_DAYS: int = Field(default=5, description="二波战法：N 天内未突破前高(创新高)则清仓离场")
 
     # ==================== 动态阈值配置 ====================
     CAPACITY_K_MIN: float = Field(default=0.7, description="容量因子 K 下限（流动性枯竭）")

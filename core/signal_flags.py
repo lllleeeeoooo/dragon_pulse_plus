@@ -5,6 +5,8 @@
 从 scheduler.monitor_core._scan_signals 抽取，实盘与回测共用同一套阈值，
 保证回测口径与实盘一致（避免"回测信号 vs 实盘信号"分叉）。
 """
+from typing import Dict
+
 import pandas as pd
 
 from config.settings import settings
@@ -18,7 +20,7 @@ SIGNAL_LABEL_COLS = [
 ]
 
 
-def compute_signal_flags(spot_df: pd.DataFrame) -> pd.DataFrame:
+def compute_signal_flags(spot_df: pd.DataFrame, dragons: Dict[str, float] = None) -> pd.DataFrame:
     """
     输入 spot_df 必须含列：code, name, price, change_pct, amount, volume_ratio,
     high, low, open, pre_close, amplitude（回测中 price 用当日收盘 close 填充）。
@@ -26,6 +28,7 @@ def compute_signal_flags(spot_df: pd.DataFrame) -> pd.DataFrame:
     输出：原 df 副本 + 辅助列 amt_billion/_limit_max/_near_limit_min/_near_limit_max
         + 四布尔列 _signal_burst/_signal_near_limit/_signal_low_open_rally/_signal_amplitude
         + _signal_tail_game（尾盘博弈候选，实盘不使用）+ _signal_hit（任一信号命中）
+        + _signal_second_wave（龙头二波候选：dragons={code: peak_price} 传入时计算，否则 False）
     返回完整 df；调用方自行取 df[df["_signal_hit"]] 得到候选池。
     """
     df = spot_df.copy()
@@ -90,6 +93,20 @@ def compute_signal_flags(spot_df: pd.DataFrame) -> pd.DataFrame:
     # 任一抢筹信号命中
     df["_signal_hit"] = (df["_signal_burst"] | df["_signal_near_limit"] |
                          df["_signal_low_open_rally"] | df["_signal_amplitude"])
+
+    # 龙头二波候选（dragons={code: peak_price} 传入时计算；实盘 _scan_second_wave 传入，回测/白天信号默认 False）：
+    # 近30天历史龙头 + 现价相对第一波最高价回撤 30%~50% + 当日涨幅>3%（止跌反包）
+    if dragons:
+        df["_peak_price"] = df["code"].astype(str).map(dragons)
+        _retreat = (df["_peak_price"].astype(float) - df["price"].astype(float)) / df["_peak_price"].astype(float)
+        df["_signal_second_wave"] = (
+            df["_peak_price"].notna() &
+            (_retreat >= settings.SECOND_WAVE_RETREAT_MIN) &
+            (_retreat <= settings.SECOND_WAVE_RETREAT_MAX) &
+            (df["change_pct"] > settings.SECOND_WAVE_CHANGE_MIN)
+        )
+    else:
+        df["_signal_second_wave"] = False
     return df
 
 

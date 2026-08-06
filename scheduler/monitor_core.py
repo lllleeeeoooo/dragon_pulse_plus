@@ -49,6 +49,8 @@ class _MonitorCoreMixin:
         self._auto_bought_codes: set = set()
         # 尾盘博弈独立预算：当日已买入的 AI_TAIL 持仓 code 集合（独立于 _auto_bought_codes）
         self._tail_auto_bought_codes: set = set()
+        # 龙头二波独立预算：当日已买入的 AI_SW 持仓 code 集合
+        self._sw_auto_bought_codes: set = set()
         self._emotion_top_alerted_today: bool = False
         self._consistency_alerted_today: bool = False
         self._pending_sell_codes: set = set()  # 跌停中待卖出的股票
@@ -98,6 +100,7 @@ class _MonitorCoreMixin:
             # 重启/换日后从数据库重建当日已买入集合（避免盘中重启导致 MAX_DAILY_BUYS 计数清零）
             self._auto_bought_codes = self._load_today_ai_bought_codes()
             self._tail_auto_bought_codes = self._load_today_tail_bought_codes()
+            self._sw_auto_bought_codes = self._load_today_sw_bought_codes()
             self._emotion_top_alerted_today = False
             self._consistency_alerted_today = False
             self._pending_sell_codes.clear()
@@ -155,7 +158,7 @@ class _MonitorCoreMixin:
 
         # --- 持仓概况 ---
         holdings = HoldingManager.get_active_holdings()
-        ai_count = sum(1 for h in holdings if h.get("holding_type") in ("AI_AUTO", "AI_TAIL"))
+        ai_count = sum(1 for h in holdings if h.get("holding_type") in ("AI_AUTO", "AI_TAIL", "AI_SW"))
         manual_count = len(holdings) - ai_count
 
         # --- 涨跌停池 ---
@@ -528,6 +531,9 @@ class _MonitorCoreMixin:
 
         # 尾盘博弈（14:30-15:00）：独立策略，闸门+LLM+AI_TAIL 持仓，次日早盘兑现（内部 is_tail_end_time 门控）
         self._scan_tail_game(spot_df, index_breaker_triggered)
+
+        # 龙头二波（全天盘中）：历史龙头回撤30-50%止跌反包 → AI_SW 持仓，N天不创新高离场（内部 is_trading_time 门控）
+        self._scan_second_wave(spot_df, index_breaker_triggered)
 
         # 5. 全市场高位连板股"炸板"监控（基于真实涨停池对比）
         self._check_zhaban_alert(spot_df)
@@ -972,6 +978,118 @@ class _MonitorCoreMixin:
             logger.warning(f"[尾盘博弈] {code} MA 检查异常({e})，站上均线规则未验证，按放行处理")
             return True
 
+    def _sw_dragons(self) -> dict:
+        """近30天历史龙头 {code: peak_price}，每日缓存（避免每轮查库）"""
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        if getattr(self, '_sw_dragons_date', '') == today:
+            return getattr(self, '_sw_dragons_cache', {})
+        dragons = {}
+        try:
+            from database import DragonManager
+            for d in DragonManager.get_recent_dragons(
+                    days_lookback=settings.SECOND_WAVE_LOOKBACK_DAYS):
+                dragons[str(d["code"])] = float(d["peak_price"])
+        except Exception as e:
+            logger.warning(f"[二波] 加载历史龙头失败: {e}")
+        self._sw_dragons_date = today
+        self._sw_dragons_cache = dragons
+        return dragons
+
+    def _scan_second_wave(self, spot_df, index_breaker_triggered):
+        """
+        龙头二波（全天盘中 9:30-15:00）：近30天历史龙头回撤 30%-50% 且当日涨幅>3%（止跌反包）。
+        独立闸门+LLM → AI_SW 持仓；卖出：突破前高兑现 / N 天未创新高离场（_monitor_holdings AI_SW 分支）。
+        独立策略，不污染白天信号去重/风格锁。
+        """
+        if not self.is_trading_time():
+            return
+        dragons = self._sw_dragons()
+        if not dragons:
+            return
+        spot_df = compute_signal_flags(spot_df, dragons=dragons)
+        candidates = spot_df[spot_df["_signal_second_wave"]]
+        if candidates is None or candidates.empty:
+            return
+        candidates = candidates.copy()
+        candidates["_retreat"] = (
+            (candidates["_peak_price"].astype(float) - candidates["price"].astype(float)) /
+            candidates["_peak_price"].astype(float))
+        candidates = candidates.sort_values(by=["_retreat", "change_pct"],
+                                            ascending=[True, False])  # 回撤越浅+涨幅高优先
+        sw_codes = {h["code"] for h in HoldingManager.get_active_holdings(holding_type="AI_SW")}
+        self._sw_llm_confirm_this_cycle = 0
+        for _, row in candidates.head(max(settings.SW_MAX_DAILY_BUYS, 1) * 2).iterrows():
+            code = str(row["code"])
+            if code in self._sw_auto_bought_codes or code in sw_codes:
+                continue
+            name = str(row["name"])
+            price = float(row["price"])
+            change_pct = float(row["change_pct"])
+            vol_ratio = float(row["volume_ratio"])
+            amt_billion = float(row["amt_billion"])
+            peak_price = float(row["_peak_price"])
+            retreat = float(row["_retreat"])
+            if not self._second_wave_gates_open(code, amt_billion, index_breaker_triggered):
+                continue
+            if not self._tail_above_ma(code, price):  # 复用：站上 MA5/MA10
+                continue
+            if self._sw_llm_confirm_this_cycle >= settings.SW_LLM_PER_CYCLE:
+                continue
+            self._sw_llm_confirm_this_cycle += 1
+            decision_source, llm_allow = self._llm_confirm_buy(
+                code, name, price, change_pct, vol_ratio, "二波预警", ["二波预警"])
+            if not llm_allow:
+                logger.info(f"[二波] {name}({code}) LLM 判观望，不买入")
+                continue
+            price, recheck_ok, _retry = self._recheck_buy_after_llm(code, price)
+            if not recheck_ok:
+                continue
+            if not self._second_wave_gates_open(code, amt_billion, index_breaker_triggered):
+                continue
+            slippage = settings.AI_BUY_SLIPPAGE_PCT
+            cost_price = round(price * (1 + slippage / 100), 2)
+            HoldingManager.add_holding(
+                code=code, name=name, cost_price=cost_price, holding_type="AI_SW",
+                strategy=f"二波战法-PEAK{peak_price}", decision_source=decision_source)
+            self._sw_auto_bought_codes.add(code)
+            ma_info = ""
+            try:
+                _ma = self._get_ma_prices(code)
+                if _ma.get("ma5") and _ma.get("ma10"):
+                    ma_info = f" 站上MA5:{_ma['ma5']:.2f}/MA10:{_ma['ma10']:.2f}"
+            except Exception:
+                pass
+            bark_notifier.send(
+                title=f"🤖 [AI 二波买入] {name}({code})",
+                body=(f"二波标的 {name}({code}) 现价:{price}元(+{change_pct}%), 前高{peak_price}元"
+                      f"(回撤{retreat * 100:.1f}%), 成本:{cost_price}元(含滑点),{ma_info}。"
+                      f"突破前高兑现 / {settings.SW_HOLD_DAYS}天未创新高离场。"),
+                group="AI自动持仓", level="timeSensitive")
+
+    def _second_wave_gates_open(self, code: str, amt_billion: float,
+                                index_breaker_triggered: bool) -> bool:
+        """二波独立闸门：独立持仓上限/当日次数 + 共享亏损熔断 + 已持仓 + 大盘熔断。"""
+        sw_holdings = HoldingManager.get_active_holdings(holding_type="AI_SW")
+        if len(sw_holdings) >= settings.SW_MAX_POSITIONS:
+            logger.info(f"[二波] {code} 闸门拦截: 二波持仓已达上限({len(sw_holdings)}/{settings.SW_MAX_POSITIONS})")
+            return False
+        if len(self._sw_auto_bought_codes) >= settings.SW_MAX_DAILY_BUYS:
+            logger.info(f"[二波] {code} 闸门拦截: 当日二波买入已达上限({len(self._sw_auto_bought_codes)}/{settings.SW_MAX_DAILY_BUYS})")
+            return False
+        if index_breaker_triggered:
+            logger.info(f"[二波] {code} 闸门拦截: 大盘熔断")
+            return False
+        if any(h["code"] == code for h in sw_holdings):
+            logger.info(f"[二波] {code} 闸门拦截: 已持仓")
+            return False
+        ai_all = (HoldingManager.get_active_holdings(holding_type="AI_AUTO") +
+                  HoldingManager.get_active_holdings(holding_type="AI_TAIL") +
+                  HoldingManager.get_active_holdings(holding_type="AI_SW"))
+        if self._is_daily_loss_breaker_triggered(ai_all):
+            logger.info(f"[二波] {code} 闸门拦截: 当日亏损熔断")
+            return False
+        return True
+
     def _load_today_ai_bought_codes(self) -> set:
         """从数据库恢复今日已 AI 买入的股票代码（buy_date=今天 且 AI_AUTO），保证盘中重启后当日计数不丢"""
         today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -1014,6 +1132,28 @@ class _MonitorCoreMixin:
             logger.warning(f"恢复今日尾盘博弈已买集合失败: {e}")
         if codes:
             logger.info(f"从数据库恢复今日尾盘博弈已买 {len(codes)} 只")
+        return codes
+
+    def _load_today_sw_bought_codes(self) -> set:
+        """从数据库恢复今日二波已买入代码（buy_date=今天 且 AI_SW），保证盘中重启后独立预算计数不丢"""
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        codes = set()
+        try:
+            from database.services import db_manager
+            from database.models import Holding
+            session = db_manager.get_session()
+            try:
+                rows = session.query(Holding).filter(
+                    Holding.buy_date == today,
+                    Holding.holding_type == "AI_SW",
+                ).all()
+                codes = {h.code for h in rows}
+            finally:
+                session.close()
+        except Exception as e:
+            logger.warning(f"恢复今日二波已买集合失败: {e}")
+        if codes:
+            logger.info(f"从数据库恢复今日二波已买 {len(codes)} 只")
         return codes
 
     def _get_stock_industry(self, code: str) -> str:
@@ -1491,6 +1631,48 @@ class _MonitorCoreMixin:
                         body=f"{reason}\n开盘:{open_px}元 卖出:{sell_px}元 (成本{cost}元)",
                         group="卖出提醒", level="timeSensitive")
                     continue  # 已兑现，不走常规卖出信号
+
+                # 龙头二波卖出：突破前高→止盈兑现；N 天未创新高→离场（不创新高坚决离场）。
+                # 绝对止损/破MA5/强止盈 仍走下方 check_sell_signals。
+                if holding.get("holding_type") == "AI_SW":
+                    peak = 0.0
+                    _s = str(holding.get("buy_strategy", ""))
+                    if "PEAK" in _s:
+                        try:
+                            peak = float(_s.split("PEAK")[-1])
+                        except ValueError:
+                            pass
+                    high_px = float(row.get("high", 0) or 0)
+                    if peak > 0 and high_px >= peak:
+                        # 突破第一波前高 → 二波兑现止盈
+                        sell_px = round(high_px * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)
+                        reason = "二波-突破前高兑现"
+                        HoldingManager.close_holding(code=code, holding_type="AI_SW", sell_price=sell_px)
+                        self._sell_sig_set(code, "AI_SW").add("二波兑现")
+                        logger.info(f"[二波] {holding.get('name')}({code}) {reason} 卖价{sell_px}")
+                        bark_notifier.send(
+                            title=f"🔔 [二波卖出] {holding.get('name')}({code})",
+                            body=f"{reason}\n突破前高{peak}元 卖出:{sell_px}元",
+                            group="卖出提醒", level="timeSensitive")
+                        continue
+                    _days = 0
+                    try:
+                        _b = datetime.datetime.strptime(str(holding.get("buy_date", "")), "%Y-%m-%d")
+                        _days = (datetime.datetime.now() - _b).days
+                    except Exception:
+                        pass
+                    if peak > 0 and _days >= settings.SW_HOLD_DAYS and high_px < peak:
+                        # N 天未创新高 → 坚决离场
+                        sell_px = round(curr_price * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)
+                        reason = f"二波-{settings.SW_HOLD_DAYS}天未创新高离场"
+                        HoldingManager.close_holding(code=code, holding_type="AI_SW", sell_price=sell_px)
+                        self._sell_sig_set(code, "AI_SW").add("二波离场")
+                        logger.info(f"[二波] {holding.get('name')}({code}) {reason} 卖价{sell_px}")
+                        bark_notifier.send(
+                            title=f"🔔 [二波卖出] {holding.get('name')}({code})",
+                            body=f"{reason}\n未突破前高{peak}元 卖出:{sell_px}元 (成本{holding.get('cost_price')}元)",
+                            group="卖出提醒", level="timeSensitive")
+                        continue
 
                 # 获取真实的 MA5 均线价格
                 ma_data = self._get_ma_prices(code)

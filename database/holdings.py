@@ -364,7 +364,7 @@ class HoldingManager:
             # ----- 当前持仓（浮动盈亏，仅 AI 自动持仓——手动持仓只用于监控不入报告）-----
             active = session.query(Holding).filter(
                 Holding.status == "HOLDING",
-                Holding.holding_type.in_(["AI_AUTO", "AI_TAIL"])
+                Holding.holding_type.in_(["AI_AUTO", "AI_TAIL", "AI_SW"])
             ).all()
             holdings_detail = []
             total_unrealized_pnl = 0.0
@@ -409,7 +409,7 @@ class HoldingManager:
             # ----- 今日平仓（已实现盈亏，仅 AI 自动持仓）-----
             today_closed = session.query(Holding).filter(
                 Holding.status == "CLOSED",
-                Holding.holding_type.in_(["AI_AUTO", "AI_TAIL"]),
+                Holding.holding_type.in_(["AI_AUTO", "AI_TAIL", "AI_SW"]),
                 Holding.updated_at >= today_str
             ).all()
 
@@ -434,7 +434,7 @@ class HoldingManager:
             # ----- 全部已实现盈亏（累计，仅 AI 自动持仓）-----
             all_closed = session.query(Holding).filter(
                 Holding.status == "CLOSED",
-                Holding.holding_type.in_(["AI_AUTO", "AI_TAIL"])
+                Holding.holding_type.in_(["AI_AUTO", "AI_TAIL", "AI_SW"])
             ).all()
             total_realized_pnl = 0.0
             total_closed_count = len(all_closed)
