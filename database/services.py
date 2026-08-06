@@ -12,3 +12,4 @@ from database.seats import SeatProfileManager
 from database.sector_cycle import SectorCycleManager
 from database.concept_cycle import ConceptCycleManager
 from database.pre_market_report import PreMarketReportManager
+from database.kline import DailyKlineManager

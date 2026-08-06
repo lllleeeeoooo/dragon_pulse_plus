@@ -168,6 +168,30 @@ class DailyZtPool(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 
+class DailyKline(Base):
+    """
+    全市场个股日线缓存表（回测用）
+    一次性 ETL 拉取全市场历史日线，供回测信号模式近似四类信号。
+    唯一索引 (code, trade_date)，INSERT OR REPLACE 幂等 upsert。
+    """
+    __tablename__ = "daily_kline"
+    __table_args__ = (Index("idx_kline_code_date", "code", "trade_date", unique=True),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(12), nullable=False, index=True, comment="股票代码")
+    trade_date = Column(String(10), nullable=False, index=True, comment="交易日期 YYYYMMDD")
+    open = Column(Float, default=0.0, comment="开盘价")
+    high = Column(Float, default=0.0, comment="最高价")
+    low = Column(Float, default=0.0, comment="最低价")
+    close = Column(Float, default=0.0, comment="收盘价")
+    volume = Column(Float, default=0.0, comment="成交量(股)")
+    amount = Column(Float, default=0.0, comment="成交额(元)")
+    pre_close = Column(Float, default=0.0, comment="昨收价")
+    change_pct = Column(Float, default=0.0, comment="涨跌幅(%)")
+    amplitude = Column(Float, default=0.0, comment="振幅(%)")
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+
 class SectorStrength(Base):
     """
     每日板块强度表

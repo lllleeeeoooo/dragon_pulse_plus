@@ -3,12 +3,13 @@ import pandas as pd
 from config.settings import settings
 import akshare as ak
 logger = logging.getLogger(__name__)
-from data.core import retry_on_exception, multi_source_fetch
+from data.core import retry_on_exception, multi_source_fetch, socket_timeout
 from data.fetcher_spot import _SpotMixin
 
 class _PoolMixin:
     @staticmethod
     @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    @socket_timeout()
     def get_zt_pool(date_str: str) -> pd.DataFrame:
         """
         获取指定日期的涨停池 (stock_zt_pool_em)
@@ -39,6 +40,7 @@ class _PoolMixin:
 
     @staticmethod
     @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    @socket_timeout()
     def get_zhaban_pool(date_str: str) -> pd.DataFrame:
         """
         获取指定日期的炸板观察池 (stock_zt_pool_zbgc_em)
@@ -68,6 +70,7 @@ class _PoolMixin:
 
     @staticmethod
     @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    @socket_timeout()
     def get_dt_pool(date_str: str) -> pd.DataFrame:
         """
         获取指定日期的跌停池 (stock_zt_pool_dtgc_em)
@@ -150,6 +153,7 @@ class _PoolMixin:
 
     @staticmethod
     @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    @socket_timeout()
     def get_board_cons(board_name: str) -> pd.DataFrame:
         """
         获取指定同花顺/东财概念板块成分股 (stock_board_industry_cons_em)
@@ -176,6 +180,7 @@ class _PoolMixin:
 
     @staticmethod
     @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    @socket_timeout()
     def get_concept_boards() -> pd.DataFrame:
         """
         获取概念板块列表（东财 → 新浪 双源降级）。
@@ -295,6 +300,7 @@ class _PoolMixin:
 
     @staticmethod
     @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    @socket_timeout()
     def get_fund_flow_instant() -> pd.DataFrame:
         """
         全市场即时资金流快照（同花顺，东财 push2 限流时的替代源）。
@@ -328,6 +334,7 @@ class _PoolMixin:
 
     @staticmethod
     @retry_on_exception(retries=settings.FETCH_RETRY_COUNT, delay=settings.FETCH_RETRY_DELAY)
+    @socket_timeout()
     def get_individual_fund_flow(stock_code: str = "600519", market: str = "sh") -> pd.DataFrame:
         """
         获取个股主力资金流向 (stock_individual_fund_flow)

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """_scan_signals 集成回归测试：审查#3(封板不锁死破板重评)/#4(买前复核fail-closed不锁)/
 #1(买入LLM预算用尽不跳过推送) 的控制流验证。"""
+import os
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -170,6 +172,78 @@ class TestBuyBlockDiagnostics(ScanSignalsHarness):
         self.assertTrue(
             any("[买入评估]" in m and "600001" in m and "LLM 判观望" in m for m in cm.output),
             f"应输出 LLM 观望日志，实际输出: {cm.output}")
+
+
+class TestWatchdog(unittest.TestCase):
+    """看门狗：主循环心跳停更(数据源挂起/网络阻塞卡死)时推送告警，恢复后复位"""
+
+    def setUp(self):
+        self.m = _MonitorCoreMixin()
+        # 默认禁用自动重启，避免 _watchdog_check 触发 os._exit 杀掉测试进程；自动重启逻辑单独测
+        self._ar = patch("scheduler.monitor_core.settings.WATCHDOG_AUTO_RESTART", False)
+        self._ar.start()
+        self.addCleanup(self._ar.stop)
+
+    def test_卡死推送一次_恢复后复位(self):
+        with patch("scheduler.monitor_core.bark_notifier.send") as bark:
+            self.m._heartbeat = time.time() - 500  # 停更 500s > 120s 阈值
+            self.assertTrue(self.m._watchdog_check())   # 首次卡死 → 告警推送
+            self.assertTrue(self.m._watchdog_alerted)
+            self.assertTrue(bark.called)
+            bark.reset_mock()
+            self.assertFalse(self.m._watchdog_check())  # 持续卡死 → 不重复推送
+            self.assertFalse(bark.called)
+            self.m._heartbeat = time.time()             # 心跳恢复
+            self.assertFalse(self.m._watchdog_check())
+            self.assertFalse(self.m._watchdog_alerted)  # 复位，下次卡死可再告警
+
+    def test_心跳正常不告警(self):
+        with patch("scheduler.monitor_core.bark_notifier.send") as bark:
+            self.m._heartbeat = time.time()
+            self.assertFalse(self.m._watchdog_check())
+            self.assertFalse(bark.called)
+
+    def _marker(self):
+        return os.path.abspath("logs/.watchdog_restart")
+
+    def test_自动重启拉起新进程并退出(self):
+        marker = self._marker()
+        if os.path.exists(marker):
+            os.remove(marker)
+        with patch("scheduler.monitor_core.bark_notifier.send"), \
+             patch("subprocess.Popen") as popen, \
+             patch("os._exit") as ex:
+            self.m._auto_restart()
+        self.assertTrue(popen.called)      # 拉起新 main.py
+        self.assertTrue(ex.called)         # 退出当前进程
+        self.assertTrue(os.path.exists(marker))  # 标记已写，供新进程感知
+        if os.path.exists(marker):
+            os.remove(marker)
+
+    def test_自动重启冷却期防循环(self):
+        marker = self._marker()
+        open(marker, "w").write(str(time.time()))  # 新鲜标记 → 冷却期内
+        try:
+            with patch("scheduler.monitor_core.bark_notifier.send"), \
+                 patch("subprocess.Popen") as popen, \
+                 patch("os._exit"):
+                self.m._auto_restart()
+            self.assertFalse(popen.called)  # 冷却期不重启，防循环
+        finally:
+            if os.path.exists(marker):
+                os.remove(marker)
+
+    def test_恢复推送并清理标记(self):
+        marker = self._marker()
+        open(marker, "w").write(str(time.time()))
+        try:
+            with patch("scheduler.monitor_core.bark_notifier.send") as bark:
+                self.m._notify_watchdog_recovered()
+            self.assertTrue(bark.called)                 # 推送『已恢复』
+            self.assertFalse(os.path.exists(marker))     # 标记清理
+        finally:
+            if os.path.exists(marker):
+                os.remove(marker)
 
 
 if __name__ == "__main__":

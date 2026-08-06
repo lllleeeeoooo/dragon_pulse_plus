@@ -377,6 +377,16 @@ EXCLUDE_STAR_MARKET=true   # 排除科创板 (688)
 EXCLUDE_BSE=true           # 排除北交所 (8/43/83/87/920)
 EXCLUDE_ST=true            # 排除 ST/*ST 股
 
+# ==================== 5.5 信号回测（mode=signals 胜率对比） ====================
+# 四类抢筹信号 + 尾盘博弈的胜率/收益率对比（全市场日线近似，非真实盘中口径）。
+# 首次使用先拉日线缓存：python -m data.kline_etl --start 20260701 --end 20260731
+# 然后回测：GET /backtest?start=20260701&end=20260731&mode=signals
+# 结果 signal_compare 里对比 点火异动/逼近封板/低开猛拉/振幅放量/尾盘博弈 各桶胜率与平均收益。
+TAIL_GAME_OPEN_GAP_PCT=2.0    # 尾盘博弈：次日开盘涨幅≥此比例(%)视为高开，用当日最高价兑现
+TAIL_GAME_NEAR_LIMIT_RATIO=0.92  # 尾盘博弈候选：涨幅≥涨停线×此比例的涨停附近放量下限
+TAIL_GAME_VOL_RATIO=3.0       # 尾盘博弈候选：放量下限（量比）
+KLINE_ETL_WORKERS=8           # 全市场日线 ETL 并行线程数
+
 # ==================== 6. 交易所监管异动与胆量风控 ====================
 REGULATORY_MONITOR_ENABLED=true
 MAIN_BOARD_3D_DEV_LIMIT=20.0

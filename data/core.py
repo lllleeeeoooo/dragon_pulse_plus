@@ -20,6 +20,23 @@ logger = logging.getLogger(__name__)
 # 曾因此停摆 48 分钟。抓取期间设置 socket 默认超时，超时按该源失败降级/重试。
 _FETCH_SOCKET_TIMEOUT = 12
 
+
+def socket_timeout(timeout: float = _FETCH_SOCKET_TIMEOUT):
+    """给数据源抓取函数加 socket 超时：akshare 内部 requests 未传 timeout，
+    源挂起时防止永久阻塞主循环——卡死变为 socket.timeout 异常，主循环 try/except
+    可 continue 自行恢复（不再停摆）。抓取期间设置 socket 默认超时，结束后恢复。"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            _old = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                socket.setdefaulttimeout(_old)
+        return wrapper
+    return decorator
+
 # ==============================================================================
 # 数据源当日熔断（次日重置）
 # 某数据源当日异常达 SOURCE_FAIL_CIRCUIT_LIMIT 次后，当天剩余时间不再调用该源，

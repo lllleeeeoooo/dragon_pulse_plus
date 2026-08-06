@@ -28,6 +28,15 @@ def job_post_market():
         return
 
     logger.info(">>> 触发 18:01 盘后深度复盘定时任务...")
+    # 盘后自动同步全市场日线缓存（后台线程，不阻塞复盘；供 mode=signals 回测用最新数据）
+    try:
+        import threading
+        from data.kline_etl import KlineEtl
+        threading.Thread(target=KlineEtl.run_incremental,
+                         kwargs={"workers": settings.KLINE_ETL_WORKERS},
+                         daemon=True, name="kline-etl").start()
+    except Exception as e:
+        logger.warning(f"盘后日线增量同步启动失败: {e}")
     try:
         today_str = datetime.datetime.now().strftime("%Y%m%d")
 

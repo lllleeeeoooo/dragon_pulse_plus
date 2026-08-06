@@ -18,8 +18,19 @@ import numpy as np
 
 from data.fetcher import DataFetcher
 from config.settings import settings
+from core.signal_flags import compute_signal_flags, signal_labels
 
 logger = logging.getLogger(__name__)
+
+# 信号回测策略桶：四类抢筹信号 + 尾盘博弈（独立子回测，互不干扰，胜率横向对比）
+SIGNAL_STRATEGIES = ["点火异动", "逼近封板", "低开猛拉", "振幅放量", "尾盘博弈"]
+SIGNAL_TO_COL = {
+    "点火异动": "_signal_burst",
+    "逼近封板": "_signal_near_limit",
+    "低开猛拉": "_signal_low_open_rally",
+    "振幅放量": "_signal_amplitude",
+    "尾盘博弈": "_signal_tail_game",
+}
 
 
 class AIBacktestEngine:
@@ -44,14 +55,18 @@ class AIBacktestEngine:
         max_positions: int = None,
         max_daily_buys: int = None,
         slippage: float = 0.3,
+        mode: str = "zt",
     ) -> dict:
         """
         :param start_date:   回测起始日期 YYYYMMDD
         :param end_date:     回测结束日期 YYYYMMDD
-        :param max_positions: 最大持仓数（默认取 settings.MAX_AI_POSITIONS）
-        :param max_daily_buys:每日最大买入笔数（默认取 settings.MAX_DAILY_BUYS）
+        :param max_positions: 最大持仓数（默认取 settings.MAX_AI_POSITIONS；mode=signals 时不限）
+        :param max_daily_buys:每日最大买入笔数（默认取 settings.MAX_DAILY_BUYS；mode=signals 时不限）
         :param slippage:      买卖滑点 (%)
+        :param mode:          "zt"=涨停池买连板龙头（旧行为）；"signals"=四类信号+尾盘博弈胜率对比
         """
+        if mode == "signals":
+            return AIBacktestEngine._run_signals(start_date, end_date, slippage)
         if max_positions is None:
             max_positions = settings.MAX_AI_POSITIONS
         if max_daily_buys is None:
@@ -155,6 +170,174 @@ class AIBacktestEngine:
             start_date, end_date, max_positions, max_daily_buys,
             circuit_breaker_triggered_dates,
         )
+
+    # ------------------------------------------------------------------
+    # 信号回测模式（mode="signals"）：四类信号 + 尾盘博弈 胜率对比
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _run_signals(start_date: str, end_date: str, slippage: float = 0.3) -> dict:
+        """
+        信号模式入口：5 个独立子回测（四类信号 + 尾盘博弈）各跑一遍，
+        去掉预算（无上限买入，只看胜率/收益率%），合并已平仓交易统计对比。
+        """
+        date_list = AIBacktestEngine._build_trade_date_list(start_date, end_date)
+        if not date_list:
+            return {"total_trades": 0,
+                    "message": f"回测区间 {start_date}~{end_date} 无交易日（日历获取失败或区间为空）",
+                    "trading_days": 0}
+        from data.kline_etl import KlineEtl
+        kline_cache = KlineEtl.load_cache(start_date, end_date)
+        if not kline_cache:
+            return {"total_trades": 0,
+                    "message": ("日线缓存缺失，请先执行 ETL: "
+                                "python -m data.kline_etl --start "
+                                f"{start_date} --end {end_date}"),
+                    "trading_days": len(date_list)}
+        all_trades = []
+        for strategy in SIGNAL_STRATEGIES:
+            all_trades.extend(
+                AIBacktestEngine._run_signal_strategy(date_list, kline_cache, strategy, slippage))
+        return AIBacktestEngine._summarize(
+            all_trades, [], date_list, start_date, end_date,
+            10 ** 6, 10 ** 6, set(), signal_mode=True)
+
+    @staticmethod
+    def _run_signal_strategy(date_list: list, kline_cache: dict, strategy: str,
+                             slippage: float) -> list:
+        """单策略逐日回测：买入该策略信号候选，卖出（尾盘博弈次日兑现 / 其余现有规则），返回已平仓交易。"""
+        positions: list = []
+        closed: list = []
+        for i, date_str in enumerate(date_list):
+            day_data = AIBacktestEngine._get_signal_day_data(
+                date_str, date_list, i, positions, kline_cache)
+            if day_data is None:
+                continue
+            if strategy == "尾盘博弈":
+                positions, c2, _ = AIBacktestEngine._process_tail_game_sells(
+                    positions, date_str, day_data, 1e12, slippage)
+            else:
+                positions, c2, _ = AIBacktestEngine._process_sells(
+                    positions, date_str, day_data, 1e12, slippage)
+            closed.extend(c2)
+            positions.extend(
+                AIBacktestEngine._process_signal_buys(date_str, strategy, day_data, slippage))
+
+        # 末日后强制平仓（沿用旧口径，收盘价卖出）
+        last_date = date_list[-1]
+        last_data = AIBacktestEngine._get_signal_day_data(
+            last_date, date_list, len(date_list) - 1, positions, kline_cache)
+        for pos in positions:
+            close_px = AIBacktestEngine._get_close_from_data(
+                pos["code"], last_date, last_data) if last_data else None
+            sell_price = (close_px or pos["cost_price"]) * (1 - slippage / 100)
+            closed.append({
+                "code": pos["code"], "name": pos.get("name", pos["code"]),
+                "buy_date": pos["buy_date"], "sell_date": last_date,
+                "buy_price": pos["cost_price"], "sell_price": round(sell_price, 2),
+                "return_pct": AIBacktestEngine._calc_return(pos["cost_price"], sell_price),
+                "hold_days": pos.get("hold_days", 1), "strategy": strategy,
+                "reason": "强制平仓",
+            })
+        return closed
+
+    @staticmethod
+    def _get_signal_day_data(date_str: str, date_list: list, idx: int,
+                             positions: list, kline_cache: dict) -> Optional[dict]:
+        """信号模式当日数据：日线组装 spot → 计算信号列 → 排除 688/BSE/ST → 补 close/MA5 缓存。"""
+        from data.kline_etl import KlineEtl
+        spot_df = KlineEtl.build_day_spot(kline_cache, date_str)
+        if spot_df is None or spot_df.empty:
+            return None
+        spot_df = compute_signal_flags(spot_df)
+        # 排除科创板/北交所/ST（对齐实盘源头过滤，不用 _filter_zt_pool 以免其量比过滤干扰信号）
+        if settings.EXCLUDE_STAR_MARKET:
+            spot_df = spot_df[~spot_df["code"].astype(str).str.startswith("688")]
+        if settings.EXCLUDE_BSE:
+            bse = ("82", "83", "87", "88", "43", "920")
+            spot_df = spot_df[~spot_df["code"].astype(str).str.startswith(bse)]
+        if settings.EXCLUDE_ST:
+            spot_df = spot_df[~spot_df["name"].astype(str).str.contains("ST", case=False, na=False)]
+
+        close_cache: Dict[str, float] = {}
+        ohlc_cache: Dict[str, dict] = {}
+        for _, r in spot_df.iterrows():
+            code = str(r["code"])
+            close_cache[code] = float(r.get("close", r.get("price")))
+            ohlc_cache[code] = {k: float(r.get(k, r.get("price")))
+                                for k in ("open", "high", "low", "close", "pre_close",
+                                          "change_pct", "amplitude", "volume_ratio")}
+        ma5_cache: Dict[str, float] = {}
+        for pos in positions:
+            bars = kline_cache.get(pos["code"])
+            if bars is not None and len(bars["close"].loc[:date_str]) >= 5:
+                ma5_cache[pos["code"]] = float(bars["close"].loc[:date_str].tail(5).mean())
+        return {"date_str": date_str, "spot_df": spot_df, "ohlc_cache": ohlc_cache,
+                "close_cache": close_cache, "ma5_cache": ma5_cache, "zt_df": pd.DataFrame()}
+
+    @staticmethod
+    def _process_signal_buys(date_str: str, strategy: str, day_data: dict,
+                             slippage: float) -> list:
+        """按策略信号列选候选，买入价=当日收盘价（≈尾盘价），无预算上限。"""
+        spot = day_data.get("spot_df")
+        if spot is None or spot.empty:
+            return []
+        col = SIGNAL_TO_COL[strategy]
+        cand = spot[spot[col]].sort_values(
+            by=["change_pct", "volume_ratio"], ascending=[False, False])
+        out = []
+        for _, row in cand.iterrows():
+            code = str(row["code"])
+            close_px = float(row.get("close", row.get("price")))
+            if close_px <= 0 or not code:
+                continue
+            cost = close_px * (1 + slippage / 100)
+            out.append({
+                "code": code, "name": str(row.get("name", code)), "buy_date": date_str,
+                "cost_price": round(cost, 2), "current_price": close_px,
+                "hold_days": 0, "profit_pct": 0.0, "strategy": strategy,
+                "sell_mode": "tail_game" if strategy == "尾盘博弈" else "regular",
+                "signals": signal_labels(row),
+            })
+        return out
+
+    @staticmethod
+    def _process_tail_game_sells(positions: list, date_str: str, day_data: dict,
+                                 available_cash: float, slippage: float) -> tuple:
+        """
+        尾盘博弈卖出：次日早盘兑现（不过 10:30）。
+        次日 open ≥ 成本×(1+TAIL_GAME_OPEN_GAP_PCT) → 视为高开，用当日 high 卖出（冲高兑现）；
+        否则按 open 卖出（开盘兑现/止损）。尾盘博弈持仓次日必清，绝不过夜第 2 天。
+        """
+        remaining, closed = [], []
+        for pos in positions:
+            if pos.get("sell_mode") != "tail_game":
+                remaining.append(pos)
+                continue
+            row = day_data.get("ohlc_cache", {}).get(pos["code"])
+            if row is None:
+                remaining.append(pos)
+                continue
+            open_px = float(row.get("open") or 0)
+            high_px = float(row.get("high") or 0)
+            if open_px <= 0:
+                open_px = high_px = float(row.get("close") or 0)
+            cost = pos["cost_price"]
+            if open_px >= cost * (1 + settings.TAIL_GAME_OPEN_GAP_PCT / 100):
+                sell_price = high_px * (1 - slippage / 100)
+                reason = "尾盘博弈-次日高开冲高兑现"
+            else:
+                sell_price = open_px * (1 - slippage / 100)
+                reason = "尾盘博弈-次日未高开按开盘兑现"
+            closed.append({
+                "code": pos["code"], "name": pos.get("name", pos["code"]),
+                "buy_date": pos["buy_date"], "sell_date": date_str,
+                "buy_price": cost, "sell_price": round(sell_price, 2),
+                "return_pct": AIBacktestEngine._calc_return(cost, sell_price),
+                "hold_days": pos.get("hold_days", 1), "strategy": "尾盘博弈",
+                "reason": reason,
+            })
+        return remaining, closed, available_cash
 
     @staticmethod
     def _build_trade_date_list(start_date: str, end_date: str) -> List[str]:
@@ -572,8 +755,10 @@ class AIBacktestEngine:
         max_positions: int,
         max_daily_buys: int,
         circuit_breaker_dates: set,
+        signal_mode: bool = False,
+        disclaimer: str = "",
     ) -> dict:
-        """生成回测汇总报告"""
+        """生成回测汇总报告。signal_mode=True 时输出 signal_compare 策略桶胜率对比。"""
         if not closed_trades:
             return {
                 "total_trades": 0,
@@ -630,10 +815,14 @@ class AIBacktestEngine:
             for r, st in reason_stats.items()
         }
 
-        # 总收益（相对初始资金 100 万）
-        total_return = round(
-            (daily_equity[-1]["total_equity"] - 1_000_000) / 1_000_000 * 100, 2
-        ) if daily_equity else 0.0
+        # 总收益：有净值用净值（zt 模式）；signal 模式无净值，用逐笔收益简单加总（只看收益率%）
+        if daily_equity:
+            total_return = round(
+                (daily_equity[-1]["total_equity"] - 1_000_000) / 1_000_000 * 100, 2)
+        elif signal_mode:
+            total_return = round(sum(returns), 2)
+        else:
+            total_return = 0.0
 
         # 盈亏分布
         profit_ranges = {
@@ -651,6 +840,31 @@ class AIBacktestEngine:
         top5 = sorted_trades[:5]
         bottom5 = sorted_trades[-5:]
 
+        # 信号模式胜率对比：按策略桶（四类信号 + 尾盘博弈 + 全部）独立统计
+        signal_compare = None
+        if signal_mode:
+            signal_compare = {}
+            groups: Dict[str, list] = {}
+            for t in closed_trades:
+                groups.setdefault(t.get("strategy", "其他"), []).append(t["return_pct"])
+            for s, rets in groups.items():
+                w = sum(1 for r in rets if r > 0)
+                signal_compare[s] = {
+                    "trades": len(rets),
+                    "win_rate_pct": round(w / len(rets) * 100, 2),
+                    "avg_return_pct": round(sum(rets) / len(rets), 2),
+                    "total_return_pct": round(sum(rets), 2),
+                }
+            all_rets = [t["return_pct"] for t in closed_trades]
+            if all_rets:
+                w2 = sum(1 for r in all_rets if r > 0)
+                signal_compare["全部信号"] = {
+                    "trades": len(all_rets),
+                    "win_rate_pct": round(w2 / len(all_rets) * 100, 2),
+                    "avg_return_pct": round(sum(all_rets) / len(all_rets), 2),
+                    "total_return_pct": round(sum(all_rets), 2),
+                }
+
         logger.info(
             f"AI 回测完成: {start_date}~{end_date} "
             f"交易={total_trades}笔 胜率={win_rate}% "
@@ -665,14 +879,19 @@ class AIBacktestEngine:
             "min_return_pct": min_ret,
             "total_return_pct": total_return,
             "max_drawdown_pct": round(max_drawdown, 2),
-            "max_positions": max_positions,
-            "max_daily_buys": max_daily_buys,
+            "max_positions": "不限" if signal_mode else max_positions,
+            "max_daily_buys": "不限" if signal_mode else max_daily_buys,
             "period": f"{start_date}~{end_date}",
             "trading_days": len(date_list),
             "circuit_breaker_days": len(circuit_breaker_dates),
             "strategy_breakdown": strategy_summary,
             "sell_reason_breakdown": reason_summary,
             "profit_distribution": profit_ranges,
+            "signal_compare": signal_compare,
+            "disclaimer": (disclaimer or (
+                "基于全市场日线收盘口径近似，非真实盘中信号；尾盘博弈买入价=收盘价近似14:30；"
+                "同一标的可计入多个独立策略桶；high/涨停附近价可能不可成交，存在乐观偏差。"
+            ) if signal_mode else ""),
             "top5": [{"code": t["code"], "name": t["name"], "return_pct": t["return_pct"],
                       "hold_days": t["hold_days"], "reason": t.get("reason", ""),
                       "strategy": t.get("strategy", "")} for t in top5],

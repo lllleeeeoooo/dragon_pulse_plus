@@ -359,20 +359,37 @@ def refresh_trade_calendar(x_api_key: Optional[str] = Header(None)):
 
 
 @app.get("/backtest", summary="模拟回测（历史模拟）",
-         description="用历史涨停池数据模拟 AI 买卖策略的盈亏。这不是真实成交统计，是'如果当时买了会怎样'的模拟。"
-                     "示例：/backtest?start=20260701&end=20260720",
+         description="历史数据模拟买卖策略盈亏，非真实成交。"
+                     "mode=zt：从涨停池买连板龙头（默认）；mode=signals：四类信号+尾盘博弈胜率对比（需先 ETL 全市场日线）。"
+                     "示例：/backtest?start=20260701&end=20260731&mode=signals",
          tags=["AkShare 数据"])
 def run_backtest(
     start: str = Query("20260701", description="起始日期 YYYYMMDD"),
     end: str = Query("20260730", description="结束日期 YYYYMMDD"),
-    max_positions: int = Query(None, description="最大持仓数，默认取 settings.MAX_AI_POSITIONS"),
-    max_daily_buys: int = Query(None, description="每日最大买入，默认取 settings.MAX_DAILY_BUYS"),
+    max_positions: int = Query(None, description="最大持仓数，默认取 settings.MAX_AI_POSITIONS（signals 模式不限）"),
+    max_daily_buys: int = Query(None, description="每日最大买入，默认取 settings.MAX_DAILY_BUYS（signals 模式不限）"),
+    mode: str = Query("zt", description="回测模式: zt=涨停池买连板 / signals=四类信号+尾盘博弈胜率对比"),
 ):
     from core.backtest import AIBacktestEngine
     result = AIBacktestEngine.run(
         start_date=start, end_date=end,
         max_positions=max_positions, max_daily_buys=max_daily_buys,
+        mode=mode,
     )
+    return {"code": 200, "data": result}
+
+
+@app.post("/backtest/etl-kline", summary="拉取全市场日线缓存（回测 signals 模式前置）",
+          description="并行拉取回测区间内全市场历史日线到 daily_kline 表（断点续传）。"
+                      "示例：/backtest/etl-kline?start=20260701&end=20260731&workers=8",
+          tags=["AkShare 数据"])
+def backtest_etl_kline(
+    start: str = Query(..., description="起始日期 YYYYMMDD"),
+    end: str = Query(..., description="结束日期 YYYYMMDD"),
+    workers: int = Query(None, description="并行线程数，默认取 settings.KLINE_ETL_WORKERS"),
+):
+    from data.kline_etl import KlineEtl
+    result = KlineEtl.run(start, end, workers)
     return {"code": 200, "data": result}
 
 

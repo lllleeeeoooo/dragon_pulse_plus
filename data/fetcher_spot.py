@@ -1,10 +1,26 @@
 import logging
+import socket
 import pandas as pd
 from config.settings import settings
 import akshare as ak
 logger = logging.getLogger(__name__)
 import time as _time
-from data.core import multi_source_fetch
+from data.core import multi_source_fetch, _FETCH_SOCKET_TIMEOUT
+
+
+def _spot_fetch(func):
+    """给数据源抓取函数包 socket 超时：akshare 内部 requests 未传 timeout，
+    数据源挂起会永久阻塞主循环（曾多次卡死盘中监控，含 _fill_ohlc_from_sina 直接调用路径）。
+    超时抛 socket.timeout，由调用方/降级链处理。"""
+    def wrapper(*args, **kwargs):
+        _old = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(_FETCH_SOCKET_TIMEOUT)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            socket.setdefaulttimeout(_old)
+    return wrapper
+
 
 _cached_total_amount: float = 0.0
 
@@ -283,6 +299,7 @@ class _SpotMixin:
 
 
     @staticmethod
+    @_spot_fetch
     def _fetch_spot_sina() -> pd.DataFrame:
         """从新浪获取全市场实时行情并归一化列名"""
         df = ak.stock_zh_a_spot()
@@ -311,6 +328,7 @@ class _SpotMixin:
 
 
     @staticmethod
+    @_spot_fetch
     def _fetch_spot_tencent() -> pd.DataFrame:
         """从腾讯获取全市场实时行情并归一化列名"""
         df = ak.stock_zh_a_spot_tx()
@@ -352,6 +370,7 @@ class _SpotMixin:
 
 
     @staticmethod
+    @_spot_fetch
     def _fetch_spot_eastmoney() -> pd.DataFrame:
         """从东财获取全市场实时行情并归一化列名（原始主力源）"""
         df = ak.stock_zh_a_spot_em()

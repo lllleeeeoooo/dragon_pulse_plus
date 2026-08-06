@@ -384,6 +384,41 @@ class TestPureRegressions(unittest.TestCase):
         self.assertEqual(socket.getdefaulttimeout(), before)  # 结束后恢复原值
         self.assertTrue(result.empty)                        # 源失败 → 返回空，不卡死主循环
 
+    def test_socket_timeout_decorator(self):
+        """data.core socket_timeout 装饰器：抓取期间设置 socket 超时、结束恢复，
+        源挂起时抛超时异常而非永久阻塞（主循环卡死自愈机制）"""
+        import socket
+        from data.core import socket_timeout
+        captured = {}
+
+        @socket_timeout(timeout=5)
+        def fake_source():
+            captured["during"] = socket.getdefaulttimeout()
+            raise socket.timeout("timed out")
+
+        before = socket.getdefaulttimeout()
+        with self.assertRaises(socket.timeout):
+            fake_source()
+        self.assertEqual(captured["during"], 5)          # 抓取期间默认超时被设为 5s
+        self.assertEqual(socket.getdefaulttimeout(), before)  # 结束后恢复
+
+    def test_spot_fetch_socket_timeout(self):
+        """_fetch_spot_* 抓取函数包 socket 超时：防止新浪/腾讯源挂起时永久阻塞主循环
+        （_fill_ohlc_from_sina 直接调用 _fetch_spot_sina 不走 multi_source_fetch 曾卡死）"""
+        import socket
+        from data.fetcher_spot import _spot_fetch
+        captured = {}
+
+        @_spot_fetch
+        def fake_source():
+            captured["during"] = socket.getdefaulttimeout()
+            return 1
+
+        before = socket.getdefaulttimeout()
+        self.assertEqual(fake_source(), 1)
+        self.assertEqual(captured["during"], 12.0)          # 抓取期间设置 socket 默认超时
+        self.assertEqual(socket.getdefaulttimeout(), before)  # 结束后恢复原值
+
     def test_spot_source_priority(self):
         """信号依赖量比/振幅：主源必须是东财或腾讯，不能是新浪（新浪缺量比振幅会让信号全灭，历史 bug）"""
         from data.core import SOURCE_PRIORITY

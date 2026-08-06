@@ -8,6 +8,7 @@ from config.settings import settings
 from data.fetcher import DataFetcher
 from core.emotion_index import EmotionVector
 from core.strategies import MarketStyle
+from core.signal_flags import compute_signal_flags
 from core.holding_monitor import HoldingMonitor
 from core.trade_calendar import is_trading_day, get_previous_trading_day
 from llm.sell_advisor import DynamicSellAdvisor
@@ -79,6 +80,9 @@ class _MonitorCoreMixin:
         self._pattern_cache: Dict[str, tuple] = {}
         # 个股行业缓存（当日），供板块集中度控制，避免反复查库
         self._industry_cache: Dict[str, str] = {}
+        # 看门狗：主循环心跳 + 疑似卡死告警（数据源挂起/网络阻塞时主线程阻塞，看门狗线程仍可跑）
+        self._heartbeat: float = time.time()
+        self._watchdog_alerted: bool = False
 
 
     def _reset_daily_state(self):
@@ -305,8 +309,11 @@ class _MonitorCoreMixin:
         from scheduler.helpers import _record_job_run
         _record_job_run("job_monitor_loop", "盘中实时监控")
         logger.info(f"启动盘中实时轮询监控引擎 (轮询间隔: {settings.MONITOR_INTERVAL_SECONDS}秒)...")
+        self._start_watchdog()  # 看门狗：主循环心跳停更时推送卡死告警
+        self._notify_watchdog_recovered()  # 若为看门狗自动重启，推送『已恢复』并清理标记
 
         while self.is_running:
+            self._heartbeat = time.time()  # 心跳：本轮开始前更新，卡死(网络阻塞)时不再更新
             try:
                 if not is_trading_day():
                     time.sleep(300)  # 非交易日5分钟检查一次，不浪费API
@@ -337,6 +344,99 @@ class _MonitorCoreMixin:
 
             time.sleep(settings.MONITOR_INTERVAL_SECONDS)
 
+    def _start_watchdog(self):
+        """启动看门狗线程：主循环心跳停更(数据源挂起/网络阻塞卡死)时推送告警。
+        独立 daemon 线程——socket 阻塞会释放 GIL，故主线程卡死时看门狗仍能运行。"""
+        try:
+            import threading
+            threading.Thread(target=self._watchdog_loop, daemon=True,
+                             name="watchdog").start()
+        except Exception as e:
+            logger.warning(f"看门狗启动失败: {e}")
+
+    def _watchdog_check(self) -> bool:
+        """单次看门狗检查：心跳停更超过阈值 → 推送一次卡死告警并置位；心跳恢复 → 复位。
+        返回 True 表示本次推送了告警。供 _watchdog_loop 与测试调用。"""
+        try:
+            stall = time.time() - self._heartbeat
+            if stall > settings.WATCHDOG_STALL_SECONDS:
+                if not self._watchdog_alerted:
+                    self._watchdog_alerted = True
+                    logger.error(
+                        f"监控主循环疑似卡死 {stall:.0f} 秒（心跳停更，数据源挂起/网络阻塞），请检查/重启")
+                    bark_notifier.send(
+                        title="⚠️ [监控疑似卡死] 盘中监控停摆",
+                        body=(f"主循环心跳已 {stall:.0f} 秒未更新（数据源挂起/网络阻塞），"
+                              f"盘中监控已停摆。"),
+                        group="系统告警",
+                        level="timeSensitive",
+                    )
+                    if settings.WATCHDOG_AUTO_RESTART:
+                        self._auto_restart()  # 推送后自动拉起新进程（自愈，冷却期内防循环）
+                    return True
+            else:
+                self._watchdog_alerted = False  # 心跳恢复 → 复位，下次卡死可再告警
+        except Exception as e:
+            logger.warning(f"看门狗检查异常: {e}")
+        return False
+
+    def _watchdog_loop(self):
+        """看门狗主循环：定期检查心跳是否停更，卡死推送一次，心跳恢复后复位可再次告警。"""
+        while True:
+            time.sleep(settings.WATCHDOG_CHECK_SECONDS)
+            self._watchdog_check()
+
+    def _auto_restart(self):
+        """看门狗自动重启：检测到卡死时拉起新 main.py 进程并退出当前进程。
+        冷却期内(距上次自动重启不足 N 分钟)再次卡死 → 停止自动重启防循环，交人工。
+        通过 logs/.watchdog_restart 标记文件让新进程感知'是自动重启'并推送恢复通知。"""
+        import os
+        import subprocess
+        import sys
+        marker = os.path.abspath("logs/.watchdog_restart")
+        try:
+            if os.path.exists(marker) and \
+                    (time.time() - os.path.getmtime(marker)) < \
+                    settings.WATCHDOG_RESTART_COOLDOWN_MINUTES * 60:
+                logger.error("看门狗冷却期内再次卡死，停止自动重启（疑似循环），需人工介入")
+                bark_notifier.send(
+                    title="🚨 [监控反复卡死] 自动重启已暂停",
+                    body=f"冷却期({settings.WATCHDOG_RESTART_COOLDOWN_MINUTES}分钟)内再次卡死，"
+                         f"已停止自动重启避免循环，请人工检查数据源/网络。",
+                    group="系统告警", level="timeSensitive")
+                return
+            open(marker, "w").write(str(time.time()))
+            bark_notifier.send(
+                title="🔄 [监控自动重启] 检测到卡死，正在重启",
+                body=f"主循环心跳停更超 {settings.WATCHDOG_STALL_SECONDS}s，"
+                     f"已自动拉起新进程，恢复后会推送确认。",
+                group="系统告警", level="timeSensitive")
+            subprocess.Popen(
+                [sys.executable, "main.py"],
+                cwd=os.getcwd(),
+                creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) |
+                               getattr(subprocess, "DETACHED_PROCESS", 0)),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True,
+            )
+        except Exception as e:
+            logger.error(f"自动重启失败: {e}")
+            return
+        os._exit(0)  # 新进程已拉起，强制退出当前卡死进程
+
+    def _notify_watchdog_recovered(self):
+        """新进程启动：若存在自动重启标记，推送『已恢复』并清理标记（每次自动重启仅通知一次）。"""
+        try:
+            import os
+            marker = os.path.abspath("logs/.watchdog_restart")
+            if os.path.exists(marker):
+                os.remove(marker)
+                bark_notifier.send(
+                    title="✅ [监控已自动恢复] 盘中监控重新上线",
+                    body="看门狗自动重启完成，监控已恢复运行。",
+                    group="系统告警", level="timeSensitive")
+        except Exception as e:
+            logger.warning(f"恢复通知失败: {e}")
 
     def _self_heal_pre_market_report(self):
         """
@@ -503,48 +603,9 @@ class _MonitorCoreMixin:
         #    b) 逼近封板: 涨幅 8%~9.5% + 量比 > 5
         #    c) 低开猛拉: 低开 + 直线拉回 + 量比 > 3
         #    d) 振幅放量: 振幅 > 7% + 量比 > 3 + 涨幅 > 3%
-        spot_df = spot_df.copy()
-        spot_df["amt_billion"] = spot_df["amount"].astype(float) / 1e8
-
-        # 辅助列：低开猛拉的拉升强度 = (现价-开盘) / (最高-最低)
-        price_range = spot_df["high"].astype(float) - spot_df["low"].astype(float)
-        rally_strength = (spot_df["price"].astype(float) - spot_df["open"].astype(float)) / price_range.replace(0, 1)
-
-        # 按板块区分涨停线：主板 10cm vs 双创 20cm（科创板已在源头过滤，此处主要区分创业板 300）
-        is_main_board = spot_df["code"].astype(str).str.match(r"^(60|00)")
-        spot_df["_limit_max"] = settings.PRICE_BURST_MAX  # 主板 10cm
-        spot_df.loc[~is_main_board, "_limit_max"] = settings.PRICE_BURST_MAX_20CM  # 双创 20cm
-        # 逼近封板区间 = 涨停线的 80%~100%
-        spot_df["_near_limit_min"] = spot_df["_limit_max"] * settings.MONITOR_NEAR_LIMIT_RATIO  # 涨停线×比值
-        spot_df["_near_limit_max"] = spot_df["_limit_max"]
-
-        spot_df["_signal_burst"] = (
-            (spot_df["volume_ratio"] >= settings.VOL_BURST_THRESHOLD) &
-            (spot_df["change_pct"] >= settings.PRICE_BURST_THRESHOLD) &
-            (spot_df["change_pct"] < spot_df["_limit_max"])
-        )
-        spot_df["_signal_near_limit"] = (
-            (spot_df["change_pct"] >= spot_df["_near_limit_min"]) &
-            (spot_df["change_pct"] <= spot_df["_near_limit_max"]) &
-            (spot_df["volume_ratio"] > settings.NEAR_LIMIT_VOL_RATIO)
-        )
-        spot_df["_signal_low_open_rally"] = (
-            (spot_df["open"].astype(float) > 0) &  # OHLC 数据缺失时（0值）不触发，避免垃圾判定
-            (spot_df["open"].astype(float) < spot_df["pre_close"].astype(float) * settings.LOW_OPEN_DEV) &
-            (spot_df["volume_ratio"] > settings.RALLY_VOL_RATIO) &
-            (rally_strength > settings.RALLY_STRENGTH_MIN) &
-            (spot_df["change_pct"] > 0)
-        )
-        spot_df["_signal_amplitude"] = (
-            (spot_df["amplitude"] > settings.AMPLITUDE_SIGNAL_MIN) &
-            (spot_df["volume_ratio"] > settings.RALLY_VOL_RATIO) &
-            (spot_df["change_pct"] > settings.AMPLITUDE_CHANGE_MIN)
-        )
-
-        # 任一信号命中
-        signal_hit = spot_df["_signal_burst"] | spot_df["_signal_near_limit"] | \
-                     spot_df["_signal_low_open_rally"] | spot_df["_signal_amplitude"]
-        hit_df = spot_df[signal_hit]
+        # 四类抢筹信号 + 尾盘博弈候选：与回测共用 compute_signal_flags（阈值口径一致）
+        spot_df = compute_signal_flags(spot_df)
+        hit_df = spot_df[spot_df["_signal_hit"]]
 
         # 按市场风格调整排序优先级
         priority_strategy = market_style.get("priority_strategy", "")
