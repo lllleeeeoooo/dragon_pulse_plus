@@ -19,6 +19,7 @@ import numpy as np
 from data.fetcher import DataFetcher
 from config.settings import settings
 from core.signal_flags import compute_signal_flags, signal_labels
+from data.core import socket_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,8 @@ logger = logging.getLogger(__name__)
 SIGNAL_STRATEGIES = ["点火异动", "逼近封板", "低开猛拉", "振幅放量", "尾盘博弈"]
 SIGNAL_TO_COL = {
     "点火异动": "_signal_burst",
-    "逼近封板": "_signal_near_limit",
+    # 逼近封板用盘中最高涨幅近似（收盘口径会漏掉盘中逼近后封板/回落的股票，样本严重偏少）
+    "逼近封板": "_signal_near_limit_intraday",
     "低开猛拉": "_signal_low_open_rally",
     "振幅放量": "_signal_amplitude",
     "尾盘博弈": "_signal_tail_game",
@@ -250,6 +252,21 @@ class AIBacktestEngine:
         if spot_df is None or spot_df.empty:
             return None
         spot_df = compute_signal_flags(spot_df)
+        # 盘中逼近封板：用当日最高涨幅 high_chg 近似（收盘口径漏掉盘中逼近后封板/回落的股票）
+        if "high_chg" in spot_df.columns:
+            # 非一字板过滤：开盘涨幅 < 涨停线（一字板开盘即涨停买不进，逼近封板只针对能买进的强势票）
+            _main = spot_df["code"].astype(str).str.match(r"^(60|00)")
+            _open_chg = (spot_df["open"].astype(float) - spot_df["pre_close"].astype(float)) \
+                        / spot_df["pre_close"].astype(float) * 100
+            _oneseal = ((_main & (_open_chg >= settings.MAIN_BOARD_LIMIT_PCT)) |
+                        (~_main & (_open_chg >= settings.GEM_STAR_LIMIT_PCT)))
+            spot_df["_signal_near_limit_intraday"] = (
+                (spot_df["high_chg"] >= spot_df["_near_limit_min"]) &
+                (spot_df["high_chg"] <= spot_df["_near_limit_max"]) &
+                (spot_df["volume_ratio"] > settings.NEAR_LIMIT_VOL_RATIO) &
+                (~_oneseal))
+        else:
+            spot_df["_signal_near_limit_intraday"] = spot_df["_signal_near_limit"]
         # 排除科创板/北交所/ST（对齐实盘源头过滤，不用 _filter_zt_pool 以免其量比过滤干扰信号）
         if settings.EXCLUDE_STAR_MARKET:
             spot_df = spot_df[~spot_df["code"].astype(str).str.startswith("688")]
@@ -291,7 +308,19 @@ class AIBacktestEngine:
             close_px = float(row.get("close", row.get("price")))
             if close_px <= 0 or not code:
                 continue
-            cost = close_px * (1 + slippage / 100)
+            # 买入价口径：
+            # 尾盘博弈用收盘价(14:30≈收盘)；
+            # 逼近封板用当日最高价(盘中冲高触发时价格接近 high，追涨成本)；
+            # 其余盘中信号用当日 VWAP(成交均价，避免收盘价追高)
+            if strategy == "尾盘博弈":
+                buy_px = close_px
+            elif strategy == "逼近封板":
+                buy_px = float(row.get("high", close_px) or close_px)
+            else:
+                vol = float(row.get("volume", 0) or 0)
+                amt = float(row.get("amount", 0) or 0)
+                buy_px = amt / vol if vol > 0 and amt > 0 else close_px
+            cost = buy_px * (1 + slippage / 100)
             out.append({
                 "code": code, "name": str(row.get("name", code)), "buy_date": date_str,
                 "cost_price": round(cost, 2), "current_price": close_px,
@@ -324,7 +353,10 @@ class AIBacktestEngine:
                 open_px = high_px = float(row.get("close") or 0)
             cost = pos["cost_price"]
             if open_px >= cost * (1 + settings.TAIL_GAME_OPEN_GAP_PCT / 100):
-                sell_price = high_px * (1 - slippage / 100)
+                # 高开：按兑现比例在 open~high 之间卖（默认 0.5=冲高一半），
+                # 不用不可成交的最高价 high（回测口径改进，避免乐观偏差）
+                take = settings.TAIL_GAME_TAKE_RATIO
+                sell_price = (open_px + (high_px - open_px) * take) * (1 - slippage / 100)
                 reason = "尾盘博弈-次日高开冲高兑现"
             else:
                 sell_price = open_px * (1 - slippage / 100)
@@ -340,6 +372,7 @@ class AIBacktestEngine:
         return remaining, closed, available_cash
 
     @staticmethod
+    @socket_timeout()
     def _build_trade_date_list(start_date: str, end_date: str) -> List[str]:
         """构建回测区间内的 A 股交易日列表（akshare 交易日历，失败回退工作日）"""
         import datetime

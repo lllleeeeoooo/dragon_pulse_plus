@@ -10,13 +10,19 @@ from core.signal_flags import compute_signal_flags
 
 
 def _spot_with_signal():
-    """一行逼近封板信号（同时命中尾盘博弈候选）的 spot_df"""
-    df = pd.DataFrame([{
-        "code": "600001", "name": "A", "price": 10.9, "change_pct": 9.0, "amount": 6e8,
-        "volume_ratio": 6.0, "high": 10.95, "low": 10.3, "open": 10.4, "pre_close": 10.0,
-        "amplitude": 6.5,
-    }])
-    return compute_signal_flags(df)
+    """两行：600001 盘中逼近封板、600002 尾盘博弈（低吸强势股）候选，含盘中逼近封板列"""
+    df = pd.DataFrame([
+        {"code": "600001", "name": "A", "price": 10.9, "change_pct": 9.0, "amount": 6e8,
+         "volume": 6e7, "volume_ratio": 6.0, "high": 10.95, "low": 10.3, "open": 10.4,
+         "pre_close": 10.0, "amplitude": 6.5},
+        {"code": "600002", "name": "B", "price": 10.4, "change_pct": 4.0, "amount": 6e8,
+         "volume": 6e7, "volume_ratio": 4.0, "high": 10.45, "low": 10.0, "open": 10.1,
+         "pre_close": 10.0, "amplitude": 4.0},
+    ])
+    df = compute_signal_flags(df)
+    df["high_chg"] = [9.5, 4.5]
+    df["_signal_near_limit_intraday"] = [True, False]
+    return df
 
 
 class TestSignalBuys(unittest.TestCase):
@@ -27,7 +33,7 @@ class TestSignalBuys(unittest.TestCase):
         self.assertTrue(out)
         self.assertEqual(out[0]["strategy"], "逼近封板")
         self.assertEqual(out[0]["sell_mode"], "regular")
-        self.assertEqual(out[0]["cost_price"], round(10.9 * 1.003, 2))  # 买入=收盘价含滑点
+        self.assertEqual(out[0]["cost_price"], round(10.95 * 1.003, 2))  # 盘中逼近用 high 追涨含滑点
         # 尾盘博弈 → sell_mode="tail_game"
         out2 = AIBacktestEngine._process_signal_buys("20260701", "尾盘博弈", day_data, 0.3)
         self.assertTrue(out2)
@@ -47,8 +53,9 @@ class TestTailGameSell(unittest.TestCase):
         self.assertEqual(remaining, [])
         self.assertEqual(len(closed), 1)
         self.assertIn("高开", closed[0]["reason"])
-        # open 10.3 ≥ 10.0×1.02 → high 卖 10.8×0.997 → return ≈ +7.68%
-        self.assertAlmostEqual(closed[0]["return_pct"], 7.68, places=1)
+        # open 10.3 ≥ 10.0×1.02 → 按兑现比例 0.5 在 open~high 间卖：
+        # (10.3+(10.8-10.3)×0.5)×0.997 = 10.518 → return ≈ +5.18%（不再用不可成交的 high 顶价）
+        self.assertAlmostEqual(closed[0]["return_pct"], 5.18, places=1)
 
     def test_次日未高开按开盘兑现(self):
         day_data = {"ohlc_cache": {"600001": {"open": 9.8, "high": 9.9, "close": 9.7}}}
@@ -90,7 +97,8 @@ class TestRunSignalsEndToEnd(unittest.TestCase):
             rows = []
             for i, d in enumerate(dates):
                 active = (code == "600001" and i == 7)
-                rows.append({"trade_date": d, "open": 10.0, "high": 10.5, "low": 9.8,
+                rows.append({"trade_date": d, "open": 10.0, "high": 10.92 if active else 10.0,
+                             "low": 9.8,
                              "close": 10.9 if active else 10.0,
                              "volume": 60000.0 if active else 10000.0,
                              "amount": 600000.0 if active else 100000.0,
@@ -103,7 +111,7 @@ class TestRunSignalsEndToEnd(unittest.TestCase):
         self.assertIn("signal_compare", res)
         self.assertGreater(res["total_trades"], 0)
         self.assertIn("逼近封板", res["signal_compare"])
-        self.assertIn("尾盘博弈", res["signal_compare"])
+        self.assertIn("点火异动", res["signal_compare"])
 
 
 if __name__ == "__main__":

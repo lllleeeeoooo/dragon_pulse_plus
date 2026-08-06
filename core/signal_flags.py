@@ -29,6 +29,10 @@ def compute_signal_flags(spot_df: pd.DataFrame) -> pd.DataFrame:
     返回完整 df；调用方自行取 df[df["_signal_hit"]] 得到候选池。
     """
     df = spot_df.copy()
+    # 统一 close：实盘 spot 只有 price(盘中现价)，回测 build_day_spot 有 close(收盘价)；
+    # 尾盘博弈候选等需要收盘价列，缺失时用 price 兜底
+    if "close" not in df.columns:
+        df["close"] = df["price"]
     df["amt_billion"] = df["amount"].astype(float) / 1e8
 
     # 辅助列：低开猛拉的拉升强度 = (现价-开盘) / (最高-最低)
@@ -66,13 +70,21 @@ def compute_signal_flags(spot_df: pd.DataFrame) -> pd.DataFrame:
         (df["change_pct"] > settings.AMPLITUDE_CHANGE_MIN)
     )
 
-    # 尾盘博弈候选（回测专用，实盘 _scan_signals 不消费此列）：
-    # 未封板 且（逼近封板区间 或 涨幅≥涨停线×0.92 且放量）——博弈次日高开
+    # 尾盘博弈候选（回测专用，实盘 _scan_signals 不消费此列）——指南「低吸强势股博次日高开」：
+    # 涨幅 2%~5%（不追高）+ 放量 + 收阳 + 短上影线(收盘卖压小) + 收盘≥全天均价(尾盘强势)
+    if "volume" in df.columns:
+        df["vwap"] = df["amount"].astype(float) / df["volume"].astype(float).replace(0, float("nan"))
+    else:
+        df["vwap"] = df["close"].astype(float)  # 无 volume 列时 vwap≈close，close≥vwap 恒成立
+    _upper_ratio = (df["high"].astype(float) - df["close"].astype(float)) / \
+                   (df["high"].astype(float) - df["low"].astype(float)).replace(0, 1)
     df["_signal_tail_game"] = (
-        (df["change_pct"] < df["_limit_max"]) &
-        (df["_signal_near_limit"] |
-         ((df["change_pct"] >= df["_limit_max"] * settings.TAIL_GAME_NEAR_LIMIT_RATIO) &
-          (df["volume_ratio"] >= settings.TAIL_GAME_VOL_RATIO)))
+        (df["change_pct"] >= settings.TAIL_GAME_CHANGE_MIN) &
+        (df["change_pct"] <= settings.TAIL_GAME_CHANGE_MAX) &
+        (df["volume_ratio"] >= settings.TAIL_GAME_VOL_RATIO) &
+        (df["close"].astype(float) > df["open"].astype(float)) &  # 收阳
+        (_upper_ratio <= settings.TAIL_GAME_SHORT_UPPER_RATIO) &   # 短上影线
+        (df["close"].astype(float) >= df["vwap"].fillna(df["close"].astype(float)))  # 收盘≥均价
     )
 
     # 任一抢筹信号命中

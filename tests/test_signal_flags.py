@@ -49,20 +49,20 @@ class TestSignalFlags(unittest.TestCase):
 
     def test_尾盘博弈候选(self):
         spot = _spot([
-            # 逼近封板区间(8-9.5, 量比6) 未封板 → 尾盘候选命中
-            ("600001", "A", 10.9, 9.0, 6e8, 6.0, 10.95, 10.3, 10.4, 10.0, 4.0),
-            # 已封板(主板 9.9>=9.8) → 尾盘候选不命中
-            ("600002", "B", 10.99, 9.9, 6e8, 6.0, 11.0, 10.4, 10.4, 10.0, 6.0),
-            # 涨停附近放量(涨幅>=9.5*0.92=8.74, 量比3) → 命中
-            ("600003", "C", 10.88, 8.8, 6e8, 3.0, 10.9, 10.4, 10.4, 10.0, 4.0),
-            # 涨幅够但未放量(量比<3) → 不命中
-            ("600004", "D", 10.88, 8.8, 6e8, 2.0, 10.9, 10.4, 10.4, 10.0, 4.0),
+            # 低吸强势: 涨幅4% 放量 收阳 短上影 → 命中
+            ("600001", "A", 10.4, 4.0, 6e8, 4.0, 10.45, 10.0, 10.1, 10.0, 4.0),
+            # 追高: 涨幅9%(>5) → 不命中
+            ("600002", "B", 10.9, 9.0, 6e8, 6.0, 10.95, 10.3, 10.4, 10.0, 4.0),
+            # 未放量(量比<3) → 不命中
+            ("600003", "C", 10.4, 4.0, 6e8, 2.0, 10.45, 10.0, 10.1, 10.0, 4.0),
+            # 收阴(close<open) → 不命中
+            ("600004", "D", 10.2, 2.0, 6e8, 4.0, 10.5, 10.0, 10.5, 10.0, 5.0),
         ])
         df = compute_signal_flags(spot)
         self.assertTrue(bool(df.iloc[0]["_signal_tail_game"]))
-        self.assertFalse(bool(df.iloc[1]["_signal_tail_game"]))  # 封板买不进
-        self.assertTrue(bool(df.iloc[2]["_signal_tail_game"]))
-        self.assertFalse(bool(df.iloc[3]["_signal_tail_game"]))
+        self.assertFalse(bool(df.iloc[1]["_signal_tail_game"]))  # 涨幅9%追高
+        self.assertFalse(bool(df.iloc[2]["_signal_tail_game"]))  # 量比2未放量
+        self.assertFalse(bool(df.iloc[3]["_signal_tail_game"]))  # 收阴
 
     def test_low_open_缺OHLC不崩(self):
         spot = _spot([

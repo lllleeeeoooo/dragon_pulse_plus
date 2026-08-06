@@ -21,8 +21,9 @@ from data.core import socket_timeout
 
 logger = logging.getLogger(__name__)
 
-# 本进程内已确认不可用的日线源（失败一次即标记跳过，避免限流源反复空转拖慢 ETL）
+# 本进程内已确认不可用的日线源（连续失败达阈值才标记跳过，偶发失败不跳过）
 _disabled_sources: set = set()
+_source_fail_count: dict = {}
 
 # 日线中文列 → 英文列 映射
 _COL_MAP = {
@@ -98,18 +99,22 @@ class KlineEtl:
             ]:
                 if name in _disabled_sources:
                     continue
-                # 空结果重试（腾讯限流常静默返回空而非异常）：最多 3 次，间隔递增，避免限流丢整只
+                # 空结果重试（限流常静默返回空而非异常）：最多 3 次，间隔递增，避免限流丢整只
                 for attempt in range(4):
                     try:
                         tmp = fn()
                         if tmp is not None and not tmp.empty:
+                            _source_fail_count[name] = 0  # 成功清零
                             df = KlineEtl._normalize_ohlcv(tmp, code)
                             break
                         if attempt < 3:
                             time.sleep(1.0 * (attempt + 1))
                     except Exception as e2:
-                        _disabled_sources.add(name)
-                        logger.warning(f"{code} {name}日线失败: {e2}")
+                        # 连续失败达阈值才跳过该源（偶发一次失败不永久标记，避免限流抖动丢整个源）
+                        _source_fail_count[name] = _source_fail_count.get(name, 0) + 1
+                        if _source_fail_count[name] >= 5:
+                            _disabled_sources.add(name)
+                        logger.warning(f"{code} {name}日线失败(连续{_source_fail_count[name]}次): {e2}")
                         break
                 if not df.empty:
                     break
@@ -201,10 +206,14 @@ class KlineEtl:
             rows.append({
                 "code": code, "name": code, "price": float(bar["close"]),
                 "close": float(bar["close"]), "change_pct": float(bar["change_pct"]),
-                "amount": float(bar["amount"]), "volume_ratio": round(vol_ratio, 2),
+                "amount": float(bar["amount"]), "volume": float(bar["volume"]),
+                "volume_ratio": round(vol_ratio, 2),
                 "high": float(bar["high"]), "low": float(bar["low"]),
                 "open": float(bar["open"]), "pre_close": float(bar["pre_close"]),
                 "amplitude": float(bar["amplitude"]),
+                # 盘中最高涨幅（近似盘中逼近封板/追涨触发时点，回测逼近封板用）
+                "high_chg": round((float(bar["high"]) - float(bar["pre_close"])) / float(bar["pre_close"]) * 100, 2)
+                if float(bar["pre_close"]) > 0 else 0.0,
             })
         return pd.DataFrame(rows)
 

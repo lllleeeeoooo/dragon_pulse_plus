@@ -47,6 +47,8 @@ class _MonitorCoreMixin:
         self._pre_market_self_heal_done: bool = False
         self._alerted_zhaban_codes: set = set()
         self._auto_bought_codes: set = set()
+        # 尾盘博弈独立预算：当日已买入的 AI_TAIL 持仓 code 集合（独立于 _auto_bought_codes）
+        self._tail_auto_bought_codes: set = set()
         self._emotion_top_alerted_today: bool = False
         self._consistency_alerted_today: bool = False
         self._pending_sell_codes: set = set()  # 跌停中待卖出的股票
@@ -95,6 +97,7 @@ class _MonitorCoreMixin:
             self._pre_market_self_heal_done = False  # 盘前简报自愈每日一次（新交易日重置）
             # 重启/换日后从数据库重建当日已买入集合（避免盘中重启导致 MAX_DAILY_BUYS 计数清零）
             self._auto_bought_codes = self._load_today_ai_bought_codes()
+            self._tail_auto_bought_codes = self._load_today_tail_bought_codes()
             self._emotion_top_alerted_today = False
             self._consistency_alerted_today = False
             self._pending_sell_codes.clear()
@@ -152,7 +155,7 @@ class _MonitorCoreMixin:
 
         # --- 持仓概况 ---
         holdings = HoldingManager.get_active_holdings()
-        ai_count = sum(1 for h in holdings if h.get("holding_type") == "AI_AUTO")
+        ai_count = sum(1 for h in holdings if h.get("holding_type") in ("AI_AUTO", "AI_TAIL"))
         manual_count = len(holdings) - ai_count
 
         # --- 涨跌停池 ---
@@ -253,6 +256,14 @@ class _MonitorCoreMixin:
             return False
         current_time = now.time()
         return datetime.time(9, 15) <= current_time <= datetime.time(9, 25)
+
+    def is_tail_end_time(self) -> bool:
+        """判断是否在尾盘博弈窗口 (14:30-15:00)——指南：避开 14:00-14:30 跳水，买在走势定型后"""
+        now = datetime.datetime.now()
+        if now.weekday() >= 5:
+            return False
+        current_time = now.time()
+        return datetime.time(14, 30) <= current_time <= datetime.time(15, 0)
 
 
     def _refresh_pool_cache(self):
@@ -514,6 +525,9 @@ class _MonitorCoreMixin:
 
         # 4. 扫描全市场抢筹信号 + 自动买入 + 推送（已拆到 _scan_signals）
         self._scan_signals(spot_df, market_style, pending_recs, pending_codes, index_breaker_triggered)
+
+        # 尾盘博弈（14:30-15:00）：独立策略，闸门+LLM+AI_TAIL 持仓，次日早盘兑现（内部 is_tail_end_time 门控）
+        self._scan_tail_game(spot_df, index_breaker_triggered)
 
         # 5. 全市场高位连板股"炸板"监控（基于真实涨停池对比）
         self._check_zhaban_alert(spot_df)
@@ -851,6 +865,102 @@ class _MonitorCoreMixin:
                         cap_map[c] = cap
             self._check_fund_inflow_alert(burst_codes_for_fund[:3], cap_map)
 
+    def _scan_tail_game(self, spot_df, index_breaker_triggered):
+        """
+        尾盘博弈（14:30-15:00）：按指南选低吸强势股（涨幅2-5%/放量/收阳/短上影/收盘≥均价）博次日高开。
+        独立预算(TAIL_MAX_*)、闸门+LLM 风控、AI_TAIL 持仓、次日 _monitor_holdings 早盘兑现。
+        独立策略，不污染 _alerted_burst_codes/风格质量过滤。
+        """
+        if not self.is_tail_end_time():
+            return
+        spot_df = compute_signal_flags(spot_df)
+        candidates = spot_df[spot_df["_signal_tail_game"]]
+        if candidates is None or candidates.empty:
+            return
+        candidates = candidates.sort_values(
+            by=["volume_ratio", "change_pct"], ascending=[False, False])
+        tail_codes = {h["code"] for h in HoldingManager.get_active_holdings(holding_type="AI_TAIL")}
+        self._tail_llm_confirm_this_cycle = 0
+        for _, row in candidates.head(max(settings.TAIL_MAX_DAILY_BUYS, 1) * 2).iterrows():
+            code = str(row["code"])
+            if code in self._tail_auto_bought_codes or code in tail_codes:
+                continue
+            name = str(row["name"])
+            price = float(row["price"])
+            change_pct = float(row["change_pct"])
+            vol_ratio = float(row["volume_ratio"])
+            amt_billion = float(row["amt_billion"])
+            if not self._tail_gates_open(code, amt_billion, index_breaker_triggered):
+                continue
+            # 指南：上升趋势站上 5/10 日均线（MA 数据缺失放行）
+            if not self._tail_above_ma(code, price):
+                continue
+            # 独立 LLM 预算：尾盘时段每轮最多确认 TAIL_LLM_PER_CYCLE 次
+            if self._tail_llm_confirm_this_cycle >= settings.TAIL_LLM_PER_CYCLE:
+                continue
+            self._tail_llm_confirm_this_cycle += 1
+            decision_source, llm_allow = self._llm_confirm_buy(
+                code, name, price, change_pct, vol_ratio, "尾盘博弈", ["尾盘博弈"])
+            if not llm_allow:
+                logger.info(f"[尾盘博弈] {name}({code}) LLM 判观望，不买入")
+                continue
+            price, recheck_ok, _retry = self._recheck_buy_after_llm(code, price)
+            if not recheck_ok:
+                logger.info(f"[尾盘博弈] {name}({code}) 买前复核未通过，放弃")
+                continue
+            if not self._tail_gates_open(code, amt_billion, index_breaker_triggered):
+                continue
+            slippage = settings.AI_BUY_SLIPPAGE_PCT
+            cost_price = round(price * (1 + slippage / 100), 2)
+            HoldingManager.add_holding(
+                code=code, name=name, cost_price=cost_price, holding_type="AI_TAIL",
+                strategy="尾盘博弈-次日高开", decision_source=decision_source)
+            self._tail_auto_bought_codes.add(code)
+            bark_notifier.send(
+                title=f"🤖 [AI 尾盘博弈买入] {name}({code})",
+                body=(f"尾盘博弈标的 {name}({code}) 现价:{price}元(+{change_pct}%), 量比{vol_ratio}倍, "
+                      f"成本:{cost_price}元(含滑点{slippage:.2f}%)，明日早盘兑现卖出。"),
+                group="AI自动持仓", level="timeSensitive")
+
+    def _tail_gates_open(self, code: str, amt_billion: float, index_breaker_triggered: bool) -> bool:
+        """尾盘博弈独立闸门：独立持仓上限/当日次数 + 共享亏损熔断 + 已持仓 + 大盘熔断。"""
+        tail_holdings = HoldingManager.get_active_holdings(holding_type="AI_TAIL")
+        if len(tail_holdings) >= settings.TAIL_MAX_POSITIONS:
+            logger.info(f"[尾盘博弈] {code} 闸门拦截: 尾盘持仓已达上限({len(tail_holdings)}/{settings.TAIL_MAX_POSITIONS})")
+            return False
+        if len(self._tail_auto_bought_codes) >= settings.TAIL_MAX_DAILY_BUYS:
+            logger.info(f"[尾盘博弈] {code} 闸门拦截: 当日尾盘买入已达上限({len(self._tail_auto_bought_codes)}/{settings.TAIL_MAX_DAILY_BUYS})")
+            return False
+        if index_breaker_triggered:
+            logger.info(f"[尾盘博弈] {code} 闸门拦截: 大盘熔断")
+            return False
+        if any(h["code"] == code for h in tail_holdings):
+            logger.info(f"[尾盘博弈] {code} 闸门拦截: 已持仓")
+            return False
+        ai_all = (HoldingManager.get_active_holdings(holding_type="AI_AUTO") +
+                  HoldingManager.get_active_holdings(holding_type="AI_TAIL"))
+        if self._is_daily_loss_breaker_triggered(ai_all):
+            logger.info(f"[尾盘博弈] {code} 闸门拦截: 当日亏损熔断")
+            return False
+        return True
+
+    def _tail_above_ma(self, code: str, price: float) -> bool:
+        """指南：个股处于上升趋势，站上 5/10 日均线。
+        MA 数据缺失/获取失败时**明确告警并放行**（未知即放行，但告知该候选未验证站均线规则）。"""
+        if not settings.TAIL_GAME_REQUIRE_MA:
+            return True
+        try:
+            ma = self._get_ma_prices(code)
+            ma5 = ma.get("ma5")
+            ma10 = ma.get("ma10")
+            if ma5 is None or ma10 is None:
+                logger.warning(f"[尾盘博弈] {code} MA5/MA10 数据缺失(新股/数据源失败)，"
+                               f"站上均线规则未验证，按放行处理")
+                return True
+            return price > ma5 and price > ma10
+        except Exception as e:
+            logger.warning(f"[尾盘博弈] {code} MA 检查异常({e})，站上均线规则未验证，按放行处理")
+            return True
 
     def _load_today_ai_bought_codes(self) -> set:
         """从数据库恢复今日已 AI 买入的股票代码（buy_date=今天 且 AI_AUTO），保证盘中重启后当日计数不丢"""
@@ -872,6 +982,28 @@ class _MonitorCoreMixin:
             logger.warning(f"恢复今日AI已买集合失败: {e}")
         if codes:
             logger.info(f"从数据库恢复今日 AI 已买 {len(codes)} 只")
+        return codes
+
+    def _load_today_tail_bought_codes(self) -> set:
+        """从数据库恢复今日尾盘博弈已买入的代码（buy_date=今天 且 AI_TAIL），保证盘中重启后独立预算计数不丢"""
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        codes = set()
+        try:
+            from database.services import db_manager
+            from database.models import Holding
+            session = db_manager.get_session()
+            try:
+                rows = session.query(Holding).filter(
+                    Holding.buy_date == today,
+                    Holding.holding_type == "AI_TAIL",
+                ).all()
+                codes = {h.code for h in rows}
+            finally:
+                session.close()
+        except Exception as e:
+            logger.warning(f"恢复今日尾盘博弈已买集合失败: {e}")
+        if codes:
+            logger.info(f"从数据库恢复今日尾盘博弈已买 {len(codes)} 只")
         return codes
 
     def _get_stock_industry(self, code: str) -> str:
@@ -1323,6 +1455,32 @@ class _MonitorCoreMixin:
                 # A股 T+1：当日买入的持仓当日不可卖出，跳过卖出信号检查（价格更新照常进行）
                 if holding.get("buy_date") == today:
                     continue
+
+                # 尾盘博弈次日早盘兑现（09:30-10:30）：AI_TAIL 持仓次日必清，绝不过夜第2天。
+                # 对齐回测 _process_tail_game_sells：高开≥2% 在 open~high 之间按 TAIL_GAME_TAKE_RATIO 兑现，
+                # 未高开按开盘价兑现/止损。
+                if holding.get("holding_type") == "AI_TAIL" and \
+                        datetime.time(9, 30) <= datetime.datetime.now().time() <= datetime.time(10, 30):
+                    open_px = float(row.get("open", 0) or 0)
+                    high_px = float(row.get("high", 0) or 0)
+                    cost = float(holding.get("cost_price", 0) or 0)
+                    if cost <= 0 or open_px <= 0:
+                        continue
+                    if open_px >= cost * (1 + settings.TAIL_GAME_OPEN_GAP_PCT / 100):
+                        sell_px = open_px + (high_px - open_px) * settings.TAIL_GAME_TAKE_RATIO
+                        reason = "尾盘博弈-次日高开兑现"
+                    else:
+                        sell_px = open_px
+                        reason = "尾盘博弈-次日开盘兑现"
+                    sell_px = round(sell_px * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)
+                    HoldingManager.close_holding(code=code, holding_type="AI_TAIL", sell_price=sell_px)
+                    self._sell_sig_set(code, "AI_TAIL").add("尾盘博弈兑现")
+                    logger.info(f"[尾盘博弈] {holding.get('name')}({code}) 兑现卖出: {reason} 卖价{sell_px}")
+                    bark_notifier.send(
+                        title=f"🔔 [尾盘博弈卖出] {holding.get('name')}({code})",
+                        body=f"{reason}\n开盘:{open_px}元 卖出:{sell_px}元 (成本{cost}元)",
+                        group="卖出提醒", level="timeSensitive")
+                    continue  # 已兑现，不走常规卖出信号
 
                 # 获取真实的 MA5 均线价格
                 ma_data = self._get_ma_prices(code)
