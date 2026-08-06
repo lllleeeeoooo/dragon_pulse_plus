@@ -429,6 +429,68 @@ class TestPureRegressions(unittest.TestCase):
         self.assertNotIn("未找到竞价数据", p)
 
 
+class TestSellAdvisorCtxCache(unittest.TestCase):
+    """审查#8：sell_advisor _ctx_cache 空结果不缓存（故障期重试）、容量有界（per-code 键不无界累积）"""
+
+    def setUp(self):
+        import llm.sell_advisor as sa
+        self.sa = sa
+        sa._ctx_cache.clear()
+
+    def tearDown(self):
+        self.sa._ctx_cache.clear()
+
+    def test_空DataFrame不缓存(self):
+        calls = []
+
+        def fetcher():
+            calls.append(1)
+            return pd.DataFrame()  # 快照源瞬时故障返回空
+        self.sa._ctx_cached("k_empty", fetcher)
+        self.assertNotIn("k_empty", self.sa._ctx_cache)
+        self.sa._ctx_cached("k_empty", fetcher)  # 未命中 → 重试而非复用空数据
+        self.assertEqual(len(calls), 2)
+
+    def test_None不缓存(self):
+        calls = []
+
+        def fetcher():
+            calls.append(1)
+            return None
+        self.sa._ctx_cached("k_none", fetcher)
+        self.assertNotIn("k_none", self.sa._ctx_cache)
+        self.sa._ctx_cached("k_none", fetcher)
+        self.assertEqual(len(calls), 2)
+
+    def test_空列表不缓存(self):
+        calls = []
+
+        def fetcher():
+            calls.append(1)
+            return []
+        self.sa._ctx_cached("k_list", fetcher)
+        self.assertNotIn("k_list", self.sa._ctx_cache)
+        self.sa._ctx_cached("k_list", fetcher)
+        self.assertEqual(len(calls), 2)
+
+    def test_非空结果缓存命中(self):
+        calls = []
+
+        def fetcher():
+            calls.append(1)
+            return [1, 2, 3]
+        self.sa._ctx_cached("k_good", fetcher)
+        self.sa._ctx_cached("k_good", fetcher)
+        self.assertEqual(len(calls), 1)  # 第二次命中缓存
+        self.assertIn("k_good", self.sa._ctx_cache)
+
+    def test_容量有界驱逐最旧(self):
+        # per-code 键全天累积：超过上限后应驱逐最旧键，字典不无界增长
+        for i in range(self.sa._CTX_CACHE_MAX + 100):
+            self.sa._ctx_cached(f"k{i}", lambda i=i: [i])
+        self.assertLessEqual(len(self.sa._ctx_cache), self.sa._CTX_CACHE_MAX)
+
+
 class TestDbRegressions(unittest.TestCase):
     """数据库相关回归（使用独立测试库，防清空生产库）"""
 

@@ -1,6 +1,7 @@
 import logging
+import threading
 import time
-from typing import Dict, Any
+from typing import Dict
 import pandas as pd
 
 from llm.client import llm_client
@@ -11,17 +12,54 @@ logger = logging.getLogger(__name__)
 # 全市场快照短 TTL 缓存：同一监控周期内多个候选股共用一份 LLM 上下文，
 # 避免每只股票都重下全市场资金流/涨停池/指数快照（审计#7 性能）
 _CTX_CACHE_TTL = 30  # 秒：覆盖一个 15s 监控周期 + LLM 决策耗时，数据变化可忽略
-_ctx_cache = {}
+# 容量上限：per-code 键(intraday:/daily_closes:)全天累积，无界增长会持有一整天 DataFrame
+# 引用并拖慢查找——超过上限驱逐最旧键（审查#8）
+_CTX_CACHE_MAX = 256
+_ctx_cache: Dict[str, tuple] = {}
+_ctx_lock = threading.Lock()
+
+
+def _is_empty_ctx_value(val) -> bool:
+    """空/失败结果判定：空结果不缓存——数据源瞬时故障期间每次调用重试，
+    避免复用过期空数据喂给 LLM（审查#8）。"""
+    if val is None:
+        return True
+    if isinstance(val, pd.DataFrame):
+        return val.empty
+    if isinstance(val, (list, tuple, dict, str)):
+        return len(val) == 0
+    return not val
+
+
+def _evict_ctx_stale(now: float) -> None:
+    """先清 TTL 过期条目；仍满则驱逐最早写入的键（FIFO），保持缓存有界。"""
+    stale = [k for k, (ts, _) in _ctx_cache.items() if now - ts >= _CTX_CACHE_TTL]
+    for k in stale:
+        del _ctx_cache[k]
+    if len(_ctx_cache) >= _CTX_CACHE_MAX and _ctx_cache:
+        oldest_key = min(_ctx_cache, key=lambda k: _ctx_cache[k][0])
+        del _ctx_cache[oldest_key]
 
 
 def _ctx_cached(key: str, fetcher):
-    """TTL 缓存包装：命中且未过期直接复用；过期/未命中则重新拉取并缓存。fetcher 返回 DataFrame。"""
+    """TTL 缓存包装：命中且未过期直接复用；过期/未命中则重新拉取并缓存。
+    - 空/None 结果不缓存（故障期间重试）；
+    - 容量超限驱逐最旧键；
+    - 锁只包住字典操作（微秒级），不跨网络拉取，后台 LLM 线程与主循环并发安全。"""
     now = time.time()
-    hit = _ctx_cache.get(key)
-    if hit is not None and now - hit[0] < _CTX_CACHE_TTL:
-        return hit[1]
+    with _ctx_lock:
+        hit = _ctx_cache.get(key)
+        if hit is not None and now - hit[0] < _CTX_CACHE_TTL:
+            return hit[1]
     val = fetcher()
-    _ctx_cache[key] = (now, val)
+    if _is_empty_ctx_value(val):
+        with _ctx_lock:
+            _ctx_cache.pop(key, None)
+        return val
+    with _ctx_lock:
+        if key not in _ctx_cache and len(_ctx_cache) >= _CTX_CACHE_MAX:
+            _evict_ctx_stale(now)
+        _ctx_cache[key] = (now, val)
     return val
 
 

@@ -99,31 +99,52 @@ class TestRecheckBuy(unittest.TestCase):
         spot = pd.DataFrame([{"code": "600001", "price": 11.0, "change_pct": 10.0,
                               "open": 10.3, "pre_close": 10.0}])
         with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot", return_value=spot):
-            price, ok = self.m._recheck_buy_after_llm("600001", 10.0)
+            price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
         self.assertFalse(ok)
+        self.assertTrue(retry)  # 审查#4：封板可能打开 → 下轮重新评估
 
     def test_回落超阈值不买(self):
         # open 10.5(+5%)，现 10.1(+1%) → 回落 4% > 2% → 不买
         spot = pd.DataFrame([{"code": "600001", "price": 10.1, "change_pct": 1.0,
                               "open": 10.5, "pre_close": 10.0}])
         with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot", return_value=spot):
-            price, ok = self.m._recheck_buy_after_llm("600001", 10.0)
+            price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
         self.assertFalse(ok)
+        self.assertFalse(retry)  # 数据可靠判回落 → 当日评估结束
 
     def test_正常用最新价(self):
         spot = pd.DataFrame([{"code": "600001", "price": 10.6, "change_pct": 6.0,
                               "open": 10.3, "pre_close": 10.0}])
         with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot", return_value=spot):
-            price, ok = self.m._recheck_buy_after_llm("600001", 10.0)
+            price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
         self.assertTrue(ok)
         self.assertAlmostEqual(price, 10.6)
 
     def test_快照失败不买(self):
-        # 审查#4：复核拿不到最新快照 → fail-closed 不买，避免用 LLM 前旧价记录不可达成交
+        # 审查#4：复核拿不到最新快照 → fail-closed 不买，避免用 LLM 前旧价记录不可达成交；
+        # retry=True：瞬时故障 → 下轮重新评估，不得被 _alerted_burst_codes 永久跳过
         with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot",
                    return_value=pd.DataFrame()):
-            price, ok = self.m._recheck_buy_after_llm("600001", 10.0)
+            price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
         self.assertFalse(ok)
+        self.assertTrue(retry)
+
+    def test_跌停不买retry_false(self):
+        # 跌停 → 快照数据可靠判不买 → final（与封板不同，跌停候选不期待重评）
+        spot = pd.DataFrame([{"code": "600001", "price": 9.0, "change_pct": -10.0,
+                              "open": 10.3, "pre_close": 10.0}])
+        with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot", return_value=spot):
+            price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
+        self.assertFalse(ok)
+        self.assertFalse(retry)
+
+    def test_复核异常retry_true(self):
+        # 复核过程中抛异常 → 视为瞬时故障 → retry=True 下轮重新评估
+        with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot",
+                   side_effect=RuntimeError("boom")):
+            price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
+        self.assertFalse(ok)
+        self.assertTrue(retry)
 
 
 class TestSellHoldCooldown(unittest.TestCase):
@@ -191,6 +212,64 @@ class TestSellHoldCooldown(unittest.TestCase):
                    ]):
             self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
             self.assertEqual(self._sell_mock.call_count, 2)  # 两个信号各咨询一次，未互相拦截
+
+
+class TestSellDedupByHoldingType(unittest.TestCase):
+    """审查#8：同 code 多持仓(AI_AUTO+MANUAL)，一仓平仓后去重只按 (code, holding_type) 键控，
+    不抑制另一仓同 code 同类型卖出信号。"""
+
+    def setUp(self):
+        self.m = _MonitorCoreMixin()
+        self.m._pending_sell_codes = set()
+        self.m._llm_sell_hold_until = {}
+        self.ai_holding = {
+            "code": "600001", "name": "A", "cost_price": 10.0,
+            "current_price": 9.0, "holding_type": "AI_AUTO",
+            "buy_date": "2026-01-01", "was_limit_up_today": False,
+            "buy_strategy": "AI自动跟进(LLM-复盘推荐)",
+        }
+        self.manual_holding = {
+            "code": "600001", "name": "A", "cost_price": 10.0,
+            "current_price": 9.0, "holding_type": "MANUAL",
+            "buy_date": "2026-01-01", "was_limit_up_today": False,
+            "buy_strategy": "手动持仓",
+        }
+        self.spot = pd.DataFrame([{
+            "code": "600001", "price": 9.0, "change_pct": -2.0,
+            "open": 9.5, "high": 9.6, "low": 9.0, "volume": 1000000, "amount": 9000000,
+        }])
+        self._close = patch("scheduler.monitor_core.HoldingManager.close_holding")
+        self._close_mock = self._close.start()
+        self.addCleanup(self._close.stop)
+        self._patches = [
+            patch.object(self.m, "_get_ma_prices", return_value={"ma5": 9.5}),
+            patch("scheduler.monitor_core.HoldingManager.batch_update_profit_rates"),
+            patch("scheduler.monitor_core.HoldingManager.update_was_limit_up"),
+            patch("scheduler.monitor_core.bark_notifier.send"),
+            patch.object(_MonitorCoreMixin, "_is_limit_up",
+                         staticmethod(lambda c, chg: False), create=True),
+            patch.object(_MonitorCoreMixin, "_is_limit_down",
+                         staticmethod(lambda c, chg: False), create=True),
+            patch.object(_MonitorCoreMixin, "_llm_confirm_sell", return_value=("llm", True)),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_同code不同holding_type互不抑制(self):
+        def signals(**kw):
+            if kw.get("buy_strategy", "").startswith("AI"):
+                return [{"type": "断板必卖", "level": "CRITICAL", "reason": "断板"}]
+            return [{"type": "破位止损", "level": "HIGH", "reason": "破位"}]
+        with patch("scheduler.monitor_core.HoldingMonitor.check_sell_signals",
+                   side_effect=signals):
+            self.m._monitor_holdings(self.spot, [self.ai_holding, self.manual_holding], 5, 20.0)
+        # 两只持仓都被平仓（AI_AUTO 断板必卖 + MANUAL 破位止损 互不抑制）
+        sold = {c.kwargs["holding_type"] for c in self._close_mock.call_args_list}
+        self.assertEqual(sold, {"AI_AUTO", "MANUAL"})
+        # 去重按 (code, holding_type) 键控
+        self.assertIn("断板必卖", self.m._alerted_sell_signals.get("600001:AI_AUTO", set()))
+        self.assertIn("破位止损", self.m._alerted_sell_signals.get("600001:MANUAL", set()))
 
 
 class TestDecisionSourceRecord(unittest.TestCase):

@@ -44,6 +44,9 @@ class _MonitorCoreMixin:
 
         # 去重：当日已推送过的股票代码（防止每 15 秒重复推送同一个股）
         self._alerted_burst_codes: set = set()
+        # 『买入决策被推迟』的候选独立去重：封板/复核失败/LLM预算用尽时推送一次"待重评"提醒，
+        # 但不锁 _alerted_burst_codes——破板/快照恢复/预算空出后下轮仍可重新评估买入（审查#3/#4）
+        self._deferred_alerted_codes: set = set()
         self._alerted_zhaban_codes: set = set()
         self._auto_bought_codes: set = set()
         self._emotion_top_alerted_today: bool = False
@@ -86,6 +89,7 @@ class _MonitorCoreMixin:
         today = datetime.datetime.now().strftime("%Y%m%d")
         if self._alert_date != today:
             self._alerted_burst_codes.clear()
+            self._deferred_alerted_codes.clear()
             self._alerted_zhaban_codes.clear()
             # 重启/换日后从数据库重建当日已买入集合（避免盘中重启导致 MAX_DAILY_BUYS 计数清零）
             self._auto_bought_codes = self._load_today_ai_bought_codes()
@@ -612,6 +616,17 @@ class _MonitorCoreMixin:
                 verdict_blocked = is_recommended and auction_verdict == "放弃"
                 # 当前已封板则买不进（封板判定覆盖一字板，含盘中打开后重新封死的）
                 is_sealed = type(self)._is_limit_up(code, change_pct)
+                # 封板买不进：推送一次『封板待重评』提醒（独立去重），但**不锁** _alerted_burst_codes。
+                # 否则竞价买入候选第一轮就被推送锁入 _alerted_burst_codes，破板后
+                # _skip_alerted_burst(行555) 恒 True → continue，买入评估永不重跑（审查#3）。
+                # 竞价推荐候选的 _rec_auction_buy_evaluated 也不标记已评估，破板后自然重新进池。
+                if is_sealed:
+                    self._push_deferred_burst_alert(
+                        code=code, name=name, price=price, change_pct=change_pct,
+                        vol_ratio=vol_ratio, amt_billion=amt_billion,
+                        title="封板待重评",
+                        reason=f"已封板({change_pct:+.1f}%)当前买不进，破板后将重新评估买入")
+                    continue
                 # 市场风格否决权（④）：观望不自动买入（抱团是防御买入型，不在此列）
                 # 推荐标的（09:26 竞价评估）无视大盘风格（观望不拦推荐买入）
                 style_blocks_buy = market_style.get("style") == "观望" and not is_recommended
@@ -636,19 +651,42 @@ class _MonitorCoreMixin:
                     ai_holdings = HoldingManager.get_active_holdings(holding_type="AI_AUTO")
                     if self._buy_gates_open(code, ai_holdings, amt_billion):
                         # 预算用尽：本轮不再同步调 LLM，候选留待下轮评估（不降级规则裸买），
-                        # 把同步阻塞控制在每轮 N 次 LLM 以内（审查#1）
+                        # 把同步阻塞控制在每轮 N 次 LLM 以内（审查#1）。
+                        # 仍推送一次『预算待重评』提醒（独立去重）但**不锁** _alerted_burst_codes：
+                        # 避免低排名候选的异动告警被无限推迟、信号短暂而漏报（审查#3），
+                        # 同时下轮预算空出后仍可重新评估买入。
                         if self._llm_buy_confirms_this_cycle >= settings.LLM_BUY_CONFIRM_PER_CYCLE:
-                            logger.debug(f"本轮买入 LLM 确认预算已用尽，{name}({code}) 留待下轮评估")
-                            continue  # 未标记 → 下轮 15s 后重新评估
+                            logger.debug(f"本轮买入 LLM 确认预算已用尽，{name}({code}) 推送待重评提醒")
+                            self._push_deferred_burst_alert(
+                                code=code, name=name, price=price, change_pct=change_pct,
+                                vol_ratio=vol_ratio, amt_billion=amt_billion,
+                                title="预算待重评",
+                                reason="本轮 LLM 确认预算已用尽，暂不买入，下轮重新评估")
+                            continue  # 未锁 → 下轮 15s 后重新评估
                         self._llm_buy_confirms_this_cycle += 1
                         # B方案：规则候选已通过，LLM 最终买入决定（失败降级回 rule）
                         decision_source, llm_allow = self._llm_confirm_buy(
                             code, name, price, change_pct, vol_ratio, signal_label, [signal_label])
                         if llm_allow:
                             # LLM 等待期间价格可能变化：买前用最新快照复核（封板/跌停/回落）
-                            price, recheck_ok = self._recheck_buy_after_llm(code, price)
+                            price, recheck_ok, recheck_retry = self._recheck_buy_after_llm(code, price)
                             if not recheck_ok:
                                 logger.info(f"买前复核不通过(已封板/跌停/回落): {name}({code})，放弃买入")
+                                if recheck_retry:
+                                    # 审查#4：复核失败若因快照不可用/封板(可能恢复) → 不下最终锁，
+                                    # 推送『复核待重评』提醒并留待下轮重新评估；快照恢复后不得被
+                                    # _alerted_burst_codes 永久跳过。推荐标的同时撤回竞价一次性
+                                    # 评估标记，避免 _rec_auction_buy_evaluated 把它锁死。
+                                    if is_recommended:
+                                        self._rec_auction_buy_evaluated.discard(code)
+                                    self._push_deferred_burst_alert(
+                                        code=code, name=name, price=price, change_pct=change_pct,
+                                        vol_ratio=vol_ratio, amt_billion=amt_billion,
+                                        title="复核待重评",
+                                        reason="买前复核未通过(快照不可用/已封板)，暂不买入，下轮重新评估")
+                                    continue
+                                # retry=False（跌停/回落，快照数据可靠）→ 视为本轮已评估，
+                                # 落到推送分支正常推送并锁（当日不再重复评估）
                             elif self._buy_gates_open(code, HoldingManager.get_active_holdings(holding_type="AI_AUTO"), amt_billion):
                                 # LLM/复核耗时数秒，期间其他候选可能已买入 → 二次过闸门后再执行
                                 self._auto_bought_codes.add(code)
@@ -707,8 +745,11 @@ class _MonitorCoreMixin:
                     self._alerted_burst_codes.add(code)
                     continue
 
-                # 已推送过的推荐标的：不再重复推送（买入评估已在更早位置完成）
-                if code in self._alerted_burst_codes:
+                # 已推送过的候选不再重复推送（买入评估已在更早位置完成）。
+                # 含『待重评』deferred 候选：本轮买入评估已走完(未再被推迟) → 落最终锁，
+                # 避免该候选下轮每 15s 重复评估/推送（审查#3/#4）
+                if code in self._alerted_burst_codes or code in self._deferred_alerted_codes:
+                    self._alerted_burst_codes.add(code)
                     continue
 
                 # 推送标题按信号类型区分
@@ -964,34 +1005,39 @@ class _MonitorCoreMixin:
     def _recheck_buy_after_llm(self, code: str, prev_price: float) -> tuple:
         """
         LLM 决策等待(~20s)期间价格可能变化：买前用最新快照复核。
-        返回 (fresh_price, ok)：ok=False 表示已封板/跌停/回落，不该买。
-        复核拿不到最新价(快照源故障) → 同样不买（fail-closed）。未落买入标记，
-        下轮监控重新评估，避免用 LLM 前的旧价记录不可达成交（审查#4）。
+        返回 (fresh_price, ok, retry)：
+        - ok=True：可用 fresh_price 买入。
+        - ok=False, retry=True：快照不可用/封板(可能恢复) → 未落买入标记，下轮监控
+          重新评估，避免用 LLM 前旧价记录不可达成交，也不因瞬时故障把当日机会永久丢弃（审查#4）。
+        - ok=False, retry=False：跌停/回落(快照数据可靠判不买) → 本候选当日评估结束。
         """
         try:
             fresh = DataFetcher.get_realtime_spot()
             if fresh is None or fresh.empty:
                 logger.warning(f"买前复核快照不可用({code})，放弃买入（下轮重新评估）")
-                return prev_price, False
+                return prev_price, False, True
             m = fresh[fresh["code"].astype(str) == str(code).zfill(6)]
             if m.empty:
-                return prev_price, False  # 最新快照查不到该股 → 不买
+                return prev_price, False, True  # 最新快照查不到该股 → 下轮重试
             row = m.iloc[0]
             fresh_price = float(row.get("price", prev_price) or prev_price)
             fresh_chg = float(row.get("change_pct", 0) or 0)
-            # 已封板/跌停 → 买不进或不该买
-            if type(self)._is_limit_up(code, fresh_chg) or type(self)._is_limit_down(code, fresh_chg):
-                return fresh_price, False
-            # 回落校验：开盘涨幅 - 最新涨幅 > REC_FADE_MAX → 冲高回落不追
+            # 已封板 → 买不进，但封板可能打开 → retry（破板后重新评估）
+            if type(self)._is_limit_up(code, fresh_chg):
+                return fresh_price, False, True
+            # 已跌停 → 不该买，快照数据可靠 → final
+            if type(self)._is_limit_down(code, fresh_chg):
+                return fresh_price, False, False
+            # 回落校验：开盘涨幅 - 最新涨幅 > REC_FADE_MAX → 冲高回落不追，数据可靠 → final
             open_p = float(row.get("open", 0) or 0)
             pre_close = float(row.get("pre_close", 0) or 0)
             open_chg = (open_p - pre_close) / pre_close * 100 if pre_close > 0 else 0
             if open_chg > 0 and (open_chg - fresh_chg) > settings.REC_FADE_MAX:
-                return fresh_price, False
-            return fresh_price, True
+                return fresh_price, False, False
+            return fresh_price, True, False
         except Exception as e:
             logger.warning(f"买前复核失败({code}): {e}，放弃买入（下轮重新评估）")
-            return prev_price, False  # 复核异常 → 不买（fail-closed）
+            return prev_price, False, True  # 复核异常 → 瞬时 → retry（fail-closed）
 
     def _llm_confirm_sell(self, holding: dict, sig: dict, curr_price: float,
                           curr_change_pct: float, holding_days: int) -> tuple:
@@ -1015,6 +1061,36 @@ class _MonitorCoreMixin:
         推荐标的只做"09:26 竞价后一次性评估"，推过一次后同样锁（盘中不再重复评估/推送）。
         """
         return code in self._alerted_burst_codes
+
+    def _push_deferred_burst_alert(self, *, code: str, name: str, price: float,
+                                   change_pct: float, vol_ratio: float,
+                                   amt_billion: float, title: str, reason: str) -> bool:
+        """
+        给『买入决策被推迟』的候选推送一次"待重评"提醒（独立去重 _deferred_alerted_codes），
+        但**不下** _alerted_burst_codes 最终锁：封板破板 / 快照恢复 / LLM 预算空出后，
+        下轮 _skip_alerted_burst 仍放行，可重新评估买入（审查#3/#4）。
+        返回 True=本次实际推送；False=已推送过(去重)。
+        """
+        if code in self._deferred_alerted_codes:
+            return False
+        self._deferred_alerted_codes.add(code)
+        bark_notifier.send(
+            title=f"⏳ [{title}] {name}({code}) +{change_pct}%",
+            body=(f"{name}({code}) 现价:{price}元(+{change_pct}%, 量比:{vol_ratio}倍, "
+                  f"成交:{amt_billion:.1f}亿)\n{reason}"),
+            group="盘中异动",
+            level="active",
+        )
+        return True
+
+    def _sell_sig_set(self, code: str, holding_type: str) -> set:
+        """
+        卖出信号当日去重集合：按 (code, holding_type) 键控。
+        同 code 多持仓(AI_AUTO+MANUAL，update_was_limit_up 注释明确支持)时，
+        一仓卖出/标记去重不得抑制另一仓同 code 同类型的卖出信号与推送（审查#8）。
+        """
+        key = f"{code}:{holding_type}"
+        return self._alerted_sell_signals.setdefault(key, set())
 
     def _merge_auction_buy_candidates(self, spot_df, hit_df, pending_recs) -> pd.DataFrame:
         """
@@ -1242,18 +1318,17 @@ class _MonitorCoreMixin:
                     buy_strategy=holding.get("buy_strategy", "")
                 )
 
+                hold_type = holding.get("holding_type", "MANUAL")
                 for sig in signals:
                     sig_type = sig["type"]
-                    # 去重：同股同类型卖出信号当日仅推送一次。
+                    # 去重：同股同类型卖出信号当日仅推送一次，按 (code, holding_type) 键控——
+                    # 同 code 多持仓(AI_AUTO+MANUAL)一仓平仓不得抑制另一仓同类型卖出信号（审查#8）。
                     # 注意：标记必须放在"实际采取动作(卖出/推送)"之后——LLM 判"持有"不落标记，
                     # 下轮携带最新行情重新复核，避免一条陈旧判断把该信号锁死一整天（风控缺口）
-                    if code not in self._alerted_sell_signals:
-                        self._alerted_sell_signals[code] = set()
-                    if sig_type in self._alerted_sell_signals[code]:
+                    if sig_type in self._sell_sig_set(code, hold_type):
                         continue
 
                     # 触发卖出信号 → 自动平仓（跌停时不卖，等破板）
-                    hold_type = holding.get("holding_type", "MANUAL")
                     if sig["level"] in ("CRITICAL", "HIGH"):
                         # 判断是否跌停
 
@@ -1262,7 +1337,7 @@ class _MonitorCoreMixin:
                             self._pending_sell_codes.add(code)
                             if code not in self._alerted_sell_signals.get("__dt_pending__", set()):
                                 self._alerted_sell_signals.setdefault("__dt_pending__", set()).add(code)
-                                self._alerted_sell_signals[code].add(sig_type)
+                                self._sell_sig_set(code, hold_type).add(sig_type)
                                 bark_notifier.send(
                                     title=f"🔒 [跌停锁定] {holding.get('name')}({code})",
                                     body=f"触发 {sig['type']} 但当前跌停({curr_change_pct}%)，暂不平仓，等破跌停板后自动卖出。",
@@ -1287,15 +1362,15 @@ class _MonitorCoreMixin:
                                             f"{settings.LLM_SELL_HOLD_COOLDOWN_SECONDS}s 内不重复咨询")
                                 continue  # LLM 判持有 → 不卖（不落去重标记，冷却到期后重新复核）
 
-                        self._alerted_sell_signals[code].add(sig_type)
+                        self._sell_sig_set(code, hold_type).add(sig_type)
                         sell_px = curr_price
                         if hold_type == "AI_AUTO":
                             sell_px = round(curr_price * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)  # AI卖出模拟滑点
                         HoldingManager.close_holding(code=code, holding_type=hold_type, sell_price=sell_px)
                         self._pending_sell_codes.discard(code)
-                        # 该持仓已卖出：同轮剩余信号一并落去重标记，避免同持仓多信号
+                        # 该持仓已卖出：同轮剩余信号一并落去重标记（仅本持仓类型），避免同持仓多信号
                         # 重复咨询 LLM + 对已平仓持仓重复"已自动标记为卖出"推送（审查#6）
-                        self._alerted_sell_signals.setdefault(code, set()).update(s["type"] for s in signals)
+                        self._sell_sig_set(code, hold_type).update(s["type"] for s in signals)
                         src_tag = "LLM" if decision_source == "llm" else "规则"
                         bark_notifier.send(
                             title=f"🚨 [{sig['type']}] {holding.get('name')}({code})",
@@ -1304,7 +1379,7 @@ class _MonitorCoreMixin:
                             level="timeSensitive"
                         )
                     else:
-                        self._alerted_sell_signals[code].add(sig_type)
+                        self._sell_sig_set(code, hold_type).add(sig_type)
                         bark_notifier.send(
                             title=f"🚨 [{sig['type']}] {holding.get('name')}",
                             body=sig["reason"],
