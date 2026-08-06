@@ -53,7 +53,6 @@ class Settings(BaseSettings):
     FUND_INFLOW_CAP_RATIO: float = Field(default=0.0005, description="主力资金扫货流通市值比例，与 FUND_INFLOW_MIN 取较大值作为动态阈值")
     MONITOR_INTERVAL_SECONDS: int = Field(default=15, description="盘中实时快照轮询间隔(秒)")
     MONITOR_POOL_CACHE_SECONDS: int = Field(default=60, description="涨停/炸板池缓存刷新间隔(秒)")
-    MONITOR_LLM_ALERT_LIMIT: int = Field(default=10, description="每日 LLM 润色异动推送次数上限")
     LLM_SELL_HOLD_COOLDOWN_SECONDS: int = Field(default=1800, description="卖出 LLM 判「持有」后冷却(秒)，冷却期内不重复咨询，避免持续信号每 15s 阻塞调 LLM（默认 30 分钟）")
     LLM_BUY_CONFIRM_PER_CYCLE: int = Field(default=1, description="每轮监控周期最多同步 LLM 买入确认次数；预算用尽后其余候选留待下轮评估，控制同步 LLM 对 15s 主循环的阻塞时长（审查#1）")
     MONITOR_NEAR_LIMIT_RATIO: float = Field(default=0.84, description="逼近封板区间 = 涨停线 × 比值")

@@ -1,14 +1,13 @@
 import time
 import datetime
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 import pandas as pd
 
 from config.settings import settings
 from data.fetcher import DataFetcher
 from core.emotion_index import EmotionVector
-from core.strategies import StrategyAnalyzer, MarketStyle
+from core.strategies import MarketStyle
 from core.holding_monitor import HoldingMonitor
 from core.trade_calendar import is_trading_day, get_previous_trading_day
 from llm.sell_advisor import DynamicSellAdvisor
@@ -16,10 +15,6 @@ from notifier.bark import bark_notifier
 from database.services import HoldingManager, RecommendationManager
 
 logger = logging.getLogger(__name__)
-
-# LLM 异动润色后台线程池：LLM 调用(拉分时+生成)可能耗时数十秒，
-# 放在后台线程执行，避免阻塞 15 秒盘中轮询导致卖出/炸板监控停摆。
-_llm_alert_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm-alert")
 
 # 全局变量（global 语句写入此模块命名空间，dashboard 直接从此读取）
 _current_market_style_global: Dict[str, str] = {}
@@ -121,7 +116,6 @@ class _MonitorCoreMixin:
             self._prev_sector_counts.clear()
             self._alerted_sector_names.clear()
             self._current_sector_counts.clear()
-            self._llm_alert_calls_today = 0
             self._auction_snapshots.clear()
             self._auction_summary_sent = False
             global _index_breaker_alerted
@@ -573,11 +567,6 @@ class _MonitorCoreMixin:
 
         if not hit_df.empty:
             burst_codes_for_fund = []
-            # 全市场总成交额（未过滤，对齐券商软件口径）+ 均涨幅，循环外计算一次
-            _total_amt = self._DF.get_market_total_amount()
-            if not _total_amt or _total_amt <= 0:
-                _total_amt = float(spot_df["amount"].sum()) if "amount" in spot_df.columns else 1e12
-            _index_pct = float(spot_df["change_pct"].mean()) if "change_pct" in spot_df.columns else 0.0
             # 每轮买入 LLM 确认预算：控制同步 LLM(20-60s)对 15s 主循环的阻塞（审查#1）
             self._llm_buy_confirms_this_cycle = 0
             for _, row in hit_df.head(5).iterrows():
@@ -773,30 +762,7 @@ class _MonitorCoreMixin:
                                     level="timeSensitive"
                                 )
 
-                # 判断是否属于动态中军池（成交额 >= 20亿 即为大容量标的）
-                is_core = amt_billion >= settings.CORE_POOL_MIN_AMOUNT
-
-                # 从涨停池获取该股所在板块的实时涨停家数
-                stock_industry = ""
-                zt_df = self._zt_pool_cache
-                if zt_df is not None and not zt_df.empty and "industry" in zt_df.columns:
-                    match = zt_df[zt_df["code"].astype(str) == code]
-                    if not match.empty:
-                        stock_industry = str(match.iloc[0].get("industry", ""))
-                sector_count = self._current_sector_counts.get(stock_industry, 1) if stock_industry else 1
-
-                tags = StrategyAnalyzer.identify_tags(
-                    stock_code=code,
-                    stock_name=name,
-                    change_pct=change_pct,
-                    turnover_rate=float(row.get("turnover_rate", 0.0)),
-                    is_in_core_pool=is_core,
-                    market_total_amount=_total_amt,
-                    index_change_pct=_index_pct,
-                    sector_active_count=sector_count
-                )
-
-                # 质量过滤：推荐标的或高质量信号才推送
+                # 质量过滤：推荐标的或高质量信号才进入主力资金检测
                 is_quality = is_recommended or is_high_signal
                 if not is_quality:
                     self._alerted_burst_codes.add(code)
@@ -809,60 +775,8 @@ class _MonitorCoreMixin:
                     self._alerted_burst_codes.add(code)
                     continue
 
-                # 推送标题按信号类型区分
-                if row["_signal_near_limit"]:
-                    emoji = "🎯"
-                    trigger_title = f"[逼近封板-{signal_label}]"
-                elif row["_signal_low_open_rally"]:
-                    emoji = "🚀"
-                    trigger_title = f"[低开猛拉-{signal_label}]"
-                elif row["_signal_amplitude"] and not row["_signal_burst"]:
-                    emoji = "📊"
-                    trigger_title = f"[振幅放量-{signal_label}]"
-                elif is_recommended:
-                    emoji = "🔥"
-                    trigger_title = "[复盘推荐股异动触发]"
-                else:
-                    emoji = "⚡"
-                    trigger_title = f"[{signal_label}]"
-
-                detail = f"量比:{vol_ratio}倍, 涨幅:{change_pct}%, 成交:{amt_billion:.1f}亿"
-                if row["_signal_low_open_rally"]:
-                    detail += f", 拉升强度:{float(rally_strength.loc[row.name]):.2f}"
-                if row["_signal_amplitude"]:
-                    detail += f", 振幅:{float(row['amplitude']):.1f}%"
-
-                # LLM润色：非观望风格且当日调用未超限时才走 LLM。
-                # LLM 调用(拉分时+生成)可能耗时数十秒，放到后台线程执行，避免阻塞 15 秒轮询。
-                llm_call_limit = settings.MONITOR_LLM_ALERT_LIMIT
-                llm_calls_today = getattr(self, '_llm_alert_calls_today', 0)
-                alert_level = "timeSensitive" if is_recommended or row["_signal_near_limit"] else "active"
-                if market_style["style"] != "观望" and llm_calls_today < llm_call_limit:
-                    self._llm_alert_calls_today = llm_calls_today + 1
-                    self._submit_llm_alert(
-                        trigger_title=trigger_title,
-                        code=code,
-                        name=name,
-                        price=price,
-                        change_pct=change_pct,
-                        vol_ratio=vol_ratio,
-                        tags=tags,
-                        detail=detail,
-                        emoji=emoji,
-                        level=alert_level,
-                    )
-                else:
-                    alert_msg = (
-                        f"【{trigger_title}】{name}({code})\n"
-                        f"现价:{price}元 (+{change_pct}%) {detail}\n"
-                        f"标签:[{','.join(tags)}]"
-                    )
-                    bark_notifier.send(
-                        title=f"{emoji} {trigger_title} {name}({code}) +{change_pct}%",
-                        body=alert_msg,
-                        group="盘中异动",
-                        level=alert_level
-                    )
+                # 【盘中异动推送已移除】：不再发送【触发信息】信号通知与 LLM 润色链。
+                # 仅保留当日去重锁 + 主力资金检测输入。
                 self._alerted_burst_codes.add(code)
                 burst_codes_for_fund.append(code)
 
@@ -1453,29 +1367,3 @@ class _MonitorCoreMixin:
         # 批量写库：一次 session 更新所有持仓价格与收益率（避免每 15 秒逐只开 session）
         if price_updates:
             HoldingManager.batch_update_profit_rates(price_updates)
-
-    def _submit_llm_alert(self, *, trigger_title: str, code: str, name: str,
-                          price: float, change_pct: float, vol_ratio: float,
-                          tags: list, detail: str, emoji: str, level: str):
-        """后台线程执行 LLM 润色 + Bark 推送，避免同步 LLM 阻塞盘中轮询主循环"""
-        def _task():
-            try:
-                alert_msg = DynamicSellAdvisor.format_alert_message(
-                    trigger_type=trigger_title,
-                    stock_code=code,
-                    stock_name=name,
-                    current_price=price,
-                    change_pct=change_pct,
-                    volume_ratio=vol_ratio,
-                    strategy_tag=",".join(tags),
-                    detail_info=detail
-                )
-                bark_notifier.send(
-                    title=f"{emoji} {trigger_title} {name}({code}) +{change_pct}%",
-                    body=alert_msg,
-                    group="盘中异动",
-                    level=level
-                )
-            except Exception as e:
-                logger.warning(f"LLM 异动推送后台任务异常 ({name}({code})): {e}")
-        _llm_alert_executor.submit(_task)

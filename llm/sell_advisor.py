@@ -5,7 +5,6 @@ from typing import Dict
 import pandas as pd
 
 from llm.client import llm_client
-from config.prompt_templates import DYNAMICS_SYSTEM_PROMPT, DYNAMICS_USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -283,47 +282,3 @@ class DynamicSellAdvisor:
             logger.warning(f"买入 LLM 决策失败: {e}")
             return ""
 
-    @classmethod
-    def format_alert_message(
-        cls,
-        trigger_type: str,
-        stock_code: str,
-        stock_name: str,
-        current_price: float,
-        change_pct: float,
-        volume_ratio: float,
-        strategy_tag: str,
-        detail_info: str
-    ) -> str:
-        """
-        将盘中异动 + 实时分时 OHLCV 数据发给 LLM，让其基于真实数据给出具体操作判断。
-        LLM 失败时降级为规则化文案。
-        """
-        # 拉取实时分时数据
-        intraday_raw = cls._fetch_intraday(stock_code)
-
-        user_prompt = DYNAMICS_USER_TEMPLATE.format(
-            trigger_type=trigger_type,
-            stock_code=stock_code,
-            stock_name=stock_name,
-            current_price=current_price,
-            change_pct=change_pct,
-            volume_ratio=volume_ratio,
-            strategy_tag=strategy_tag,
-            detail_info=detail_info,
-            intraday_data=intraday_raw,
-            context_data=cls._fetch_context(stock_code, current_price)
-        )
-
-        try:
-            message = llm_client.generate(
-                system_prompt=DYNAMICS_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                module="sell_advisor"
-            )
-            return message
-        except Exception as e:
-            logger.error(f"生成异动提示文本失败: {e}")
-            return (f"【{trigger_type}】{stock_name}({stock_code}) "
-                    f"现价:{current_price} (+{change_pct}%) 量比:{volume_ratio} "
-                    f"标签:[{strategy_tag}]")
