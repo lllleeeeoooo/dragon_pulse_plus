@@ -67,10 +67,17 @@ class TestConceptGate(unittest.TestCase):
             }, member={"600001": ["A", "B"]})
         self.assertTrue(self.m._get_concept_blocks_buy("600001"))
 
-    def test_概念无周期数据视为不可买(self):
-        # 概念昨天无涨停 → concept_cycle 无该概念行 → phase 未知 → 不可买（冷题材不追）
-        self._seed(member={"600001": ["冷门题材"]})
-        self.assertTrue(self.m._get_concept_blocks_buy("600001"))
+    def test_概念无周期记录放行(self):
+        # 概念无周期记录（phase 未知）→ 与无概念数据一致，未知即放行，
+        # 避免误杀数据源未覆盖题材的股票（如仅"参股金融"无记录的冷门标签）
+        self._seed(member={"600001": ["参股金融"]})
+        self.assertFalse(self.m._get_concept_blocks_buy("600001"))
+
+    def test_混合_退潮与无记录概念放行(self):
+        # 一个明确退潮 + 一个无周期记录 → 存在非明确负向 → 放行（不再"全部负向"）
+        self._seed(cycle={"旧题材": {"phase": "退潮", "is_mainline": False}},
+                   member={"600001": ["旧题材", "参股金融"]})
+        self.assertFalse(self.m._get_concept_blocks_buy("600001"))
 
     def test_标签取最优概念(self):
         self._seed(cycle={

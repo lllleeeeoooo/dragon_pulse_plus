@@ -158,6 +158,63 @@ class TestConceptCycle(unittest.TestCase):
             session.close()
         self.assertEqual(len(rows2), 4)
 
+    def test_refresh_清理孤儿快照(self):
+        """概念刷新后清除 concept_code 不在当前概念列表的旧行（历史 gn_x 占位脏数据根治）"""
+        session = db_manager.get_session()
+        try:
+            session.add(ConceptMember(concept_code="gn_x", concept_name="参股金融",
+                                      stock_code="600892", refresh_date="20260804"))
+            session.commit()
+        finally:
+            session.close()
+        boards = pd.DataFrame({"code": ["gn_cgjr"], "name": ["参股金融"]})
+        cons = pd.DataFrame({"code": ["600892"]})
+        with patch("data.fetcher_pool._PoolMixin.get_concept_boards", return_value=boards), \
+             patch("data.fetcher_pool._PoolMixin.get_concept_cons", return_value=cons):
+            ConceptCycleManager.refresh_membership("20260805", force=True)
+        session = db_manager.get_session()
+        try:
+            rows = session.query(ConceptMember).all()
+            codes = {(r.concept_code, r.stock_code) for r in rows}
+        finally:
+            session.close()
+        self.assertIn(("gn_cgjr", "600892"), codes)
+        self.assertNotIn(("gn_x", "600892"), codes)  # 孤儿脏行被清
+        self.assertEqual(len(rows), 1)
+
+    def test_membership_map去重(self):
+        """_membership_map 按 (code, 概念名) 去重，跨日/同名重复行不重复"""
+        session = db_manager.get_session()
+        try:
+            session.add(ConceptMember(concept_code="gn_x", concept_name="参股金融",
+                                      stock_code="600892", refresh_date="20260804"))
+            session.add(ConceptMember(concept_code="gn_cgjr", concept_name="参股金融",
+                                      stock_code="600892", refresh_date="20260805"))
+            session.commit()
+        finally:
+            session.close()
+        session = db_manager.get_session()
+        try:
+            m = ConceptCycleManager._membership_map(session)
+        finally:
+            session.close()
+        self.assertEqual(m["600892"], ["参股金融"])  # 只一条
+
+    def test_get_stock_concepts去重(self):
+        """get_stock_concepts 概念名去重，同名重复行只返回一次"""
+        session = db_manager.get_session()
+        try:
+            session.add(ConceptMember(concept_code="gn_x", concept_name="参股金融",
+                                      stock_code="600892", refresh_date="20260804"))
+            session.add(ConceptMember(concept_code="gn_cgjr", concept_name="参股金融",
+                                      stock_code="600892", refresh_date="20260805"))
+            session.commit()
+        finally:
+            session.close()
+        cons = ConceptCycleManager.get_stock_concepts("600892")
+        names = [c["concept"] for c in cons]
+        self.assertEqual(names.count("参股金融"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

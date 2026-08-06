@@ -89,6 +89,12 @@ class ConceptCycleManager:
                 except Exception as e:
                     logger.warning(f"概念[{name}]成分股刷新失败: {e}")
                 time.sleep(0.15)  # 礼貌性间隔，避免被新浪限流
+            # 清理孤儿快照：concept_code 不在本次概念列表中的旧数据
+            # （如历史新浪源异常产生的 gn_x 占位脏行），避免跨日累积污染当日映射。
+            # 本次刷新失败的概念其代号仍在 gn_list 中 → 保留旧快照不受影响。
+            active_codes = [c for c, _ in gn_list]
+            session.query(ConceptMember).filter(
+                ~ConceptMember.concept_code.in_(active_codes)).delete(synchronize_session=False)
             session.commit()
             total = session.query(ConceptMember).filter(
                 ConceptMember.refresh_date == today).count()
@@ -103,11 +109,14 @@ class ConceptCycleManager:
 
     @staticmethod
     def _membership_map(session) -> Dict[str, List[str]]:
-        """{股票代码: [概念名...]} 当前全部快照并集（每概念只保留最新快照，故并集即现状）"""
+        """{股票代码: [概念名...]} 当前全部快照并集（每概念只保留最新快照，故并集即现状）。
+        按 (code, 概念名) 去重：避免跨日快照/同名重复行（如历史 gn_x 占位脏行）导致概念名重复。"""
         rows = session.query(ConceptMember.stock_code, ConceptMember.concept_name).all()
         m: Dict[str, List[str]] = {}
         for code, name in rows:
-            m.setdefault(str(code).zfill(6), []).append(name)
+            lst = m.setdefault(str(code).zfill(6), [])
+            if name not in lst:
+                lst.append(name)
         return m
 
     # ---------------------------------------------------------------
@@ -212,8 +221,9 @@ class ConceptCycleManager:
         session = db_manager.get_session()
         try:
             code6 = str(stock_code).zfill(6)
-            concepts = [r[0] for r in session.query(ConceptMember.concept_name).filter(
-                ConceptMember.stock_code == code6).all()]
+            # 概念名去重：concept_member 可能含跨日快照/同名重复行，避免重复概念进 LLM 上下文
+            concepts = sorted(set(r[0] for r in session.query(ConceptMember.concept_name).filter(
+                ConceptMember.stock_code == code6).all()))
             if not concepts:
                 return []
             cycle_map = {r["concept"]: r for r in ConceptCycleManager.get_concept_cycle(top=500)}

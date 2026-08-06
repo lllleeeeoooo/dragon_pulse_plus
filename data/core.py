@@ -4,6 +4,7 @@
 """
 
 import time
+import socket
 import functools
 import datetime
 import logging
@@ -13,6 +14,11 @@ import pandas as pd
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# 数据源抓取 socket 超时（秒）：akshare 内部 requests 未传 timeout，
+# 数据源挂起(服务器不响应也不断连)时会永久阻塞调用线程——盘中 15s 轮询的主循环
+# 曾因此停摆 48 分钟。抓取期间设置 socket 默认超时，超时按该源失败降级/重试。
+_FETCH_SOCKET_TIMEOUT = 12
 
 # ==============================================================================
 # 数据源当日熔断（次日重置）
@@ -97,15 +103,23 @@ def retry_on_exception(retries: int = 3, delay: float = 2.0, backoff: float = 1.
 SOURCE_PRIORITY = ["东财", "腾讯", "新浪"]
 
 
-def multi_source_fetch(source_chain: List[Tuple[str, Callable[[], pd.DataFrame]]]) -> pd.DataFrame:
+def multi_source_fetch(source_chain: List[Tuple[str, Callable[[], pd.DataFrame]]],
+                       timeout: float = _FETCH_SOCKET_TIMEOUT) -> pd.DataFrame:
     """多数据源降级：依次尝试，返回第一个非空 DataFrame。
-    当日已熔断的源（异常达阈值）直接跳过，不浪费调用。"""
+    当日已熔断的源（异常达阈值）直接跳过，不浪费调用。
+    每个源调用包裹 socket 超时：akshare 内部 requests 未传 timeout，数据源挂起时
+    主循环会永久阻塞（曾导致盘中监控停摆 48 分钟）——超时按该源失败降级/记录。"""
     for source_name, fetch_func in source_chain:
         if source_blocked(source_name):
             logger.debug(f"数据源 [{source_name}] 今日已熔断，跳过")
             continue
         try:
-            df = fetch_func()
+            _old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
+            try:
+                df = fetch_func()
+            finally:
+                socket.setdefaulttimeout(_old_timeout)
             if df is not None and not df.empty:
                 logger.debug(f"数据源 [{source_name}] 成功，获取 {len(df)} 条记录")
                 return df

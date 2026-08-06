@@ -366,6 +366,24 @@ class TestPureRegressions(unittest.TestCase):
         dc._source_fail_date = "19990101"
         self.assertFalse(dc.source_blocked("坏源"))
 
+    def test_multi_source_fetch_socket_timeout(self):
+        """数据源抓取加 socket 超时：akshare 内部 requests 无 timeout，源挂起会永久阻塞
+        主循环(曾致盘中监控停摆 48 分钟)。修复后抓取期间设置 socket 默认超时、结束恢复，
+        超时按该源失败降级返回空而非卡死。"""
+        import socket
+        from data import core as dc
+        captured = {}
+
+        def hanging_source():
+            captured["during"] = socket.getdefaulttimeout()
+            raise socket.timeout("timed out")  # 模拟 akshare 内部 socket 读超时
+
+        before = socket.getdefaulttimeout()
+        result = dc.multi_source_fetch([("挂起源", hanging_source)], timeout=7)
+        self.assertEqual(captured["during"], 7)              # 抓取期间默认超时被设为 7s
+        self.assertEqual(socket.getdefaulttimeout(), before)  # 结束后恢复原值
+        self.assertTrue(result.empty)                        # 源失败 → 返回空，不卡死主循环
+
     def test_spot_source_priority(self):
         """信号依赖量比/振幅：主源必须是东财或腾讯，不能是新浪（新浪缺量比振幅会让信号全灭，历史 bug）"""
         from data.core import SOURCE_PRIORITY

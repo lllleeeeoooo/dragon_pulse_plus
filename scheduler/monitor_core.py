@@ -672,7 +672,7 @@ class _MonitorCoreMixin:
                     if sector_blocks_buy:
                         _block = f"板块否决[{sector_industry or '-'} {sector_phase or '-'}{'·主线' if sector_mainline else '非主线'}]"
                     elif concept_blocks_buy:
-                        _block = f"概念否决[{concept_brief or '全部负向'}]"
+                        _block = f"概念否决[{concept_brief or '全部概念明确负向'}]"
                     elif style_blocks_buy:
                         _block = "市场风格观望"
                     elif verdict_blocked:
@@ -1152,7 +1152,11 @@ class _MonitorCoreMixin:
             try:
                 for code, name in session.query(
                         ConceptMember.stock_code, ConceptMember.concept_name).all():
-                    self._concept_member_map.setdefault(str(code).zfill(6), []).append(name)
+                    # 按 (code, 概念名) 去重：concept_member 可能含跨日快照/同名重复行
+                    # （如历史新浪源异常产生的 gn_x 占位行），加载层兜底避免概念名重复
+                    lst = self._concept_member_map.setdefault(str(code).zfill(6), [])
+                    if name not in lst:
+                        lst.append(name)
             finally:
                 session.close()
         except Exception as e:
@@ -1165,9 +1169,10 @@ class _MonitorCoreMixin:
 
     def _get_concept_blocks_buy(self, code: str) -> bool:
         """
-        概念因子否决（切片3）：无概念数据 → 不否决（覆盖率有限，未知即放行）；
-        存在任一可买概念（发酵/启动/主线高潮）→ 不否决；
-        全部概念均为负向（退潮/冰点/高潮非主线）→ 否决。
+        概念因子否决（切片3）：**只有全部概念均明确负向才否决**——
+        退潮/冰点/高潮非主线；无概念数据 或 概念无周期记录(未知) 均放行
+        （覆盖率有限，未知即放行，避免误杀数据源未覆盖题材的股票，如仅"参股金融"无记录）。
+        存在任一可买概念（发酵/启动/主线高潮）同样放行。
         """
         concepts = self._get_stock_concepts(code)
         if not concepts:
@@ -1179,7 +1184,9 @@ class _MonitorCoreMixin:
                 return False
             if phase == "高潮" and info.get("is_mainline", False):
                 return False
-            # 退潮/冰点/高潮非主线/未知 → 视为该概念不可买，继续看下一个
+            if not phase:
+                return False  # 无周期记录 = 未知 → 放行（与无概念数据一致）
+            # phase ∈ {退潮, 冰点, 高潮非主线} → 该概念明确负向，继续看下一个
         return True
 
     def _get_stock_concept_tag(self, code: str) -> str:
