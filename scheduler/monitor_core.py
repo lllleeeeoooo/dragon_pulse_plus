@@ -916,10 +916,20 @@ class _MonitorCoreMixin:
                 code=code, name=name, cost_price=cost_price, holding_type="AI_TAIL",
                 strategy="尾盘博弈-次日高开", decision_source=decision_source)
             self._tail_auto_bought_codes.add(code)
+            # 通知里带上对应个股 MA5/MA10（_get_ma_prices 当日缓存，命中不联网）
+            ma_info = ""
+            try:
+                _ma = self._get_ma_prices(code)
+                _ma5 = _ma.get("ma5")
+                _ma10 = _ma.get("ma10")
+                if _ma5 and _ma10:
+                    ma_info = f" 站上MA5:{_ma5:.2f}/MA10:{_ma10:.2f}"
+            except Exception:
+                pass
             bark_notifier.send(
                 title=f"🤖 [AI 尾盘博弈买入] {name}({code})",
                 body=(f"尾盘博弈标的 {name}({code}) 现价:{price}元(+{change_pct}%), 量比{vol_ratio}倍, "
-                      f"成本:{cost_price}元(含滑点{slippage:.2f}%)，明日早盘兑现卖出。"),
+                      f"成本:{cost_price}元(含滑点{slippage:.2f}%),{ma_info}，明日早盘兑现卖出。"),
                 group="AI自动持仓", level="timeSensitive")
 
     def _tail_gates_open(self, code: str, amt_billion: float, index_breaker_triggered: bool) -> bool:
