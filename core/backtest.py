@@ -334,13 +334,9 @@ class AIBacktestEngine:
     def _process_tail_game_sells(positions: list, date_str: str, day_data: dict,
                                  available_cash: float, slippage: float) -> tuple:
         """
-        尾盘博弈卖出：次日早盘兑现（不过 10:30）。
-        次日 open ≥ 成本×(1+TAIL_GAME_OPEN_GAP_PCT) → 视为高开，在 open~window_high 之间按
-        TAIL_GAME_TAKE_RATIO 兑现；否则按 open 卖出（开盘兑现/止损）。尾盘博弈持仓次日必清，绝不过夜第 2 天。
-
-        回测口径（消除 look-ahead）：日线只有全天最高价，而实盘兑现窗口是 09:30-10:30。
-        这里把窗口最高价按 开盘×(1+TAIL_GAME_MORNING_HIGH_CAP_PCT%) 封顶——即使全天最高出现在
-        10:30 之后，也不虚高回测收益（原用全天 high 是轻度未来函数，已在评审中指出）。
+        尾盘博弈卖出：次日 TAIL_GAME_SELL_TIME(默认09:35) 统一卖出（简化版）。
+        实盘 09:35 按现价清仓；回测日线无分时数据，用开盘价近似 09:35 价格（开盘后5分钟≈开盘）。
+        不再区分高开/低开、不再冲高兑现（消除全天最高价的 look-ahead 与乐观偏差）。
         """
         remaining, closed = [], []
         for pos in positions:
@@ -352,20 +348,11 @@ class AIBacktestEngine:
                 remaining.append(pos)
                 continue
             open_px = float(row.get("open") or 0)
-            high_px = float(row.get("high") or 0)
             if open_px <= 0:
-                open_px = high_px = float(row.get("close") or 0)
+                open_px = float(row.get("close") or 0)
             cost = pos["cost_price"]
-            if open_px >= cost * (1 + settings.TAIL_GAME_OPEN_GAP_PCT / 100):
-                # 高开：按兑现比例在 open~window_high 之间卖（默认 0.5=冲高一半），
-                # window_high 用 09:30-10:30 窗口封顶值，不用全天最高价（消除 10:30 后高点的 look-ahead）
-                _window_high = min(high_px, open_px * (1 + settings.TAIL_GAME_MORNING_HIGH_CAP_PCT / 100))
-                take = settings.TAIL_GAME_TAKE_RATIO
-                sell_price = (open_px + (_window_high - open_px) * take) * (1 - slippage / 100)
-                reason = "尾盘博弈-次日高开冲高兑现"
-            else:
-                sell_price = open_px * (1 - slippage / 100)
-                reason = "尾盘博弈-次日未高开按开盘兑现"
+            sell_price = open_px * (1 - slippage / 100)  # 按开盘近似 09:35 现价
+            reason = f"尾盘博弈-次日{settings.TAIL_GAME_SELL_TIME}统一卖出(按开盘近似)"
             closed.append({
                 "code": pos["code"], "name": pos.get("name", pos["code"]),
                 "buy_date": pos["buy_date"], "sell_date": date_str,

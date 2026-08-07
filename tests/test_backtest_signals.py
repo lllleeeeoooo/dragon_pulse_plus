@@ -46,23 +46,22 @@ class TestTailGameSell(unittest.TestCase):
         return {"code": "600001", "name": "A", "cost_price": 10.0, "buy_date": "20260701",
                 "sell_mode": "tail_game", "hold_days": 0}
 
-    def test_次日高开冲高兑现(self):
+    def test_次日09_35统一卖出按开盘近似(self):
+        """简化版：尾盘博弈次日统一卖出，回测按开盘价近似 09:35（不分高开低开）"""
         day_data = {"ohlc_cache": {"600001": {"open": 10.3, "high": 10.8, "close": 10.5}}}
         remaining, closed, _ = AIBacktestEngine._process_tail_game_sells(
             [self._pos()], "20260702", day_data, 1e12, 0.3)
         self.assertEqual(remaining, [])
         self.assertEqual(len(closed), 1)
-        self.assertIn("高开", closed[0]["reason"])
-        # open 10.3 ≥ 10.0×1.02 → 按兑现比例 0.5 在 open~high 间卖：
-        # (10.3+(10.8-10.3)×0.5)×0.997 = 10.518 → return ≈ +5.18%（不再用不可成交的 high 顶价）
-        self.assertAlmostEqual(closed[0]["return_pct"], 5.18, places=1)
+        self.assertIn("统一卖出", closed[0]["reason"])
+        # 统一按开盘卖：10.3×0.997 → return ≈ +2.69%（不再分高开/低开、不再冲高兑现）
+        self.assertAlmostEqual(closed[0]["return_pct"], 2.69, places=1)
 
-    def test_次日未高开按开盘兑现(self):
+    def test_次日低开也统一卖出(self):
         day_data = {"ohlc_cache": {"600001": {"open": 9.8, "high": 9.9, "close": 9.7}}}
         remaining, closed, _ = AIBacktestEngine._process_tail_game_sells(
             [self._pos()], "20260702", day_data, 1e12, 0.3)
-        self.assertIn("未高开", closed[0]["reason"])
-        # open 9.8 < 10.2 → open 卖 9.8×0.997 → return ≈ -2.29%
+        self.assertIn("统一卖出", closed[0]["reason"])
         self.assertAlmostEqual(closed[0]["return_pct"], -2.29, places=1)
 
 

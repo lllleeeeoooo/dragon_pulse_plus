@@ -207,10 +207,10 @@
 
 ### 7.3 专项卖出（独立策略持仓）
 
-**尾盘博弈 AI_TAIL 次日早盘兑现**（次日 09:30 起，绝不过夜第 2 天）：
-- 未高开（开盘 < 成本×（1+`TAIL_GAME_OPEN_GAP_PCT=2%`））→ 按开盘价兑现/止损；
-- **高开 → 动态移动止盈**（实盘）：从当日最高（09:30 起）回落 ≥ `TAIL_GAME_TRAIL_PULLBACK_PCT=3%` → 实时价卖出；未回落持有到 **10:30 强平**（慢周期也不漏）。不再"假设在开盘与最高点中点成交"（原模型偏乐观）。
-- **回测口径**（消除 look-ahead）：日线无分时数据，09:30-10:30 窗口最高价按 开盘×（1+`TAIL_GAME_MORNING_HIGH_CAP_PCT=5%`）封顶后按 `TAIL_GAME_TAKE_RATIO=0.5` 冲高一半兑现——全天最高出现在 10:30 之后也不虚高回测收益。
+**尾盘博弈 AI_TAIL 次日早盘统一卖出**（简化版，绝不过夜第 2 天）：
+- 次日到 `TAIL_GAME_SELL_TIME=09:35` → **按现价统一清仓**（不区分高开/低开，不再动态止盈），Bark 通知"尾盘博弈-次日09:35统一卖出"；
+- 09:35 前统一持有不卖；
+- **回测口径**：日线无分时数据，按**开盘价近似** 09:35 现价（开盘后 5 分钟 ≈ 开盘），不再冲高兑现/不再用全天最高价（消除 look-ahead 与乐观偏差）。
 
 **龙头二波 AI_SW**：
 - **突破前高兑现**：当日最高价 ≥ 第一波峰值（记录在持仓策略 `PEAK{price}` 中）→ 按最高价止盈卖出；
@@ -389,10 +389,7 @@
 | TAIL_GAME_CHANGE_MIN / MAX | 2.0 / 5.0 | 尾盘博弈涨幅区间(%) |
 | TAIL_GAME_VOL_RATIO | 3.0 | 尾盘博弈量比下限 |
 | TAIL_GAME_SHORT_UPPER_RATIO | 0.3 | 尾盘博弈上影线占比上限 |
-| TAIL_GAME_OPEN_GAP_PCT | 2.0 | 尾盘次日高开判定(%) |
-| TAIL_GAME_TAKE_RATIO | 0.5 | 尾盘回测高开兑现比例 |
-| TAIL_GAME_TRAIL_PULLBACK_PCT | 3.0 | 尾盘实盘高开动态止盈回落阈值(%)，10:30强平兜底 |
-| TAIL_GAME_MORNING_HIGH_CAP_PCT | 5.0 | 尾盘回测窗口最高价封顶(开盘×1+%) |
+| TAIL_GAME_SELL_TIME | 09:35 | 尾盘博弈次日统一卖出时刻(HH:MM)，到点按现价清仓 |
 | TAIL_MAX_DAILY_BUYS / TAIL_MAX_POSITIONS | 2 / 2 | 尾盘当日次数/持仓上限 |
 | TAIL_LLM_PER_CYCLE | 1 | 尾盘每轮 LLM 确认次数 |
 | SECOND_WAVE_RETREAT_MIN / MAX | 0.30 / 0.50 | 二波回撤区间 |

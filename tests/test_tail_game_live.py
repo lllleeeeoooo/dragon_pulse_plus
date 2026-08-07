@@ -132,46 +132,33 @@ class TestTailGameExit(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _run(self, spot_df, holding):
-        now = datetime.datetime(2026, 8, 6, 9, 45)  # 09:45 在兑现窗口内
+    def _run(self, spot_df, holding, hour=9, minute=45):
+        now = datetime.datetime(2026, 8, 6, hour, minute)
         with patch("scheduler.monitor_core.datetime.datetime") as dt:
             dt.now.return_value = now
             dt.time.return_value = now.time()
             self.m._monitor_holdings(spot_df, [holding], 5, 20.0)
 
-    def test_高开冲高回落止盈(self):
-        """高开 + 从当日最高回落≥TAIL_GAME_TRAIL_PULLBACK_PCT → 实时价动态止盈"""
+    def test_09_35统一卖出(self):
+        """到点(≥TAIL_GAME_SELL_TIME=09:35)按现价清仓 AI_TAIL（不区分高开低开）"""
         holding = {"code": "600002", "name": "B", "cost_price": 10.0, "holding_type": "AI_TAIL",
                    "buy_date": "2026-08-05", "was_limit_up_today": False}
-        # 高开 open 10.3≥10.2，现价 10.4 从最高 10.8 回落 3.7%≥3% → 实时价 10.4 卖出
-        spot = pd.DataFrame([{"code": "600002", "price": 10.4, "change_pct": 4.0, "open": 10.3,
+        spot = pd.DataFrame([{"code": "600002", "price": 10.5, "change_pct": 5.0, "open": 10.3,
                               "high": 10.8, "low": 10.0, "volume": 1000000, "amount": 10500000}])
-        self._run(spot, holding)
+        self._run(spot, holding, hour=9, minute=36)  # 09:36 ≥ 09:35
         self.assertTrue(self._close_mock.called)
         kw = self._close_mock.call_args.kwargs
         self.assertEqual(kw.get("holding_type"), "AI_TAIL")
-        self.assertAlmostEqual(kw.get("sell_price"), round(10.4 * 0.997, 2), places=2)
+        self.assertAlmostEqual(kw.get("sell_price"), round(10.5 * 0.997, 2), places=2)  # 现价×滑点
 
-    def test_高开未回落持有(self):
-        """高开但回落<阈值 → 持有（不卖，等下一轮/10:30强平），避免用不可达的中点价"""
+    def test_09_35前持有(self):
+        """09:35 前统一持有不卖（次日必清，到点清仓）"""
         holding = {"code": "600002", "name": "B", "cost_price": 10.0, "holding_type": "AI_TAIL",
                    "buy_date": "2026-08-05", "was_limit_up_today": False}
-        # 现价 10.5 从最高 10.8 回落 2.78%<3% → 持有
         spot = pd.DataFrame([{"code": "600002", "price": 10.5, "change_pct": 5.0, "open": 10.3,
                               "high": 10.8, "low": 10.0, "volume": 1000000, "amount": 10500000}])
-        self._run(spot, holding)
+        self._run(spot, holding, hour=9, minute=30)  # 09:30 < 09:35
         self.assertFalse(self._close_mock.called)
-
-    def test_未高开按开盘兑现(self):
-        holding = {"code": "600002", "name": "B", "cost_price": 10.0, "holding_type": "AI_TAIL",
-                   "buy_date": "2026-08-05", "was_limit_up_today": False}
-        spot = pd.DataFrame([{"code": "600002", "price": 10.1, "change_pct": 1.0, "open": 10.1,
-                              "high": 10.2, "low": 10.0, "volume": 1000000, "amount": 10100000}])
-        self._run(spot, holding)
-        self.assertTrue(self._close_mock.called)
-        kw = self._close_mock.call_args.kwargs
-        # open 10.1 < 10.2 → 按 open 10.1 ×0.997 = 10.07
-        self.assertAlmostEqual(kw.get("sell_price"), round(10.1 * 0.997, 2), places=2)
 
 
 class TestPnlIncludeTail(unittest.TestCase):

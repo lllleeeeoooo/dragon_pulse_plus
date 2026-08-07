@@ -1717,38 +1717,30 @@ class _MonitorCoreMixin:
                 if holding.get("buy_date") == today:
                     continue
 
-                # 尾盘博弈次日早盘兑现：AI_TAIL 持仓次日必清，绝不过夜第2天。
-                # 未高开→按开盘价兑现/止损；高开→动态移动止盈（从当日最高回落≥TAIL_GAME_TRAIL_PULLBACK_PCT
-                # 实时价卖出，不再假设在开盘与最高点中点成交——原模型偏乐观），10:30 强平兜底（慢周期也不漏）。
-                if holding.get("holding_type") == "AI_TAIL" and \
-                        datetime.datetime.now().time() >= datetime.time(9, 30):
+                # 尾盘博弈次日早盘统一卖出：到 TAIL_GAME_SELL_TIME(默认09:35) 按现价清仓 AI_TAIL 持仓。
+                # 简化版——不再动态止盈/区分高开低开，到点统一卖（无论高开低开），绝不过夜第2天。
+                if holding.get("holding_type") == "AI_TAIL":
+                    _sell_at = datetime.time(9, 35)
+                    try:
+                        _h, _m = settings.TAIL_GAME_SELL_TIME.split(":")
+                        _sell_at = datetime.time(int(_h), int(_m))
+                    except Exception:
+                        pass
+                    if datetime.datetime.now().time() < _sell_at:
+                        continue  # 未到卖出时间：持有（次日必清）
                     open_px = float(row.get("open", 0) or 0)
-                    high_px = float(row.get("high", 0) or 0)
                     curr_price = float(row.get("price", open_px) or open_px)
                     cost = float(holding.get("cost_price", 0) or 0)
-                    if cost <= 0 or open_px <= 0:
-                        continue
-                    if open_px < cost * (1 + settings.TAIL_GAME_OPEN_GAP_PCT / 100):
-                        sell_px = open_px
-                        reason = "尾盘博弈-次日开盘兑现"
-                    elif datetime.datetime.now().time() >= datetime.time(10, 30):
-                        sell_px = curr_price
-                        reason = "尾盘博弈-次日10:30强平"
-                    elif high_px > open_px and (high_px - curr_price) / high_px * 100 >= \
-                            settings.TAIL_GAME_TRAIL_PULLBACK_PCT:
-                        sell_px = curr_price
-                        reason = "尾盘博弈-次日冲高回落止盈"
-                    else:
-                        continue  # 高开且未回落：持有等下一轮（10:30 强平兜底）
-                    sell_px = round(sell_px * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)
+                    sell_px = round(curr_price * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)
+                    reason = f"尾盘博弈-次日{settings.TAIL_GAME_SELL_TIME}统一卖出"
                     HoldingManager.close_holding(code=code, holding_type="AI_TAIL", sell_price=sell_px)
-                    self._sell_sig_set(code, "AI_TAIL").add("尾盘博弈兑现")
-                    logger.info(f"[尾盘博弈] {holding.get('name')}({code}) 兑现卖出: {reason} 卖价{sell_px}")
+                    self._sell_sig_set(code, "AI_TAIL").add("尾盘博弈统一卖出")
+                    logger.info(f"[尾盘博弈] {holding.get('name')}({code}) {reason}: 卖价{sell_px} (成本{cost}元)")
                     bark_notifier.send(
                         title=f"🔔 [尾盘博弈卖出] {holding.get('name')}({code})",
-                        body=f"{reason}\n开盘:{open_px}元 卖出:{sell_px}元 (成本{cost}元)",
+                        body=f"{reason}（到点清仓，不区分高开低开）\n卖出:{sell_px}元 (成本{cost}元)",
                         group="卖出提醒", level="timeSensitive")
-                    continue  # 已兑现，不走常规卖出信号
+                    continue  # 已卖出，不走常规卖出信号
 
                 # 龙头二波卖出：突破前高→止盈兑现；N 天未创新高→离场（不创新高坚决离场）。
                 # 绝对止损/破MA5/强止盈 仍走下方 check_sell_signals。
