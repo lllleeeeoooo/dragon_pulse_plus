@@ -158,9 +158,12 @@ class _MonitorStyleMixin:
         estimated_today = est["estimated"] if est.get("estimated", 0) > 0 else now_amount
 
         # K = 预估全天 / 昨日全天（盘后有真实数据时更准）
+        # 滞后缓冲：传入上一轮风格，评分在阈值附近时不频闪横跳（首次 _current_market_style 为空 → None）
         style = MarketStyle.classify(emotion,
                                      market_amount=estimated_today,
-                                     baseline=baseline)
+                                     baseline=baseline,
+                                     prev_style=self._current_market_style.get("style")
+                                     if self._current_market_style else None)
         style["now_amount_billion"] = now_amount
         style["estimated_today_billion"] = estimated_today
         style["baseline_ma20_billion"] = baseline

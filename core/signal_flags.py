@@ -91,7 +91,9 @@ def compute_signal_flags(spot_df: pd.DataFrame, dragons: Dict[str, float] = None
     df["_signal_tail_game"] = (
         (df["change_pct"] >= settings.TAIL_GAME_CHANGE_MIN) &
         (df["change_pct"] <= settings.TAIL_GAME_CHANGE_MAX) &
-        (df["volume_ratio"] >= settings.TAIL_GAME_VOL_RATIO) &
+        # 量比温和放量 1.2~2.5（评审：低涨幅+量比≥3 是放量滞涨/出货抛压重，真正尾盘低吸是温和放量）
+        (df["volume_ratio"] >= settings.TAIL_GAME_VOL_RATIO_MIN) &
+        (df["volume_ratio"] <= settings.TAIL_GAME_VOL_RATIO_MAX) &
         (df["close"].astype(float) > df["open"].astype(float)) &  # 收阳
         (_upper_ratio <= settings.TAIL_GAME_SHORT_UPPER_RATIO) &   # 短上影线
         (df["close"].astype(float) >= df["vwap"].fillna(df["close"].astype(float)))  # 收盘≥均价

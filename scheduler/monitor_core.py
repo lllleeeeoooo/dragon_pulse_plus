@@ -266,12 +266,21 @@ class _MonitorCoreMixin:
         return datetime.time(9, 15) <= current_time <= datetime.time(9, 25)
 
     def is_tail_end_time(self) -> bool:
-        """判断是否在尾盘博弈窗口 (14:30-15:00)——指南：避开 14:00-14:30 跳水，买在走势定型后"""
+        """判断是否在尾盘博弈买入窗口 (默认 14:50-14:57，可配 TAIL_GAME_WINDOW_START/END)。
+        评审：14:00-14:45 是尾盘跳水最危险段，收窄到临近收盘、全天形态定型后再买。"""
         now = datetime.datetime.now()
         if now.weekday() >= 5:
             return False
         current_time = now.time()
-        return datetime.time(14, 30) <= current_time <= datetime.time(15, 0)
+        _start = _end = None
+        try:
+            _hs, _ms = settings.TAIL_GAME_WINDOW_START.split(":")
+            _he, _me = settings.TAIL_GAME_WINDOW_END.split(":")
+            _start = datetime.time(int(_hs), int(_ms))
+            _end = datetime.time(int(_he), int(_me))
+        except Exception:
+            _start, _end = datetime.time(14, 50), datetime.time(14, 57)
+        return _start <= current_time <= _end
 
 
     def _refresh_pool_cache(self):
@@ -795,6 +804,8 @@ class _MonitorCoreMixin:
                             open_price=float(row.get("open", price)),
                             pre_close=pre_close,
                             change_pct=float(change_pct),
+                            high_price=float(row.get("high", price) or price),
+                            current_price=price,
                         )
 
                 # 高质量信号 = 逼近封板 / 低开猛拉 / 点火异动(高质量)
@@ -1105,6 +1116,54 @@ class _MonitorCoreMixin:
         self._sw_dragons_cache = dragons
         return dragons
 
+    def _second_wave_bottom_confirmed(self, code: str, today_volume: float) -> bool:
+        """二波地量止跌确认（评审：单纯回撤30-50%+单日涨3%易买在A杀半山腰/死猫跳）。
+        从 daily_kline 近30日量价判定：①止跌窗口(T-4..T-1)最小量 ≤ 峰值×SW_GROUND_VOL_PEAK_RATIO 或 <0.55×MA20量；
+        ②止跌窗口振幅收敛≥SW_GROUND_MIN_DAYS 天(≤SW_GROUND_AMPLITUDE_MAX)；③窗口末不再创新低；
+        ④今日放量点火：今日量>地量日(轻量)。daily_kline 覆盖不足时返回 True（未知即放行）。"""
+        try:
+            from database.connection import db_manager
+            from database.models import DailyKline
+            session = db_manager.get_session()
+            try:
+                rows = session.query(DailyKline).filter(
+                    DailyKline.code == str(code)
+                ).order_by(DailyKline.trade_date.desc()).limit(30).all()
+            finally:
+                session.close()
+        except Exception:
+            return True
+        if len(rows) < 20:
+            return True  # 数据不足 → 放行（未知即放行）
+        rows = rows[::-1]  # 升序
+        df = pd.DataFrame([{
+            "close": float(r.close), "high": float(r.high), "low": float(r.low),
+            "volume": float(r.volume), "amplitude": float(getattr(r, "amplitude", 0) or 0),
+        } for r in rows])
+        peak_volume = float(df["volume"].max())
+        # 止跌评估窗口 = 今天之前 4 天（不含今天，今天是放量点火/反包日）
+        bottom = df.iloc[-5:-1]
+        if len(bottom) < 2:
+            return True
+        min_vol = float(bottom["volume"].min())
+        # ① 地量：缩至峰值 35% 以内 或 低于 20 日均量 55%
+        vol_shrink = (peak_volume > 0 and min_vol <= settings.SW_GROUND_VOL_PEAK_RATIO * peak_volume)
+        ma20_vol = float(df["volume"].tail(20).mean())
+        vol_below_ma = (ma20_vol > 0 and min_vol < 0.55 * ma20_vol)
+        if not (vol_shrink or vol_below_ma):
+            return False
+        # ② 振幅收敛
+        if int((bottom["amplitude"] <= settings.SW_GROUND_AMPLITUDE_MAX).sum()) < settings.SW_GROUND_MIN_DAYS:
+            return False
+        # ③ 不创新低（窗口末最低 ≥ 窗口内最低×0.995）
+        min_low = float(bottom["low"].min())
+        if bottom["low"].iloc[-1] < min_low * 0.995:
+            return False
+        # ④ 今日放量点火（轻量：今日量>地量日；今日量缺失/为0 不拦）
+        if today_volume > 0 and min_vol > 0 and today_volume < min_vol:
+            return False
+        return True
+
     def _scan_second_wave(self, spot_df, index_breaker_triggered):
         """
         龙头二波（全天盘中 9:30-15:00）：近30天历史龙头回撤 30%-50% 且当日涨幅>3%（止跌反包）。
@@ -1143,6 +1202,11 @@ class _MonitorCoreMixin:
                 continue
             if not self._tail_above_ma(code, price):  # 复用：站上 MA5/MA10
                 continue
+            # 地量止跌确认（评审：防 A 杀半山腰/死猫跳；未缩量收敛/未放量点火的二波多为诱多）
+            if settings.SW_REQUIRE_GROUND_BOTTOM and \
+                    not self._second_wave_bottom_confirmed(code, float(row.get("volume", 0) or 0)):
+                logger.info(f"[二波] {name}({code}) 地量止跌未确认(前期未缩量收敛/今日未放量点火)，跳过")
+                continue
             if self._sw_llm_confirm_this_cycle >= settings.SW_LLM_PER_CYCLE:
                 continue
             self._sw_llm_confirm_this_cycle += 1
@@ -1158,9 +1222,11 @@ class _MonitorCoreMixin:
                 continue
             slippage = settings.AI_BUY_SLIPPAGE_PCT
             cost_price = round(price * (1 + slippage / 100), 2)
+            # 记录前高 PEAK 与止跌谷底 VALLEY(当日最低≈回撤低点)，供黄金分割止盈用
+            valley_low = float(row.get("low", price) or price)
             HoldingManager.add_holding(
                 code=code, name=name, cost_price=cost_price, holding_type="AI_SW",
-                strategy=f"二波战法-PEAK{peak_price}", decision_source=decision_source)
+                strategy=f"二波战法-PEAK{peak_price}-VALLEY{valley_low}", decision_source=decision_source)
             self._sw_auto_bought_codes.add(code)
             ma_info = ""
             try:
@@ -1338,12 +1404,13 @@ class _MonitorCoreMixin:
         return self._sector_cycle_info.get(industry, {}).get("is_mainline", False)
 
     def _check_rec_buy_condition(self, rec_info, open_price: float,
-                                 pre_close: float, change_pct: float) -> bool:
+                                 pre_close: float, change_pct: float,
+                                 high_price: float = 0.0, current_price: float = 0.0) -> bool:
         """
         推荐标的是否满足买入条件：
         - 竞价判定"买入"(前提=满足已自证) → 跳过 open_requirement/竞价量能正则，信任竞价 LLM 实时判断
         - 观察/无verdict（未获竞价确认）→ 用 open_requirement + 竞价量能 正则防御
-        - 无论哪种：相对开盘回落超过 REC_FADE_MAX（走弱）均不买（活的安全网）
+        - 无论哪种：相对盘中最高点回落 ≥ REC_FADE_MAX（冲高回落）均不买（活的安全网）
         """
         open_change = round((float(open_price) - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0
         auction_verdict = (rec_info or {}).get("auction_verdict", "")
@@ -1353,8 +1420,12 @@ class _MonitorCoreMixin:
                     return False
             if not self._check_auction_volume(rec_info):
                 return False
-        if open_change > 0 and (open_change - change_pct) > settings.REC_FADE_MAX:
-            return False
+        # 回落校验：相对盘中最高点回落 ≥ REC_FADE_MAX → 冲高回落不买（评审：原"相对开盘回落"
+        # 漏掉高开拉到高位再砸回的冲高回落，如 +1%→+8%→+5.5% 相对开盘仍为正）
+        if high_price > 0 and current_price > 0 and current_price < high_price:
+            drawdown = (high_price - current_price) / high_price * 100
+            if drawdown >= settings.REC_FADE_MAX:
+                return False
         return True
 
     def _check_auction_volume(self, rec_info) -> bool:
@@ -1458,12 +1529,13 @@ class _MonitorCoreMixin:
             # 已跌停 → 不该买，快照数据可靠 → final
             if type(self)._is_limit_down(code, fresh_chg):
                 return fresh_price, False, False
-            # 回落校验：开盘涨幅 - 最新涨幅 > REC_FADE_MAX → 冲高回落不追，数据可靠 → final
-            open_p = float(row.get("open", 0) or 0)
-            pre_close = float(row.get("pre_close", 0) or 0)
-            open_chg = (open_p - pre_close) / pre_close * 100 if pre_close > 0 else 0
-            if open_chg > 0 and (open_chg - fresh_chg) > settings.REC_FADE_MAX:
-                return fresh_price, False, False
+            # 回落校验：相对盘中最高点回落 ≥ REC_FADE_MAX → 冲高回落不追（评审：原"相对开盘回落"
+            # 漏掉高开拉到高位再砸回的冲高回落风险，如 +1%→+8%→+5.5% 相对开盘还是涨的），数据可靠 → final
+            high_p = float(row.get("high", 0) or 0)
+            if high_p > 0 and fresh_price < high_p:
+                drawdown = (high_p - fresh_price) / high_p * 100
+                if drawdown >= settings.REC_FADE_MAX:
+                    return fresh_price, False, False
             return fresh_price, True, False
         except Exception as e:
             logger.warning(f"买前复核失败({code}): {e}，放弃买入（下轮重新评估）")
@@ -1742,27 +1814,38 @@ class _MonitorCoreMixin:
                         group="卖出提醒", level="timeSensitive")
                     continue  # 已卖出，不走常规卖出信号
 
-                # 龙头二波卖出：突破前高→止盈兑现；N 天未创新高→离场（不创新高坚决离场）。
-                # 绝对止损/破MA5/强止盈 仍走下方 check_sell_signals。
+                # 龙头二波卖出：黄金分割位止盈（评审：突破前高太乐观，多数二波双顶在 0.618~0.8 反弹位）
+                # 止盈位1 = 谷底+(前高-谷底)×SW_TAKE_PROFIT_RATIO(0.618)；止盈位2 = 前高×SW_TAKE_PROFIT_HIGH_RATIO(0.95)
+                # N 天未达止盈位→离场。绝对止损/破MA5/强止盈 仍走下方 check_sell_signals。
                 if holding.get("holding_type") == "AI_SW":
                     peak = 0.0
+                    valley = 0.0
                     _s = str(holding.get("buy_strategy", ""))
                     if "PEAK" in _s:
                         try:
-                            peak = float(_s.split("PEAK")[-1])
+                            peak = float(_s.split("PEAK")[-1].split("-VALLEY")[0])
                         except ValueError:
                             pass
+                    if "VALLEY" in _s:
+                        try:
+                            valley = float(_s.split("VALLEY")[-1])
+                        except ValueError:
+                            pass
+                    if valley <= 0:
+                        valley = float(holding.get("cost_price", 0) or 0)  # 旧持仓无 VALLEY → 成本价近似谷底
                     high_px = float(row.get("high", 0) or 0)
-                    if peak > 0 and high_px >= peak:
-                        # 突破第一波前高 → 二波兑现止盈
+                    tp1 = valley + (peak - valley) * settings.SW_TAKE_PROFIT_RATIO if peak > 0 and valley > 0 else 0.0
+                    tp2 = peak * settings.SW_TAKE_PROFIT_HIGH_RATIO if peak > 0 else 0.0
+                    if peak > 0 and valley > 0 and tp1 > 0 and high_px >= tp1:
+                        # 达到 0.618 黄金分割止盈位 → 二波止盈（tp1<tp2 恒成立，先到 tp1；到 tp2 次高点则更高价全清）
                         sell_px = round(high_px * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)
-                        reason = "二波-突破前高兑现"
+                        reason = f"二波-次高点止盈(tp2={tp2:.2f})" if high_px >= tp2 else f"二波-黄金分割止盈(tp1={tp1:.2f})"
                         HoldingManager.close_holding(code=code, holding_type="AI_SW", sell_price=sell_px)
                         self._sell_sig_set(code, "AI_SW").add("二波兑现")
                         logger.info(f"[二波] {holding.get('name')}({code}) {reason} 卖价{sell_px}")
                         bark_notifier.send(
                             title=f"🔔 [二波卖出] {holding.get('name')}({code})",
-                            body=f"{reason}\n突破前高{peak}元 卖出:{sell_px}元",
+                            body=f"{reason}\n前高{peak}元 谷底{valley}元 卖出:{sell_px}元",
                             group="卖出提醒", level="timeSensitive")
                         continue
                     _days = 0
@@ -1771,16 +1854,16 @@ class _MonitorCoreMixin:
                         _days = (datetime.datetime.now() - _b).days
                     except Exception:
                         pass
-                    if peak > 0 and _days >= settings.SW_HOLD_DAYS and high_px < peak:
-                        # N 天未创新高 → 坚决离场
+                    if peak > 0 and valley > 0 and _days >= settings.SW_HOLD_DAYS and high_px < tp1:
+                        # N 天未达黄金分割止盈位 → 坚决离场（不恋战）
                         sell_px = round(curr_price * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)
-                        reason = f"二波-{settings.SW_HOLD_DAYS}天未创新高离场"
+                        reason = f"二波-{settings.SW_HOLD_DAYS}天未达止盈位离场"
                         HoldingManager.close_holding(code=code, holding_type="AI_SW", sell_price=sell_px)
                         self._sell_sig_set(code, "AI_SW").add("二波离场")
                         logger.info(f"[二波] {holding.get('name')}({code}) {reason} 卖价{sell_px}")
                         bark_notifier.send(
                             title=f"🔔 [二波卖出] {holding.get('name')}({code})",
-                            body=f"{reason}\n未突破前高{peak}元 卖出:{sell_px}元 (成本{holding.get('cost_price')}元)",
+                            body=f"{reason}\n止盈位{tp1:.2f} 现价{curr_price:.2f}元 (成本{holding.get('cost_price')}元)",
                             group="卖出提醒", level="timeSensitive")
                         continue
 

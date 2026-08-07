@@ -71,9 +71,11 @@ class TestRecBuyCondition(unittest.TestCase):
         self.assertEqual(calls, [])  # 正则确实没被调用
 
     def test_买入verdict回落超过阈值仍不买(self):
+        # 相对盘中最高点回落（评审）：现10.2，从最高10.6回落3.8%>2% → 不买
         ok = self.m._check_rec_buy_condition(
             {"auction_verdict": "买入"},
-            open_price=10.5, pre_close=10.0, change_pct=2.0)  # 开盘+5%，现+2%，回落3%>2%
+            open_price=10.5, pre_close=10.0, change_pct=2.0,
+            high_price=10.6, current_price=10.2)
         self.assertFalse(ok)
 
     def test_观察verdict仍走open_requirement正则(self):

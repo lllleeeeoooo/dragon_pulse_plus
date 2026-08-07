@@ -104,17 +104,25 @@ class TestRecheckBuy(unittest.TestCase):
         self.assertTrue(retry)  # 审查#4：封板可能打开 → 下轮重新评估
 
     def test_回落超阈值不买(self):
-        # open 10.5(+5%)，现 10.1(+1%) → 回落 4% > 2% → 不买
+        # 相对盘中最高点回落：high 10.6，现 10.1 → 回落 4.7% > 2% → 不买（评审：相对最高点而非开盘）
         spot = pd.DataFrame([{"code": "600001", "price": 10.1, "change_pct": 1.0,
-                              "open": 10.5, "pre_close": 10.0}])
+                              "open": 10.5, "pre_close": 10.0, "high": 10.6}])
         with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot", return_value=spot):
             price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
         self.assertFalse(ok)
-        self.assertFalse(retry)  # 数据可靠判回落 → 当日评估结束
+        self.assertFalse(retry)  # 数据可靠判冲高回落 → 当日评估结束
+
+    def test_高开拉到高位回落仍被拦(self):
+        # 评审案例：+1%高开 → 拉到+8% → 砸回+5.5%，相对开盘还涨 4.5%，但相对最高点回落 2.3%>2% → 拦
+        spot = pd.DataFrame([{"code": "600001", "price": 10.55, "change_pct": 5.5,
+                              "open": 10.1, "pre_close": 10.0, "high": 10.8}])
+        with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot", return_value=spot):
+            price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
+        self.assertFalse(ok)
 
     def test_正常用最新价(self):
         spot = pd.DataFrame([{"code": "600001", "price": 10.6, "change_pct": 6.0,
-                              "open": 10.3, "pre_close": 10.0}])
+                              "open": 10.3, "pre_close": 10.0, "high": 10.6}])
         with patch("scheduler.monitor_core.DataFetcher.get_realtime_spot", return_value=spot):
             price, ok, retry = self.m._recheck_buy_after_llm("600001", 10.0)
         self.assertTrue(ok)

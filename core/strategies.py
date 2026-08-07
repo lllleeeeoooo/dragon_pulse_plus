@@ -60,12 +60,14 @@ class MarketStyle:
         return (d - x) / (d - c)
 
     @staticmethod
-    def classify(emotion: dict, market_amount: float = 8000, baseline: float = 8000) -> dict:
+    def classify(emotion: dict, market_amount: float = 8000, baseline: float = 8000,
+                 prev_style: str = None) -> dict:
         """
-        市场风格分类 —— 平滑评分模型（替代硬切档位，消除边界悬崖）。
+        市场风格分类 —— 平滑评分模型 + 滞后缓冲（防评分在阈值附近每 15s 频闪横跳）。
         :param emotion: {height, zt_count, dt_count, zhaban_rate, sentiment_index, yield_rate}
         :param market_amount: 今日预估成交额（亿元）
         :param baseline: 20日均成交额基准（亿元）
+        :param prev_style: 上一轮风格（盘中连续调用传入；首次/盘后传 None 用基础阈值 0.5/0.55）
         :return: {"style","reason","priority_strategy","capacity_factor","confidence","scores"}
         """
         height = emotion.get("height", 0)
@@ -119,20 +121,38 @@ class MarketStyle:
                     "capacity_factor": round(k, 2),
                     "confidence": round(confidence, 2), "scores": scores}
 
-        # ── 风险风格优先（生存/顶部），得分达 0.5 即触发 ──
-        if s_baotuan >= 0.5:
+        _STYLE_PRIORITY = {"抱团": "避险抱团", "高潮": "观望/跟随", "共振": "板块共振",
+                           "打板": "打板接力", "低吸": "中军回踩"}
+
+        # ── 滞后缓冲：已处非观望风格且分数未跌破退出阈值 → 保持原风格（防每15s频闪横跳）──
+        if settings.STYLE_HYSTERESIS_ENABLED and prev_style in _STYLE_PRIORITY:
+            prev_score = scores.get(prev_style, 0.0)
+            if prev_score >= settings.STYLE_EXIT_SCORE:
+                return _ret(prev_style, _STYLE_PRIORITY[prev_style],
+                            f"滞后保持：{prev_style} 分{prev_score:.2f}≥退出阈值{settings.STYLE_EXIT_SCORE}", prev_score)
+
+        # 进入阈值：首次/盘后无 prev_style 用基础(风险0.5/攻击0.55)；盘中跌破退出后重新选择用更严阈值(0.55/0.60)
+        if prev_style is None:
+            thr_risk, thr_attack = 0.5, 0.55
+        else:
+            thr_risk, thr_attack = settings.STYLE_ENTER_RISK_SCORE, settings.STYLE_ENTER_ATTACK_SCORE
+
+        # ── 抱团最高优先级仅当流动性枯竭(K<STYLE_BAOTUAN_K_MAX)且涨停稀少(<STYLE_BAOTUAN_ZT_MAX)；
+        #    否则主线进攻/高潮优先，抱团降为后备（评审B6：主线爆发时杂毛跌停不再强制防守错失打板接力）──
+        _baotuan_priority = (k < settings.STYLE_BAOTUAN_K_MAX and zt_count < settings.STYLE_BAOTUAN_ZT_MAX)
+        if _baotuan_priority and s_baotuan >= thr_risk:
             return _ret("抱团", "避险抱团",
-                        f"跌停{dt_count}家（动态线{dt_panic}）或溢价{premium}%，恐慌蔓延，绝对防守", s_baotuan)
-        if s_gaochao >= 0.5:
+                        f"流动性枯竭(K={k:.2f}<{settings.STYLE_BAOTUAN_K_MAX})且涨停仅{zt_count}家，恐慌蔓延，绝对防守", s_baotuan)
+        if s_gaochao >= thr_risk:
             return _ret("高潮", "观望/跟随",
                         f"最高{height}板+涨停{zt_count}家（超上限{zt_daban_max}）且情绪{sentiment_index}分，"
                         f"市场过于一致，明日必分歧。高位减仓，等分歧后做弱转强。", s_gaochao)
 
-        # ── 攻击风格取最高分，需达阈值 ──
+        # ── 攻击风格取最高分，需达进入阈值（主线进攻优先）──
         attack = {"共振": s_gongzhen, "打板": s_daban, "低吸": s_dixi}
         best_style = max(attack, key=attack.get)
         best_score = attack[best_style]
-        if best_score >= 0.55:
+        if best_score >= thr_attack:
             if best_style == "共振":
                 return _ret("共振", "板块共振",
                             f"情绪{sentiment_index}分+涨停{zt_count}家+炸板率{zhaban_rate}%（上限{zb_limit:.0f}%），全力进攻首板", best_score)
@@ -142,8 +162,13 @@ class MarketStyle:
             return _ret("低吸", "中军回踩",
                         f"涨停{zt_count}家（下限{zt_mid_min}）+高度{height}板+情绪{sentiment_index}分，轮动修复期，低吸中军", best_score)
 
+        # ── 抱团后备：活跃市场(K≥0.8或涨停≥15)里杂毛跌停不再主导风格，但两极端并存(涨停多+跌停多)仍防守 ──
+        if s_baotuan >= thr_risk:
+            return _ret("抱团", "避险抱团",
+                        f"跌停{dt_count}家（动态线{dt_panic}）或溢价{premium}%，恐慌蔓延，绝对防守", s_baotuan)
+
         # ── 都不够 → 观望（带原因：哪个风格差多少达标）──
-        gap = 0.55 - best_score
+        gap = thr_attack - best_score
         return _ret("观望", "观望/跟随",
                     f"涨停{zt_count}/跌停{dt_count}/情绪{sentiment_index}/K={k:.2f}，各风格分均低"
                     f"（最高{best_style} {best_score:.2f}，差{gap:.2f}达标）——观望等方向", 0.0)

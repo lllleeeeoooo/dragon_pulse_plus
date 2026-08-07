@@ -135,7 +135,7 @@
 2. **合并竞价"买入"指令**（`_merge_auction_buy_candidates`）：09:26 竞价 LLM 判定"买入"且前提"满足"的推荐标的，无信号也进候选池（仅评估一次）。
 3. 每轮最多评估 `hit_df.head(5)` 个候选。
 4. **当日去重**：已推送过的 code 跳过（推荐标的 09:26 一次性评估后同样锁）。
-5. **推荐标的买点验证**（`_check_rec_buy_condition`）：竞价未判"买入"的，需满足 open_requirement + 竞价量能正则；任何情况下相对开盘回落 > `REC_FADE_MAX=2.0%` 不买（活的安全网）。
+5. **推荐标的买点验证**（`_check_rec_buy_condition`）：竞价未判"买入"的，需满足 open_requirement + 竞价量能正则；任何情况下**相对盘中最高点回落 ≥ `REC_FADE_MAX=2.0%`**（冲高回落）不买（评审：原相对开盘回落漏掉"高开拉到高位再砸回"的风险）。
 6. **高质量信号判定**（跟随风格）：打板接力→逼近封板；中军回踩→低开猛拉；避险抱团→振幅放量；共振/观望→任一信号（点火异动需 涨幅≥5% 且 量比≥5 且 成交≥2亿 才高质）。
 7. **情绪周期约束**（`cycle_stance`）：冰点/退潮 `allow_auto_buy=False` 禁止自动买入；启动期 `only_recommended=True` 只买推荐标的；发酵/高潮放开。
 8. **竞价 verdict 门控**：09:26 判定"放弃"的推荐标的不自动买入（仍推送异动提醒）。
@@ -150,9 +150,9 @@
 
 **成交滑点模型**（`_compute_buy_cost`）：普通信号买入成本 = 现价 × (1 + `AI_BUY_SLIPPAGE_PCT=0.3%`)；**逼近封板/高位放量信号默认按涨停价撮合**（`AI_BUY_NEAR_LIMIT_FILL_LIMIT=True`，成本 = 昨收 × (1+涨停线)，打板资金实际多撮合在涨停附近，原 0.5% 滑点对回测过于乐观）；关闭该开关时退回 0.3%+`AI_BUY_SLIPPAGE_HOT_PCT=0.2%` 滑点模型。尾盘博弈/二波买入走普通滑点。
 
-**尾盘博弈**（14:30-15:00，`_scan_tail_game`）：候选 = 尾盘博弈信号（涨幅 2%~5% + 量比≥3 + 收阳 + 上影线占比≤0.3 + 收盘≥均价 VWAP）→ 站上 MA5/MA10（`TAIL_GAME_REQUIRE_MA=True`，MA 缺失**明确告警并放行**）→ 独立闸门 → 独立 LLM 确认（每轮 `TAIL_LLM_PER_CYCLE=1`）→ 买前复核 → AI_TAIL 持仓。次日 09:30-10:30 早盘兑现（见卖出节）。
+**尾盘博弈**（14:50-14:57 买入窗口，`_scan_tail_game`，评审：14:00-14:45 尾盘跳水最危险段，收窄到临近收盘形态定型后买）：候选 = 尾盘博弈信号（涨幅 2%~5% + **量比温和放量 1.2~2.5**（评审：低涨幅+量比≥3 是放量滞涨/出货）+ 收阳 + 上影线占比≤0.3 + 收盘≥均价 VWAP）→ 站上 MA5/MA10（`TAIL_GAME_REQUIRE_MA=True`，MA 缺失**明确告警并放行**）→ 独立闸门 → 独立 LLM 确认（每轮 `TAIL_LLM_PER_CYCLE=1`）→ 买前复核 → AI_TAIL 持仓。次日 09:35 统一卖出（见卖出节）。
 
-**龙头二波**（全天 9:30-15:00，`_scan_second_wave`）：近 `SECOND_WAVE_LOOKBACK_DAYS=30` 天历史龙头（`peak_price`）+ 现价回撤 **30%~50%** + 当日涨幅 > `SECOND_WAVE_CHANGE_MIN=3.0%`（止跌反包）→ 站上 MA5/MA10 → 独立闸门 → 独立 LLM 确认（每轮 `SW_LLM_PER_CYCLE=1`）→ AI_SW 持仓。回撤越浅+涨幅高优先。卖出：突破前高兑现 / `SW_HOLD_DAYS=5` 天未创新高离场。
+**龙头二波**（全天 9:30-15:00，`_scan_second_wave`）：近 `SECOND_WAVE_LOOKBACK_DAYS=30` 天历史龙头（`peak_price`）+ 现价回撤 **30%~50%** + 当日涨幅 > `SECOND_WAVE_CHANGE_MIN=3.0%`（止跌反包）→ **地量止跌确认**（`SW_REQUIRE_GROUND_BOTTOM=True`，评审防A杀半山腰/死猫跳：止跌窗口 T-4..T-1 缩量至峰值×`SW_GROUND_VOL_PEAK_RATIO=0.35` 或 <0.55×MA20量 + 振幅收敛≥`SW_GROUND_MIN_DAYS=2`天(≤4%) + 不创新低 + 今日放量>地量日；数据不足放行）→ 站上 MA5/MA10 → 独立闸门 → 独立 LLM 确认（每轮 `SW_LLM_PER_CYCLE=1`）→ AI_SW 持仓（策略记录 `PEAK{前高}-VALLEY{谷底}`）。回撤越浅+涨幅高优先。**卖出：黄金分割止盈**（谷底+(前高-谷底)×`SW_TAKE_PROFIT_RATIO=0.618` 止盈，前高×`SW_TAKE_PROFIT_HIGH_RATIO=0.95` 次高点全清，不再死守突破前高）/ `SW_HOLD_DAYS=5` 天未达止盈位离场。
 
 ---
 
@@ -213,8 +213,8 @@
 - **回测口径**：日线无分时数据，按**开盘价近似** 09:35 现价（开盘后 5 分钟 ≈ 开盘），不再冲高兑现/不再用全天最高价（消除 look-ahead 与乐观偏差）。
 
 **龙头二波 AI_SW**：
-- **突破前高兑现**：当日最高价 ≥ 第一波峰值（记录在持仓策略 `PEAK{price}` 中）→ 按最高价止盈卖出；
-- **N 天未创新高离场**：持仓 ≥ `SW_HOLD_DAYS=5` 天且未突破前高 → 按现价清仓离场；
+- **黄金分割止盈**：当日最高价 ≥ 谷底+(前高−谷底)×`SW_TAKE_PROFIT_RATIO=0.618` → 按最高价止盈（评审：突破前高太乐观，多数二波双顶在 0.618~0.8 反弹位）；最高价 ≥ 前高×`SW_TAKE_PROFIT_HIGH_RATIO=0.95` 次高点全清；
+- **N 天未达止盈位离场**：持仓 ≥ `SW_HOLD_DAYS=5` 天且未达黄金分割止盈位 → 按现价清仓离场；
 - 绝对止损/破 MA5/强止盈仍走常规 7.1 规则。
 
 ---
@@ -310,6 +310,8 @@
 - 动态阈值均随 K 缩放（跌停恐慌线 = 10×√K，打板涨停区间 = 30K~50K，低吸 = 40K，炸板容忍 = 25/√K×递增等）。
 - **五风格评分**（trap/ramp 平滑函数）：抱团 = max(跌停恐慌成分, 0.8×溢价崩塌成分)（阈值 0.5）；高潮 = 0.5×涨停区间 + 0.3×高度 + 0.2×情绪分（阈值 0.5）；共振/打板/低吸三个攻击风格（阈值 0.55）。
 - **判定优先级**：抱团 ≥ 0.5 → 抱团/避险抱团；高潮 ≥ 0.5 → 高潮/观望；攻击风格最高分 ≥ 0.55 → 共振/打板/低吸；全不满足 → 观望。
+- **滞后缓冲**（`STYLE_HYSTERESIS_ENABLED=True`，评审C7防频闪）：盘中已处某风格且分数 ≥ `STYLE_EXIT_SCORE=0.45` → 保持原风格；跌破退出后才重新选择，此时进入非观望风格需更高阈值（攻击 ≥ `STYLE_ENTER_ATTACK_SCORE=0.60`、风险 ≥ `STYLE_ENTER_RISK_SCORE=0.55`），评分在阈值附近不再每 15s 横跳。首次/盘后无 `prev_style` 用基础阈值 0.5/0.55。
+- **抱团优先级门控**（评审B6防"假防守"）：抱团获得**最高优先级仅当** K < `STYLE_BAOTUAN_K_MAX=0.8` 且 涨停 < `STYLE_BAOTUAN_ZT_MAX=15`（流动性枯竭+主线无行情）；否则**主线进攻（共振/打板/低吸）/高潮优先**，抱团降为后备——主线爆发时杂毛股批量跌停不再把系统强制归类为避险抱团、错失打板接力。
 - **StyleAnalyzer 战法标签**：二波预警 / 中军回踩（中军池且 -2~3%）/ 板块共振（指数≥1% 且 板块活跃≥3 且 个股≥5%）/ 避险抱团（指数<-0.5% 且 成交<7000亿 且 上涨）/ 打板接力（涨幅≥涨停线，主板9.5/双创19.5/北交所30）/ 观望兜底。
 
 ### 11.3 情绪周期状态机（`core/cycle_machine.py`）
@@ -387,16 +389,20 @@
 | AMPLITUDE_CHANGE_MIN | 3.0 | 振幅放量涨幅下限(%) |
 | MAIN_BOARD_LIMIT_PCT / GEM_STAR_LIMIT_PCT | 9.8 / 19.8 | 涨停线判定(%) |
 | TAIL_GAME_CHANGE_MIN / MAX | 2.0 / 5.0 | 尾盘博弈涨幅区间(%) |
-| TAIL_GAME_VOL_RATIO | 3.0 | 尾盘博弈量比下限 |
+| TAIL_GAME_VOL_RATIO_MIN / MAX | 1.2 / 2.5 | 尾盘博弈量比区间（温和放量，防放量滞涨） |
 | TAIL_GAME_SHORT_UPPER_RATIO | 0.3 | 尾盘博弈上影线占比上限 |
 | TAIL_GAME_SELL_TIME | 09:35 | 尾盘博弈次日统一卖出时刻(HH:MM)，到点按现价清仓 |
+| TAIL_GAME_WINDOW_START / END | 14:50 / 14:57 | 尾盘博弈买入窗口（规避 14:00-14:45 跳水段） |
 | TAIL_MAX_DAILY_BUYS / TAIL_MAX_POSITIONS | 2 / 2 | 尾盘当日次数/持仓上限 |
 | TAIL_LLM_PER_CYCLE | 1 | 尾盘每轮 LLM 确认次数 |
 | SECOND_WAVE_RETREAT_MIN / MAX | 0.30 / 0.50 | 二波回撤区间 |
 | SECOND_WAVE_LOOKBACK_DAYS | 30 | 二波追溯龙头天数 |
 | SECOND_WAVE_CHANGE_MIN | 3.0 | 二波止跌信号涨幅下限(%) |
 | SW_MAX_DAILY_BUYS / SW_MAX_POSITIONS | 2 / 2 | 二波当日次数/持仓上限 |
-| SW_HOLD_DAYS | 5 | 二波 N 天未创新高离场 |
+| SW_HOLD_DAYS | 5 | 二波 N 天未达止盈位离场 |
+| SW_TAKE_PROFIT_RATIO / HIGH_RATIO | 0.618 / 0.95 | 二波黄金分割止盈 / 次高点止盈 |
+| SW_REQUIRE_GROUND_BOTTOM | true | 二波买入需地量止跌确认 |
+| SW_GROUND_VOL_PEAK_RATIO / AMPLITUDE_MAX / MIN_DAYS | 0.35 / 4.0 / 2 | 地量缩量比 / 振幅收敛上限 / 收敛天数 |
 | MAX_AI_POSITIONS | 5 | AI 持仓上限 |
 | MAX_DAILY_BUYS | 3 | AI 当日买入次数上限 |
 | MAX_AI_SECTOR_POSITIONS | 2 | 同板块持仓上限 |
@@ -406,13 +412,16 @@
 | TIME_STOP_LOSS_DAYS | 3 | 时间止损天数 |
 | TAKE_PROFIT_WARN_PCT / CRITICAL_PCT | 15 / 20 | 止盈提醒/强止盈线(%) |
 | TAKE_PROFIT_HIGH_PULLBACK_PCT | 5.0 | 强止盈自当日高点最低回落(%) |
-| REC_FADE_MAX | 2.0 | 相对开盘回落走弱上限(%) |
+| REC_FADE_MAX | 2.0 | 相对盘中最高点回落上限(%)，冲高回落不买 |
 | MA5_FALLBACK_RATIO | 0.97 | MA5 获取失败兜底 = 现价×0.97 |
 | PATTERN_CHECK_MIN_AMOUNT | 5.0 | 分时形态检测最低成交额(亿) |
 | PATTERN_CHECK_CACHE_SECONDS | 300 | 分时形态缓存 TTL(秒) |
 | ZHABAN_ALERT_CHANGE / VOL_RATIO | 7.0 / 2.0 | 炸板预警涨幅/量比 |
 | SECTOR_LINKAGE_MIN_COUNT / ACCEL_DELTA | 3 / 2 | 板块联动涨停家数/加速增量 |
 | EMOTION_TOP_MAX_LBC / ZHABAN_RATE / SENTIMENT_MIN | 8 / 35 / 75 | 情绪到顶预警条件 |
+| STYLE_HYSTERESIS_ENABLED | true | 风格滞后缓冲开关（防阈值附近频闪） |
+| STYLE_ENTER_ATTACK_SCORE / RISK / EXIT | 0.60 / 0.55 / 0.45 | 滞后进入攻击/风险阈值 / 退出阈值 |
+| STYLE_BAOTUAN_K_MAX / ZT_MAX | 0.8 / 15 | 抱团最高优先级需 K<此值 且 涨停<此值 |
 | FUND_INFLOW_MIN / CAP_RATIO | 2000 / 0.0005 | 大单抱团绝对底线(万)/市值比例 |
 | LLM_BUY_CONFIRM_PER_CYCLE | 1 | 每轮 LLM 买入确认次数 |
 | LLM_SELL_HOLD_COOLDOWN_SECONDS | 1800 | 卖出 LLM 判持有后冷却(秒) |

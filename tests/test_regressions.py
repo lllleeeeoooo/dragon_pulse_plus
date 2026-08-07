@@ -228,10 +228,12 @@ class TestPureRegressions(unittest.TestCase):
             self.assertEqual(obj._get_sector_phase("未知板块"), "")
 
     def test_market_style_classify(self):
-        """市场风格分类：抱团/共振/打板 三档命中"""
+        """市场风格分类：枯竭市场抱团/活跃共振/打板 三档命中（评审B6：抱团需 K<0.8 且 涨停<15）"""
         from core.strategies import MarketStyle
-        r = MarketStyle.classify({"height": 2, "zt_count": 20, "dt_count": 12,
-                                  "zhaban_rate": 30, "sentiment_index": 30, "yield_rate": -3})
+        # 枯竭市场(zt8/dt15/K=0.5) → 抱团
+        r = MarketStyle.classify({"height": 2, "zt_count": 8, "dt_count": 15,
+                                  "zhaban_rate": 30, "sentiment_index": 30, "yield_rate": -3},
+                                 market_amount=4000, baseline=8000)
         self.assertEqual(r["style"], "抱团")
         self.assertEqual(r["priority_strategy"], "避险抱团")
         r2 = MarketStyle.classify({"height": 4, "zt_count": 50, "dt_count": 0,

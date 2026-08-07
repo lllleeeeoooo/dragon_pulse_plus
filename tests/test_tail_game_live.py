@@ -10,10 +10,10 @@ from scheduler.monitor_core import _MonitorCoreMixin
 
 
 def _tail_spot():
-    """一行尾盘博弈命中（涨幅4%/量比4/收阳/短上影/收盘≥均价）的 spot"""
+    """一行尾盘博弈命中（涨幅4%/量比2温和放量/收阳/短上影/收盘≥均价）的 spot"""
     return pd.DataFrame([{
         "code": "600002", "name": "B", "price": 10.4, "change_pct": 4.0, "amount": 6e8,
-        "volume": 6e7, "volume_ratio": 4.0, "high": 10.45, "low": 10.0, "open": 10.1,
+        "volume": 6e7, "volume_ratio": 2.0, "high": 10.45, "low": 10.0, "open": 10.1,
         "pre_close": 10.0, "amplitude": 4.0,
     }])
 
@@ -195,6 +195,24 @@ class TestPnlIncludeTail(unittest.TestCase):
         self.assertEqual(report.get("active_positions"), 1)  # AI_TAIL 计入活跃持仓数
         codes = [h.get("code") for h in report.get("holdings", [])]
         self.assertIn("600002", codes)  # AI_TAIL 持仓进入盈亏报告明细
+
+
+class TestTailWindow(unittest.TestCase):
+    """尾盘博弈买入窗口（评审：14:30 太早，收窄到 14:50-14:57 规避尾盘跳水）"""
+
+    def test_窗口14_50到14_57(self):
+        from unittest.mock import Mock
+        import scheduler.monitor_core as mc
+        from scheduler.monitor_core import _MonitorCoreMixin
+        m = _MonitorCoreMixin()
+        # patch 整个模块的 datetime 引用：datetime(类) mock + time(类) 用真实现
+        fake = Mock()
+        fake.time = datetime.time  # 真实 time 类
+        with patch.object(mc, "datetime", fake):
+            for hh, mm, expected in [(14, 30, False), (14, 49, False), (14, 50, True),
+                                     (14, 57, True), (14, 58, False), (15, 0, False)]:
+                fake.datetime.now.return_value = datetime.datetime(2026, 8, 6, hh, mm)  # 周四
+                self.assertEqual(m.is_tail_end_time(), expected, f"{hh}:{mm}")
 
 
 if __name__ == "__main__":

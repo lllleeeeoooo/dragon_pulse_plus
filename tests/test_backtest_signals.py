@@ -16,7 +16,7 @@ def _spot_with_signal():
          "volume": 6e7, "volume_ratio": 6.0, "high": 10.95, "low": 10.3, "open": 10.4,
          "pre_close": 10.0, "amplitude": 6.5},
         {"code": "600002", "name": "B", "price": 10.4, "change_pct": 4.0, "amount": 6e8,
-         "volume": 6e7, "volume_ratio": 4.0, "high": 10.45, "low": 10.0, "open": 10.1,
+         "volume": 6e7, "volume_ratio": 2.0, "high": 10.45, "low": 10.0, "open": 10.1,
          "pre_close": 10.0, "amplitude": 4.0},
     ])
     df = compute_signal_flags(df)

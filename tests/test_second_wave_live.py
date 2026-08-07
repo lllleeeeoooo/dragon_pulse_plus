@@ -133,19 +133,23 @@ class TestSecondWaveExit(unittest.TestCase):
     def _run(self, spot_df, holding):
         self.m._monitor_holdings(spot_df, [holding], 5, 20.0)
 
-    def test_突破前高兑现(self):
+    def test_黄金分割止盈(self):
+        """PEAK20.0/VALLEY12.0 → tp1=12+(20-12)×0.618=16.94；high≥tp1 → 止盈（不再死守突破前高20）"""
         holding = {"code": "600001", "name": "A", "cost_price": 13.0, "holding_type": "AI_SW",
-                   "buy_strategy": "二波战法-PEAK20.0", "buy_date": "2026-07-25",
+                   "buy_strategy": "二波战法-PEAK20.0-VALLEY12.0", "buy_date": "2026-07-25",
                    "was_limit_up_today": False}
-        spot = pd.DataFrame([{"code": "600001", "price": 20.5, "change_pct": 5.0, "open": 20.0,
-                              "high": 20.5, "low": 19.5, "volume": 1000000, "amount": 20000000}])
+        spot = pd.DataFrame([{"code": "600001", "price": 17.0, "change_pct": 5.0, "open": 16.5,
+                              "high": 17.0, "low": 16.0, "volume": 1000000, "amount": 17000000}])
         self._run(spot, holding)
         self.assertTrue(self._close_mock.called)
         self.assertEqual(self._close_mock.call_args.kwargs.get("holding_type"), "AI_SW")
+        self.assertAlmostEqual(self._close_mock.call_args.kwargs.get("sell_price"),
+                               round(17.0 * 0.997, 2), places=2)
 
-    def test_N天未创新高离场(self):
+    def test_N天未达止盈位离场(self):
+        """已持≥5天且 high < tp1 → 坚决离场（不恋战）"""
         holding = {"code": "600001", "name": "A", "cost_price": 13.0, "holding_type": "AI_SW",
-                   "buy_strategy": "二波战法-PEAK20.0", "buy_date": "2026-07-01",  # 已持远超5天
+                   "buy_strategy": "二波战法-PEAK20.0-VALLEY12.0", "buy_date": "2026-07-01",
                    "was_limit_up_today": False}
         spot = pd.DataFrame([{"code": "600001", "price": 12.5, "change_pct": 1.0, "open": 12.5,
                               "high": 12.8, "low": 12.0, "volume": 1000000, "amount": 12500000}])
@@ -188,6 +192,56 @@ class TestPnlIncludeSw(unittest.TestCase):
         self.assertEqual(report.get("active_positions"), 1)
         codes = [h.get("code") for h in report.get("holdings", [])]
         self.assertIn("600001", codes)
+
+
+class TestGroundVolumeBottom(unittest.TestCase):
+    """二波地量止跌确认（评审：防 A 杀半山腰/死猫跳）"""
+
+    def _rows(self, tail_vol, tail_amp, peak_vol=1e8, n=30):
+        rows = []
+        for i in range(n):
+            r = Mock()
+            r.close = 10.0 + i * 0.1
+            r.high = r.close + 0.2
+            r.low = r.close - 0.2
+            # 开头有峰值量，末尾 4 天用 tail_vol/tail_amp
+            r.volume = peak_vol if i == 0 else (tail_vol if i >= n - 5 else 3e7)
+            r.amplitude = tail_amp if i >= n - 5 else 8.0
+            rows.append(r)
+        return rows[::-1]  # 模拟查询 desc 排序（方法内会再反转为升序）
+
+    def _run(self, rows, today_vol):
+        from scheduler.monitor_core import _MonitorCoreMixin
+        m = _MonitorCoreMixin()
+        with patch("database.connection.db_manager.get_session") as gs:
+            sess = Mock()
+            gs.return_value = sess
+            sess.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = rows
+            sess.close = Mock()
+            return m._second_wave_bottom_confirmed("600001", today_vol)
+
+    def test_地量缩量收敛确认通过(self):
+        # 峰值1e8，尾部地量5e6(≤0.35×1e8)，振幅3%收敛 → 确认
+        rows = self._rows(tail_vol=5e6, tail_amp=3.0)
+        self.assertTrue(self._run(rows, 6e6))  # 今日量>地量日
+
+    def test_未缩量不确认(self):
+        # 尾部量仍大(4e7 > 0.35×1e8) → 未地量 → 不确认
+        rows = self._rows(tail_vol=4e7, tail_amp=3.0)
+        self.assertFalse(self._run(rows, 5e7))
+
+    def test_振幅未收敛不确认(self):
+        # 地量但振幅8%未收敛 → 未止跌 → 不确认
+        rows = self._rows(tail_vol=5e6, tail_amp=8.0)
+        self.assertFalse(self._run(rows, 6e6))
+
+    def test_今日未放量不确认(self):
+        # 地量收敛，但今日量(1e6) < 地量日(5e6) → 未点火 → 不确认
+        rows = self._rows(tail_vol=5e6, tail_amp=3.0)
+        self.assertFalse(self._run(rows, 1e6))
+
+    def test_数据不足放行(self):
+        self.assertTrue(self._run(self._rows(5e6, 3.0, n=10), 6e6))  # 仅10根 → 放行
 
 
 if __name__ == "__main__":

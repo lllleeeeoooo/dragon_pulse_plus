@@ -112,5 +112,72 @@ class TestQuantCore(unittest.TestCase):
         self.assertTrue(any(s["type"] == "断板必卖" for s in signals))
 
 
+class TestStyleHysteresis(unittest.TestCase):
+    """市场风格滞后缓冲（评审C7）：评分在阈值附近不每15s频闪横跳"""
+
+    def _em(self):
+        # zt25/h4/sentiment45 → 低吸 0.45（在退出阈值0.45~进入阈值0.60 的滞回带内）
+        return {"height": 4, "zt_count": 25, "dt_count": 3, "zhaban_rate": 10,
+                "sentiment_index": 45, "yield_rate": 1.0}
+
+    def test_无prev用基础阈值(self):
+        from core.strategies import MarketStyle
+        # 低吸 0.45 < 基础攻击阈值 0.55 → 观望
+        self.assertEqual(MarketStyle.classify(self._em())["style"], "观望")
+
+    def test_滞后保持原风格(self):
+        from core.strategies import MarketStyle
+        # 已处低吸且 0.45 ≥ 退出阈值 → 保持（不再因分数略降横跳）
+        self.assertEqual(MarketStyle.classify(self._em(), prev_style="低吸")["style"], "低吸")
+
+    def test_进入需更高阈值(self):
+        from core.strategies import MarketStyle
+        # 观望进低吸需 ≥0.60，0.45 不足 → 仍观望（防弱信号误切）
+        self.assertEqual(MarketStyle.classify(self._em(), prev_style="观望")["style"], "观望")
+
+    def test_跌破退出阈值重新选择(self):
+        from core.strategies import MarketStyle
+        from config.settings import settings
+        with patch.object(settings, "STYLE_EXIT_SCORE", 0.5):  # 退出阈值提到 0.5 > 低吸 0.45
+            r = MarketStyle.classify(self._em(), prev_style="低吸")
+        self.assertNotEqual(r["style"], "低吸")  # 0.45 < 0.5 → 不保持
+
+    def test_开关关闭不滞后(self):
+        from core.strategies import MarketStyle
+        from config.settings import settings
+        with patch.object(settings, "STYLE_HYSTERESIS_ENABLED", False):
+            # prev=低吸 但关闭滞后 → 走基础判定(0.45<0.55) → 观望
+            self.assertEqual(MarketStyle.classify(self._em(), prev_style="低吸")["style"], "观望")
+
+
+class TestBaotuanPriority(unittest.TestCase):
+    """抱团优先级门控（评审B6）：主线爆发时杂毛跌停不再强制防守，枯竭市场才最高优先"""
+
+    def test_活跃市场抱团降级(self):
+        # 涨停30(活跃) + 跌停15(杂毛跌停) + K=1.0 → 旧判抱团，新判主线进攻
+        from core.strategies import MarketStyle
+        em = {"height": 4, "zt_count": 30, "dt_count": 15, "zhaban_rate": 10,
+              "sentiment_index": 55, "yield_rate": -1.0}
+        r = MarketStyle.classify(em, market_amount=8000, baseline=8000)  # K=1.0
+        self.assertNotEqual(r["style"], "抱团")  # 不再强制防守
+        self.assertIn(r["style"], ("共振", "打板", "低吸"))  # 主线进攻优先
+
+    def test_枯竭市场抱团仍最高优先级(self):
+        # 涨停8 + 跌停15 + K=0.5 → K<0.8 且 zt<15 → 抱团保持最高优先级
+        from core.strategies import MarketStyle
+        em = {"height": 2, "zt_count": 8, "dt_count": 15, "zhaban_rate": 30,
+              "sentiment_index": 30, "yield_rate": -3.0}
+        r = MarketStyle.classify(em, market_amount=4000, baseline=8000)  # K=0.5
+        self.assertEqual(r["style"], "抱团")
+
+    def test_涨停多但K枯竭不判抱团(self):
+        # AND 条件：K<0.8 且 涨停<15 才最高优先；zt=20≥15 → 不满足 → 不判抱团
+        from core.strategies import MarketStyle
+        em = {"height": 4, "zt_count": 20, "dt_count": 18, "zhaban_rate": 20,
+              "sentiment_index": 50, "yield_rate": -2.0}
+        r = MarketStyle.classify(em, market_amount=4000, baseline=8000)  # K=0.5 但 zt=20
+        self.assertNotEqual(r["style"], "抱团")
+
+
 if __name__ == "__main__":
     unittest.main()
