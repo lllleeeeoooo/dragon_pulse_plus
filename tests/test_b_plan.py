@@ -213,6 +213,27 @@ class TestSellHoldCooldown(unittest.TestCase):
             self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
             self.assertEqual(self._sell_mock.call_count, 2)  # 两个信号各咨询一次，未互相拦截
 
+    def test_冷却中急跌破局打破冷却重新复核(self):
+        """风控盲区修复：LLM 判持有后现价较决策价急跌≥LLM_SELL_COOLDOWN_BREAK_PCT%，打破冷却立即重新评估"""
+        self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
+        self.assertEqual(self._sell_mock.call_count, 1)
+        self.assertIn("600001:破位止损", self.m._llm_sell_hold_price)  # 记录了 LLM 决策价
+        # 现价 9.0 → 8.5（较决策价跌 5.6% ≥ 3%）→ 打破冷却，重新咨询 LLM
+        spot_drop = self.spot.copy()
+        spot_drop["price"] = 8.5
+        self.m._monitor_holdings(spot_drop, [self.holding], 5, 20.0)
+        self.assertEqual(self._sell_mock.call_count, 2)
+
+    def test_冷却中未急跌不打破(self):
+        """现价未较决策价急跌≥阈值：冷却期内不重复咨询（防每 15s 阻塞 LLM）"""
+        self.m._monitor_holdings(self.spot, [self.holding], 5, 20.0)
+        self.assertEqual(self._sell_mock.call_count, 1)
+        # 现价 9.0 → 8.9（跌 1.1% < 3%）→ 冷却仍生效
+        spot_small = self.spot.copy()
+        spot_small["price"] = 8.9
+        self.m._monitor_holdings(spot_small, [self.holding], 5, 20.0)
+        self.assertEqual(self._sell_mock.call_count, 1)
+
 
 class TestSellDedupByHoldingType(unittest.TestCase):
     """审查#8：同 code 多持仓(AI_AUTO+MANUAL)，一仓平仓后去重只按 (code, holding_type) 键控，

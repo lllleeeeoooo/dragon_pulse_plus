@@ -58,3 +58,19 @@ def get_previous_trading_day(date: Optional[datetime.date] = None) -> str:
     while prev.weekday() >= 5:
         prev -= datetime.timedelta(days=1)
     return prev.strftime("%Y%m%d")
+
+
+def count_trading_days(start: datetime.date, end: datetime.date) -> int:
+    """start(含)~end(含)之间的交易日数。
+    日历覆盖范围内精确计数；超出覆盖范围或日历不可用时按工作日(周一~周五)估算。
+    （供时间止损改交易日计算：避免自然日跨周末误触发。）"""
+    _ensure_synced()
+    try:
+        from database.services import TradeCalendarManager
+        n = TradeCalendarManager.count_trading_days(start.isoformat(), end.isoformat())
+        if n is not None:
+            return n
+    except Exception:
+        pass
+    return sum(1 for i in range((end - start).days + 1)
+               if (start + datetime.timedelta(days=i)).weekday() < 5)

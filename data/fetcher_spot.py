@@ -8,6 +8,12 @@ import time as _time
 from data.core import multi_source_fetch, _FETCH_SOCKET_TIMEOUT
 
 
+# 东财 clist 全市场行情多主机轮换池：东财按后端主机/IP 频率限流（实测连续 ~8 次请求即
+# RemoteDisconnected），akshare 硬编码 82.push2 且分页需 ~59 次请求必被断。
+# 这里轮换多个 push2 主机分摊请求，规避单个后端主机被限流。
+_EM_CLIST_HOSTS = ["82.push2", "92.push2", "push2", "7.push2", "30.push2"]
+
+
 def _spot_fetch(func):
     """给数据源抓取函数包 socket 超时：akshare 内部 requests 未传 timeout，
     数据源挂起会永久阻塞主循环（曾多次卡死盘中监控，含 _fill_ohlc_from_sina 直接调用路径）。
@@ -372,8 +378,39 @@ class _SpotMixin:
     @staticmethod
     @_spot_fetch
     def _fetch_spot_eastmoney() -> pd.DataFrame:
-        """从东财获取全市场实时行情并归一化列名（原始主力源）"""
-        df = ak.stock_zh_a_spot_em()
+        """从东财获取全市场实时行情并归一化列名（原始主力源）。
+        东财 clist 端点按请求频率限流（实测连续 ~8 次请求后连接被 RemoteDisconnected 重置），
+        akshare 默认 pz=100 分页拉全市场需 ~59 次请求必被断 → 临时补丁 akshare 分页层：
+        ① 加大 pz(2000) 减少分页次数（被截断时 fetch_paginated_data 按实际页大小自适应）；
+        ② 逐页轮换 push2 主机（_EM_CLIST_HOSTS），规避单个后端主机被限流。
+        解析仍交给 akshare（列口径一致，避免自解析 f-code 顺序变化的坑）。"""
+        import akshare as ak
+        import akshare.utils.func as _func
+        _hist_em = None
+        try:
+            import akshare.stock_feature.stock_hist_em as _hist_em
+        except Exception:
+            pass
+        _orig = _func.fetch_paginated_data
+        _state = {"idx": 0}
+
+        def _patched(url, params, timeout=15):
+            p = dict(params or {})
+            p["pz"] = "2000"  # 减少分页次数，降低触发东财频率限流概率
+            host = _EM_CLIST_HOSTS[_state["idx"] % len(_EM_CLIST_HOSTS)]
+            _state["idx"] += 1
+            url = url.replace("82.push2", host)
+            return _orig(url, p, timeout)
+
+        _func.fetch_paginated_data = _patched
+        if _hist_em is not None and hasattr(_hist_em, "fetch_paginated_data"):
+            _hist_em.fetch_paginated_data = _patched
+        try:
+            df = ak.stock_zh_a_spot_em()
+        finally:
+            _func.fetch_paginated_data = _orig
+            if _hist_em is not None and hasattr(_hist_em, "fetch_paginated_data"):
+                _hist_em.fetch_paginated_data = _orig
         if df is None or df.empty:
             return pd.DataFrame()
         df = df.rename(columns={

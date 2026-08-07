@@ -2,7 +2,9 @@
 HoldingMonitor 卖出信号全矩阵测试
 覆盖 5 条风控规则：绝对止损、断板必卖、破位止损、止盈、时间止损
 """
+import datetime
 import unittest
+from unittest.mock import patch
 from core.holding_monitor import HoldingMonitor
 
 
@@ -77,6 +79,44 @@ class TestHoldingMonitor(unittest.TestCase):
         )
         self.assertTrue(any(s["type"] == "止盈提醒" and s["level"] == "WARNING" for s in signals))
 
+    def test_take_profit_critical_no_pullback_downgrades(self):
+        """强止盈+高点回落：盈利≥20% 但现价=当日最高（未回落）→ 不触发强止盈，退化为止盈提醒(防打断主升浪)"""
+        signals = HoldingMonitor.check_sell_signals(
+            stock_code="000001", stock_name="主升浪",
+            current_price=12.0,        # +20%
+            cost_price=10.0,
+            avg_vwap_price=10.0, ma5_price=10.0,
+            is_limit_up=False, was_limit_up_today=False,
+            day_high_price=12.0,       # 现价=最高，回落 0%
+        )
+        self.assertFalse(any(s["type"] == "逢高止盈" for s in signals))
+        self.assertTrue(any(s["type"] == "止盈提醒" and s["level"] == "WARNING" for s in signals))
+
+    def test_take_profit_critical_with_pullback(self):
+        """盈利≥20% 且自当日高点回落≥5% → 触发强止盈 HIGH"""
+        signals = HoldingMonitor.check_sell_signals(
+            stock_code="000001", stock_name="回落股",
+            current_price=12.0,        # +20%
+            cost_price=10.0,
+            avg_vwap_price=10.0, ma5_price=10.0,
+            is_limit_up=False, was_limit_up_today=False,
+            day_high_price=12.8,       # 回落 (12.8-12)/12.8=6.25% ≥ 5%
+        )
+        self.assertTrue(any(s["type"] == "逢高止盈" and s["level"] == "HIGH" for s in signals))
+
+    def test_take_profit_critical_pullback_below_threshold(self):
+        """盈利≥20% 但回落<5% → 仍不触发强止盈，只给止盈提醒"""
+        signals = HoldingMonitor.check_sell_signals(
+            stock_code="000001", stock_name="小回落",
+            current_price=12.0,        # +20%
+            cost_price=10.0,
+            avg_vwap_price=10.0, ma5_price=10.0,
+            is_limit_up=False, was_limit_up_today=False,
+            day_high_price=12.3,       # 回落 (12.3-12)/12.3=2.4% < 5%
+        )
+        self.assertFalse(any(s["type"] == "逢高止盈" for s in signals))
+        self.assertTrue(any(s["type"] == "止盈提醒" and s["level"] == "WARNING" for s in signals))
+
     def test_time_stop_loss(self):
         """时间止损：持仓 >= 3 天且未盈利触发 WARNING"""
         signals = HoldingMonitor.check_sell_signals(
@@ -136,3 +176,33 @@ class TestHoldingMonitor(unittest.TestCase):
             buy_strategy="低吸战法",
         )
         self.assertTrue(any(s["type"] == "破位止损" for s in signals))
+
+
+class TestCountTradingDays(unittest.TestCase):
+    """时间止损改交易日计算：count_trading_days 日历精确计数 + 工作日回退"""
+
+    def test_日历精确计数(self):
+        from core.trade_calendar import count_trading_days
+        with patch("core.trade_calendar._ensure_synced"), \
+             patch("database.services.TradeCalendarManager.count_trading_days", return_value=2):
+            n = count_trading_days(datetime.date(2026, 8, 3), datetime.date(2026, 8, 7))
+        self.assertEqual(n, 2)
+
+    def test_日历不可用时工作日回退(self):
+        """周五买入→周一 = 1 个交易日（回退按工作日）——消除自然日跨周末误触发"""
+        from core.trade_calendar import count_trading_days
+        fri = datetime.date(2026, 8, 7)   # 周五
+        mon = datetime.date(2026, 8, 10)  # 周一
+        with patch("core.trade_calendar._ensure_synced"), \
+             patch("database.services.TradeCalendarManager.count_trading_days", return_value=None):
+            # 同 monitor_core 口径：count(buy+1, today]
+            n = count_trading_days(fri + datetime.timedelta(days=1), mon)
+        self.assertEqual(n, 1)  # 只数到周一
+
+    def test_当天买入0交易日(self):
+        from core.trade_calendar import count_trading_days
+        day = datetime.date(2026, 8, 7)
+        with patch("core.trade_calendar._ensure_synced"), \
+             patch("database.services.TradeCalendarManager.count_trading_days", return_value=None):
+            n = count_trading_days(day + datetime.timedelta(days=1), day)
+        self.assertEqual(n, 0)  # 区间空 → 0

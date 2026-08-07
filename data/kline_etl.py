@@ -26,6 +26,15 @@ logger = logging.getLogger(__name__)
 _disabled_sources: set = set()
 _source_fail_count: dict = {}
 
+# 启动时恢复今日已熔断源（如东财被限流）：看门狗重启后的新进程不重打被限流源
+try:
+    from data.core import source_circuit_status
+    _restored_blocked = {k for k, v in source_circuit_status().items() if v.get("blocked")}
+    if "东财" in _restored_blocked:
+        _disabled_sources.add("东财")
+except Exception:
+    pass
+
 # 进程内日线同步互斥锁：同刻只允许一个 ETL（run/run_serial）在跑。
 # 防跨天重叠——网络差时昨日任务可能拖到今日 18:01 仍未结束，新任务再起会并发
 # upsert 同一张表（SQLite 写锁竞争 + 重复劳动）。已在跑时新调用直接跳过，不排队。

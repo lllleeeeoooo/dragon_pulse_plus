@@ -25,7 +25,7 @@ class HoldingMonitor:
     │  2   │ 破位止损  │ HIGH     │ 打板股: 跌破VWAP; 低吸股: 跌破MA5 │
     │  3   │ 情绪到顶  │ WARNING  │ 连板>=8 且 炸板率>35%              │
     │  4   │ 时间止损  │ WARNING  │ 持仓>=3天 且 未盈利                 │
-    │  5   │ 逢高止盈  │ HIGH     │ 盈利>=20%(强); >=15%(提醒)         │
+    │  5   │ 逢高止盈  │ HIGH     │ 盈利>=20% 且 自当日高点回落>=5%(强); >=15%(提醒) │
     └──────┴──────────┴──────────┴──────────────────────────────────┘
 
     策略区分（规则2）：
@@ -46,7 +46,8 @@ class HoldingMonitor:
         market_max_lbc: int = 5,
         market_zhaban_rate: float = 20.0,
         holding_days: int = 0,
-        buy_strategy: str = ""
+        buy_strategy: str = "",
+        day_high_price: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
         检查单只持仓股票是否触卖出/减仓/止损信号
@@ -120,13 +121,20 @@ class HoldingMonitor:
             })
 
         # ====== 规则 5：逢高止盈 ======
-        # 20%+ 强止盈(HIGH)：建议锁定利润
+        # 20%+ 强止盈(HIGH)：需同时从当日最高点回落 TAKE_PROFIT_HIGH_PULLBACK_PCT 才触发
+        #   （防打断主升浪/妖股连板——只在高点开始回落时锁定利润）
         # 15%~20% 提醒(WARNING)：建议设移动止盈或逢高减仓
-        if profit_pct >= settings.TAKE_PROFIT_CRITICAL_PCT:
+        pullback_ok = True  # 高点数据缺失(day_high_price<=0)时按旧行为处理（退化为纯盈利触发）
+        if day_high_price > 0:
+            # 现价≥当日最高(未回落) → 回落率≤0 → 不触发强止盈（防打断主升浪）
+            pullback_ok = (day_high_price - current_price) / day_high_price * 100 >= \
+                settings.TAKE_PROFIT_HIGH_PULLBACK_PCT
+        if profit_pct >= settings.TAKE_PROFIT_CRITICAL_PCT and pullback_ok:
             signals.append({
                 "type": "逢高止盈",
                 "level": "HIGH",
-                "reason": f"标的 {stock_name}({stock_code}) 盈利已达 {profit_pct}%（超过{settings.TAKE_PROFIT_CRITICAL_PCT}%强止盈线），短线应锁定利润，逢高分批卖出！"
+                "reason": f"标的 {stock_name}({stock_code}) 盈利已达 {profit_pct}%（超过{settings.TAKE_PROFIT_CRITICAL_PCT}%强止盈线）"
+                          f"且自当日最高点回落≥{settings.TAKE_PROFIT_HIGH_PULLBACK_PCT}%，短线应锁定利润，逢高分批卖出！"
             })
         elif profit_pct >= settings.TAKE_PROFIT_WARN_PCT:
             signals.append({

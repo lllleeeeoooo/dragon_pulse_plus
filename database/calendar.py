@@ -19,6 +19,24 @@ class TradeCalendarManager:
             session.close()
 
     @staticmethod
+    def count_trading_days(start_date: str, end_date: str) -> Optional[int]:
+        """start~end(含)之间的交易日数；区间超出日历覆盖范围(±30天)返回 None，由调用方回退估算。"""
+        session = db_manager.get_session()
+        try:
+            earliest = session.query(TradeCalendar).order_by(TradeCalendar.trade_date.asc()).first()
+            latest = session.query(TradeCalendar).order_by(TradeCalendar.trade_date.desc()).first()
+            if earliest is None or latest is None:
+                return None
+            if start_date < earliest.trade_date or end_date > latest.trade_date:
+                return None
+            return session.query(TradeCalendar).filter(
+                TradeCalendar.trade_date >= start_date,
+                TradeCalendar.trade_date <= end_date
+            ).count()
+        finally:
+            session.close()
+
+    @staticmethod
     def sync_calendar(force: bool = False):
         """
         从 akshare 同步交易日历，保留 ±30 天数据，清理过期记录。

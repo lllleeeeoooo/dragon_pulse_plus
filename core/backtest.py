@@ -335,8 +335,13 @@ class AIBacktestEngine:
                                  available_cash: float, slippage: float) -> tuple:
         """
         尾盘博弈卖出：次日早盘兑现（不过 10:30）。
-        次日 open ≥ 成本×(1+TAIL_GAME_OPEN_GAP_PCT) → 视为高开，用当日 high 卖出（冲高兑现）；
+        次日 open ≥ 成本×(1+TAIL_GAME_OPEN_GAP_PCT) → 视为高开，在 open~high 之间按
+        TAIL_GAME_TAKE_RATIO 兑现（用中点而非不可成交的最高价，已避免乐观偏差）；
         否则按 open 卖出（开盘兑现/止损）。尾盘博弈持仓次日必清，绝不过夜第 2 天。
+
+        ⚠️ 已知局限（非 bug，数据模型所致）：回测仅用日线 OHLC（ohlc_cache），无分时分钟数据，
+        此处 high 为"全天最高价"，而实盘兑现窗口是 09:30-10:30。若全天高点出现在 10:30 之后，
+        回测会略高估兑现价（轻度 look-ahead）。精确修复需引入分钟级数据，超出当前日线回测数据模型。
         """
         remaining, closed = [], []
         for pos in positions:

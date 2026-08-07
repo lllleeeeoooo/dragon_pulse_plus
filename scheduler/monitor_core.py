@@ -10,7 +10,7 @@ from core.emotion_index import EmotionVector
 from core.strategies import MarketStyle
 from core.signal_flags import compute_signal_flags
 from core.holding_monitor import HoldingMonitor
-from core.trade_calendar import is_trading_day, get_previous_trading_day
+from core.trade_calendar import is_trading_day, get_previous_trading_day, count_trading_days
 from llm.sell_advisor import DynamicSellAdvisor
 from notifier.bark import bark_notifier
 from database.services import HoldingManager, RecommendationManager
@@ -58,6 +58,8 @@ class _MonitorCoreMixin:
         # "code:sig_type" -> 卖出 LLM 判"持有"冷却到期时间戳。
         # 按 (code, sig_type) 键控：一条信号判持有只冷却该信号，不蒙住同股更严重的新信号（审查#2）
         self._llm_sell_hold_until: Dict[str, float] = {}
+        # "code:sig_type" -> 卖出 LLM 判"持有"时的决策价（冷却破除判断：急跌≥阈值打破冷却）
+        self._llm_sell_hold_price: Dict[str, float] = {}
         self._alert_date: str = ""
         # 市场风格缓存（供 API 查询）
         self._current_market_style: Dict[str, str] = {}
@@ -106,6 +108,7 @@ class _MonitorCoreMixin:
             self._pending_sell_codes.clear()
             self._alerted_sell_signals.clear()
             self._llm_sell_hold_until.clear()
+            self._llm_sell_hold_price.clear()
             self._rec_auction_buy_evaluated = set()  # 推荐标的 09:26 一次性评估标记（新交易日重置）
             self._alert_date = today
             self._ma_cache.clear()
@@ -484,6 +487,9 @@ class _MonitorCoreMixin:
         """
         单次轮询检测逻辑
         """
+        # 周期时间预算起点：慢源(如东财限流后腾讯降级 ~80s)把单轮拖长时，超预算跳过非关键步骤，
+        # 保证单轮不触发看门狗 120s 自动重启（重启环根因是单轮周期过长，治本于周期预算）
+        self._cycle_started_at = time.time()
         # 交易日切换时重置去重状态
         self._reset_daily_state()
 
@@ -529,6 +535,12 @@ class _MonitorCoreMixin:
         # 4. 扫描全市场抢筹信号 + 自动买入 + 推送（已拆到 _scan_signals）
         self._scan_signals(spot_df, market_style, pending_recs, pending_codes, index_breaker_triggered)
 
+        # 周期时间预算：慢源拖累单轮超预算时跳过非关键策略/预警（尾盘/二波/炸板/情绪到顶/一致性），
+        # 提前收尾避免触发看门狗重启；卖出监控与抢筹买入扫描已在前置完成（安全优先）
+        if self._cycle_over_budget():
+            logger.info(f"单轮监控周期超预算({settings.MONITOR_CYCLE_BUDGET_SECONDS}s)，跳过非关键步骤提前收尾")
+            return
+
         # 尾盘博弈（14:30-15:00）：独立策略，闸门+LLM+AI_TAIL 持仓，次日早盘兑现（内部 is_tail_end_time 门控）
         self._scan_tail_game(spot_df, index_breaker_triggered)
 
@@ -542,6 +554,13 @@ class _MonitorCoreMixin:
 
         self._check_consistency_alert()
 
+    def _cycle_over_budget(self) -> bool:
+        """单轮监控周期是否已超出时间预算（慢源把单轮拖长时提前收尾，防触发看门狗 120s 重启）。
+        未记录起点（异常路径）时保守返回 False，不误跳过关键步骤。"""
+        start = getattr(self, "_cycle_started_at", None)
+        if start is None:
+            return False
+        return time.time() - start > settings.MONITOR_CYCLE_BUDGET_SECONDS
 
     def _notify_style_change(self, market_style):
         """市场风格切换通知（从 _check_realtime_market 拆出）"""
@@ -780,8 +799,9 @@ class _MonitorCoreMixin:
                         # 仍推送一次『预算待重评』提醒（独立去重）但**不锁** _alerted_burst_codes：
                         # 避免低排名候选的异动告警被无限推迟、信号短暂而漏报（审查#3），
                         # 同时下轮预算空出后仍可重新评估买入。
-                        if self._llm_buy_confirms_this_cycle >= settings.LLM_BUY_CONFIRM_PER_CYCLE:
-                            logger.debug(f"本轮买入 LLM 确认预算已用尽，{name}({code}) 推送待重评提醒")
+                        if (self._llm_buy_confirms_this_cycle >= settings.LLM_BUY_CONFIRM_PER_CYCLE
+                                or self._cycle_over_budget()):
+                            logger.debug(f"本轮买入 LLM 确认预算已用尽或单轮超预算，{name}({code}) 推送待重评提醒")
                             self._push_deferred_burst_alert(
                                 code=code, name=name, price=price, change_pct=change_pct,
                                 vol_ratio=vol_ratio, amt_billion=amt_billion,
@@ -862,14 +882,16 @@ class _MonitorCoreMixin:
                 burst_codes_for_fund.append(code)
 
             # 4.5 大单抱团监控：对命中标的验证主力资金（含流通市值分级阈值）
-            cap_map = {}
-            if not spot_df.empty and "circ_market_cap" in spot_df.columns:
-                for _, srow in spot_df.iterrows():
-                    c = str(srow.get("code", ""))
-                    cap = float(srow.get("circ_market_cap", 0))
-                    if c and cap > 0:
-                        cap_map[c] = cap
-            self._check_fund_inflow_alert(burst_codes_for_fund[:3], cap_map)
+            # 周期预算：慢源拖累单轮超预算时跳过（仅日志/提示类，非买入闸门，可牺牲）
+            if not self._cycle_over_budget():
+                cap_map = {}
+                if not spot_df.empty and "circ_market_cap" in spot_df.columns:
+                    for _, srow in spot_df.iterrows():
+                        c = str(srow.get("code", ""))
+                        cap = float(srow.get("circ_market_cap", 0))
+                        if c and cap > 0:
+                            cap_map[c] = cap
+                self._check_fund_inflow_alert(burst_codes_for_fund[:3], cap_map)
 
     def _scan_tail_game(self, spot_df, index_breaker_triggered):
         """
@@ -1585,6 +1607,7 @@ class _MonitorCoreMixin:
                         )
 
         price_updates = []  # (code, price, holding_type)，循环内收集、循环后一次性批量写库
+        _tdays_cache: Dict[str, int] = {}  # buy_date -> 交易日持仓天数（每轮每只持仓算一次）
         for holding in active_holdings:
             code = holding["code"]
             stock_data = spot_df[spot_df["code"] == code]
@@ -1688,15 +1711,19 @@ class _MonitorCoreMixin:
                             float(row.get("high", curr_price)) +
                             float(row.get("low", curr_price))) / 4.0
 
-                # 计算持仓天数
+                # 计算持仓天数（按交易日：时间止损改交易日口径，避免自然日跨周末误触发）
                 buy_date_str = holding.get("buy_date", "")
                 holding_days = 0
                 if buy_date_str:
-                    try:
-                        buy_dt = datetime.datetime.strptime(buy_date_str, "%Y-%m-%d")
-                        holding_days = (datetime.datetime.now() - buy_dt).days
-                    except ValueError:
-                        pass
+                    if buy_date_str not in _tdays_cache:
+                        try:
+                            buy_dt = datetime.datetime.strptime(buy_date_str, "%Y-%m-%d").date()
+                            # count(buy_dt+1, today]：与旧口径"今日-买入日"一致，但只数交易日
+                            _tdays_cache[buy_date_str] = count_trading_days(
+                                buy_dt + datetime.timedelta(days=1), datetime.date.today())
+                        except ValueError:
+                            _tdays_cache[buy_date_str] = 0
+                    holding_days = _tdays_cache[buy_date_str]
 
                 signals = HoldingMonitor.check_sell_signals(
                     stock_code=code,
@@ -1710,7 +1737,8 @@ class _MonitorCoreMixin:
                     market_max_lbc=market_max_lbc if market_max_lbc > 0 else 5,
                     market_zhaban_rate=market_zhaban_rate if market_zhaban_rate > 0 else 20.0,
                     holding_days=holding_days,
-                    buy_strategy=holding.get("buy_strategy", "")
+                    buy_strategy=holding.get("buy_strategy", ""),
+                    day_high_price=float(row.get("high", 0) or 0),
                 )
 
                 hold_type = holding.get("holding_type", "MANUAL")
@@ -1742,20 +1770,31 @@ class _MonitorCoreMixin:
                             continue
 
                         # B方案：除绝对止损(硬护栏)外，断板/破位/止盈/时间止损 由 LLM 复核决定
+                        # 周期预算：单轮超预算时跳过 LLM 复核，直接按规则卖（安全优先，避免 LLM 阻塞把
+                        # 单轮拖过看门狗阈值触发重启）
                         decision_source = "rule"
-                        if sig_type != "绝对止损":
+                        if sig_type != "绝对止损" and not self._cycle_over_budget():
                             # LLM 复核冷却：判"持有"后 N 秒内不重复咨询，避免持续信号每 15s
                             # 轮询都阻塞调 LLM(20-60s)；冷却到期后携最新行情重新复核（审计#3风控缺口的另一面）
                             _hold_key = f"{code}:{sig_type}"  # 冷却按信号类型区分（审查#2）
                             if time.time() < self._llm_sell_hold_until.get(_hold_key, 0):
-                                continue
+                                # 冷却中急跌破局：现价较 LLM 决策价急跌 ≥LLM_SELL_COOLDOWN_BREAK_PCT%
+                                # → 打破冷却立即重新评估（防闪崩/退潮时冷却期硬扛砸穿止损；绝对止损仍兜底）
+                                _hold_px = self._llm_sell_hold_price.get(_hold_key, 0)
+                                if not (_hold_px > 0 and
+                                        curr_price < _hold_px * (1 - settings.LLM_SELL_COOLDOWN_BREAK_PCT / 100)):
+                                    continue
                             decision_source, do_sell = self._llm_confirm_sell(
                                 holding, sig, curr_price, curr_change_pct, holding_days)
                             if not do_sell:
                                 self._llm_sell_hold_until[_hold_key] = time.time() + settings.LLM_SELL_HOLD_COOLDOWN_SECONDS
+                                self._llm_sell_hold_price[_hold_key] = curr_price
                                 logger.info(f"LLM 判持有: {holding.get('name')}({code}) {sig_type} 不卖出，"
                                             f"{settings.LLM_SELL_HOLD_COOLDOWN_SECONDS}s 内不重复咨询")
                                 continue  # LLM 判持有 → 不卖（不落去重标记，冷却到期后重新复核）
+                            # LLM 判出货 → 卖：清理该信号冷却状态
+                            self._llm_sell_hold_until.pop(_hold_key, None)
+                            self._llm_sell_hold_price.pop(_hold_key, None)
 
                         self._sell_sig_set(code, hold_type).add(sig_type)
                         sell_px = curr_price

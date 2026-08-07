@@ -39,7 +39,8 @@ class Settings(BaseSettings):
     ABSOLUTE_STOP_LOSS_PCT: float = Field(default=-7.0, description="绝对止损线(%)，亏损超过此值无条件触发卖出")
     TIME_STOP_LOSS_DAYS: int = Field(default=3, description="时间止损天数，持仓超过N天且未盈利则触发警告")
     TAKE_PROFIT_WARN_PCT: float = Field(default=15.0, description="止盈提醒线(%)，盈利超过此值触发WARNING")
-    TAKE_PROFIT_CRITICAL_PCT: float = Field(default=20.0, description="强止盈线(%)，盈利超过此值且从高点回落则触发CRITICAL")
+    TAKE_PROFIT_CRITICAL_PCT: float = Field(default=20.0, description="强止盈线(%)，盈利超过此值触发CRITICAL")
+    TAKE_PROFIT_HIGH_PULLBACK_PCT: float = Field(default=5.0, description="强止盈从当日最高点回落比例下限(%)——盈利≥强止盈线且从高点回落≥此值才触发CRITICAL(防打断主升浪连板)；高点数据缺失时按触发处理")
 
     # ==================== Bark 推送配置 ====================
     BARK_TOKEN: str = Field(default="", description="Bark 推送 Device Key")
@@ -53,11 +54,13 @@ class Settings(BaseSettings):
     FUND_INFLOW_CAP_RATIO: float = Field(default=0.0005, description="主力资金扫货流通市值比例，与 FUND_INFLOW_MIN 取较大值作为动态阈值")
     MONITOR_INTERVAL_SECONDS: int = Field(default=15, description="盘中实时快照轮询间隔(秒)")
     MONITOR_POOL_CACHE_SECONDS: int = Field(default=60, description="涨停/炸板池缓存刷新间隔(秒)")
+    MONITOR_CYCLE_BUDGET_SECONDS: int = Field(default=90, description="单轮监控周期时间预算(秒)——超过后跳过资金流/尾盘/二波/预警等非关键步骤提前收尾，防止慢源把单轮拖过看门狗120s阈值触发自动重启；须小于 WATCHDOG_STALL_SECONDS")
     WATCHDOG_STALL_SECONDS: int = Field(default=120, description="看门狗：主循环心跳超过此秒数未更新视为疑似卡死(数据源挂起/网络阻塞)，推送告警")
     WATCHDOG_CHECK_SECONDS: int = Field(default=20, description="看门狗检查间隔(秒)")
     WATCHDOG_AUTO_RESTART: bool = Field(default=True, description="看门狗检测卡死后自动拉起新 main.py 进程并退出当前进程")
     WATCHDOG_RESTART_COOLDOWN_MINUTES: int = Field(default=10, description="自动重启冷却：距上次自动重启不足此分钟再次卡死则停止自动重启(防循环)，交人工")
     LLM_SELL_HOLD_COOLDOWN_SECONDS: int = Field(default=1800, description="卖出 LLM 判「持有」后冷却(秒)，冷却期内不重复咨询，避免持续信号每 15s 阻塞调 LLM（默认 30 分钟）")
+    LLM_SELL_COOLDOWN_BREAK_PCT: float = Field(default=3.0, description="卖出 LLM 冷却破除：冷却期内现价较 LLM 判持有时的决策价急跌≥此比例(%)则打破冷却，立即重新评估卖出（防闪崩风控盲区）")
     LLM_BUY_CONFIRM_PER_CYCLE: int = Field(default=1, description="每轮监控周期最多同步 LLM 买入确认次数；预算用尽后其余候选留待下轮评估，控制同步 LLM 对 15s 主循环的阻塞时长（审查#1）")
     MONITOR_NEAR_LIMIT_RATIO: float = Field(default=0.84, description="逼近封板区间 = 涨停线 × 比值")
     NEAR_LIMIT_VOL_RATIO: float = Field(default=5.0, description="逼近封板信号：量比下限")
