@@ -10,7 +10,8 @@
 3. [持仓管理接口](#三持仓管理接口)
 4. [日志查询接口](#四日志查询接口)
 5. [定时任务手动触发接口](#五定时任务手动触发接口)
-6. [iOS 快捷指令配置指引](#六ios-快捷指令-shortcuts-配置指引)
+6. [数据缓存与回测接口](#六数据缓存与回测接口)
+7. [iOS 快捷指令配置指引](#七ios-快捷指令-shortcuts-配置指引)
 
 ---
 
@@ -37,6 +38,7 @@
 | **7** | 任务 | 手动触发盘前简报 | `POST` | `/jobs/pre-market` |
 | **8** | 任务 | 手动触发竞价观察 | `POST` | `/jobs/call-auction` |
 | **9** | 任务 | 手动触发盘后复盘 | `POST` | `/jobs/post-market` |
+| **10** | 数据 | 拉取/补拉全市场日线缓存 | `POST` | `/backtest/etl-kline` |
 
 ---
 
@@ -215,7 +217,35 @@ curl -X POST http://127.0.0.1:8000/jobs/pre-market -H "X-API-Key: your_key"
 
 ---
 
-## 六、iOS 快捷指令 (Shortcuts) 配置指引
+## 六、数据缓存与回测接口
+
+### 10. 拉取/补拉全市场日线缓存 `/backtest/etl-kline`
+
+- **HTTP 方法**: `POST`
+- **请求 URL**: `http://127.0.0.1:8000/backtest/etl-kline?start=20260701&end=20260806`
+- **Header**: `X-API-Key: <your_key>`（仅当 API_KEY 已配置且该接口启用鉴权时）
+- **功能**: 拉取回测区间内全市场历史日线到 `daily_kline` 表（断点续传，已完整覆盖的 code 自动跳过）。
+  - 默认**并行**拉取（`workers` 控制线程数）；
+  - `serial=true` 走**串行低QPS补拉**——逐只限速 + 多轮重试，每轮只重试未完整覆盖的 code，源限流/静默空返回时用，替代原 `_backfill_kline.py` 脚本。
+- **参数**:
+
+| 参数名 | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `start` | string | 是 | - | 起始日期 `YYYYMMDD` |
+| `end` | string | 是 | - | 结束日期 `YYYYMMDD` |
+| `workers` | int | 否 | `settings.KLINE_ETL_WORKERS` | 并行线程数（仅并行模式生效，建议保持低位防源限流） |
+| `serial` | bool | 否 | `false` | `true` 时走串行低QPS补拉（源限流时用） |
+| `max_rounds` | int | 否 | `59` | 串行补拉最大轮数，每轮只重试未完整覆盖的 code |
+
+- **注意**: 同步执行，全市场串行约 0.15s/只，首轮可能耗时数分钟；已有日线同步在跑时新调用直接返回跳过（进程内互斥，防跨天重叠，返回 `message` 而非 `error`）。
+- **响应示例** (serial 模式):
+```json
+{"code": 200, "data": {"universe": 2345, "pulled": 612, "remaining": 0, "rounds": 2, "rows": 62594}}
+```
+
+---
+
+## 七、iOS 快捷指令 (Shortcuts) 配置指引
 
 1. **新建快捷指令**: 打开"快捷指令" App → 点击"+"新建
 2. **添加"询问输入"**: 提示词设为"请输入股票代码"
