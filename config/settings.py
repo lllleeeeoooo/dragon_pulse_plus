@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     MONITOR_INTERVAL_SECONDS: int = Field(default=15, description="盘中实时快照轮询间隔(秒)")
     MONITOR_POOL_CACHE_SECONDS: int = Field(default=60, description="涨停/炸板池缓存刷新间隔(秒)")
     MONITOR_CYCLE_BUDGET_SECONDS: int = Field(default=90, description="单轮监控周期时间预算(秒)——超过后跳过资金流/尾盘/二波/预警等非关键步骤提前收尾，防止慢源把单轮拖过看门狗120s阈值触发自动重启；须小于 WATCHDOG_STALL_SECONDS")
+    SPOT_FETCH_PARALLEL: bool = Field(default=True, description="腾讯/新浪全市场行情是否并行分页抓取(串行28页~30s→并行~13s，东财限流降级时显著缓解慢源)；新浪反爬严格，若被临时封IP可关掉")
     WATCHDOG_STALL_SECONDS: int = Field(default=120, description="看门狗：主循环心跳超过此秒数未更新视为疑似卡死(数据源挂起/网络阻塞)，推送告警")
     WATCHDOG_CHECK_SECONDS: int = Field(default=20, description="看门狗检查间隔(秒)")
     WATCHDOG_AUTO_RESTART: bool = Field(default=True, description="看门狗检测卡死后自动拉起新 main.py 进程并退出当前进程")

@@ -326,6 +326,12 @@ class _MonitorCoreMixin:
         from scheduler.helpers import _record_job_run
         _record_job_run("job_monitor_loop", "盘中实时监控")
         logger.info(f"启动盘中实时轮询监控引擎 (轮询间隔: {settings.MONITOR_INTERVAL_SECONDS}秒)...")
+        # 配置校验：周期预算必须小于看门狗阈值，否则预算检查在看门狗之后触发、失去保护
+        if settings.MONITOR_CYCLE_BUDGET_SECONDS >= settings.WATCHDOG_STALL_SECONDS:
+            logger.warning(
+                f"MONITOR_CYCLE_BUDGET_SECONDS({settings.MONITOR_CYCLE_BUDGET_SECONDS}) "
+                f">= WATCHDOG_STALL_SECONDS({settings.WATCHDOG_STALL_SECONDS})：周期预算在看门狗之后才触发，"
+                f"等于关闭了『慢源提前收尾』保护，慢周期仍会触发看门狗重启。建议设 < 看门狗阈值(默认90)。")
         self._start_watchdog()  # 看门狗：主循环心跳停更时推送卡死告警
         self._notify_watchdog_recovered()  # 若为看门狗自动重启，推送『已恢复』并清理标记
 
@@ -498,9 +504,13 @@ class _MonitorCoreMixin:
 
         # 0. 刷新涨停/炸板池缓存（内部自带 60 秒间隔控制）
         self._refresh_pool_cache()
+        # 周期内推进心跳：慢源(东财限流后腾讯/新浪降级)把单轮拖长时，让看门狗知道"仍在推进只是慢"，
+        # 只对真正的单次卡死(>120s)报警，不再把"慢但活着的长周期"误判为停摆
+        self._heartbeat = time.time()
 
-        # 1. 获取全市场快照
+        # 1. 获取全市场快照（可能最慢：多源降级 spot 可达数十秒）
         spot_df = self._DF.get_realtime_spot()
+        self._heartbeat = time.time()
         if spot_df.empty:
             return
 
@@ -531,9 +541,11 @@ class _MonitorCoreMixin:
         # 7. 持仓卖出/止损信号监控 + 批量更新收益率（已拆到 _monitor_holdings）。
         # 前置到买入扫描之前：绝对止损等硬护栏不因买入 LLM 同步调用(20-60s)被拖后（审查#1）
         self._monitor_holdings(spot_df, active_holdings, market_max_lbc, market_zhaban_rate)
+        self._heartbeat = time.time()  # 卖出/止损监控完成，推进心跳
 
         # 4. 扫描全市场抢筹信号 + 自动买入 + 推送（已拆到 _scan_signals）
         self._scan_signals(spot_df, market_style, pending_recs, pending_codes, index_breaker_triggered)
+        self._heartbeat = time.time()  # 抢筹扫描完成，推进心跳
 
         # 周期时间预算：慢源拖累单轮超预算时跳过非关键策略/预警（尾盘/二波/炸板/情绪到顶/一致性），
         # 提前收尾避免触发看门狗重启；卖出监控与抢筹买入扫描已在前置完成（安全优先）
@@ -553,6 +565,7 @@ class _MonitorCoreMixin:
         self._check_emotion_top_alert(market_max_lbc, market_zhaban_rate)
 
         self._check_consistency_alert()
+        self._heartbeat = time.time()  # 本周期全部步骤完成，推进心跳
 
     def _cycle_over_budget(self) -> bool:
         """单轮监控周期是否已超出时间预算（慢源把单轮拖长时提前收尾，防触发看门狗 120s 重启）。

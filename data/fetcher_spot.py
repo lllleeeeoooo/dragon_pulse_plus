@@ -28,6 +28,58 @@ def _spot_fetch(func):
     return wrapper
 
 
+def _parallel_fetch_pages(url: str, make_params, parse_rows, indices, workers: int = 10) -> list:
+    """并行分页抓取：make_params(idx)->params；parse_rows(json)->rows。返回按 idx 排序合并的 rows。
+    任一页失败抛异常（由调用方回退串行/akshare）。每页 socket 超时用 _FETCH_SOCKET_TIMEOUT 兜底。"""
+    import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _one(idx):
+        r = requests.get(url, params=make_params(idx), timeout=_FETCH_SOCKET_TIMEOUT)
+        r.raise_for_status()
+        return idx, parse_rows(r.json())
+
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_one, i): i for i in indices}
+        for f in as_completed(futs):
+            results.append(f.result())
+    results.sort(key=lambda x: x[0])
+    rows = []
+    for _, rs in results:
+        rows.extend(rs)
+    return rows
+
+
+# ---- 并行抓取反爬熔断 ----
+# 并行分页请求频率高（腾讯28页/新浪59页并发），新浪/腾讯反爬可能封 IP。连续失败达阈值后
+# 自动切回串行（akshare），冷却期结束再重试并行——避免被限流时每轮仍白试并行。
+_SPOT_PARALLEL_FAIL_LIMIT = 2        # 连续失败次数 → 熔断该源并行
+_SPOT_PARALLEL_BLOCK_SECONDS = 600   # 熔断冷却(秒)，10 分钟后重试并行
+_parallel_fail_count: dict = {}
+_parallel_blocked_until: dict = {}
+
+
+def _parallel_allowed(source: str) -> bool:
+    """该源并行抓取是否允许（未处于反爬熔断冷却期）"""
+    return _time.time() >= _parallel_blocked_until.get(source, 0)
+
+
+def _parallel_ok(source: str):
+    """并行抓取成功，清零连续失败计数"""
+    _parallel_fail_count.pop(source, None)
+
+
+def _parallel_fail(source: str):
+    """并行抓取失败/返回空(疑似反爬限流)：连续失败达阈值则熔断该源并行，冷却后重试"""
+    _parallel_fail_count[source] = _parallel_fail_count.get(source, 0) + 1
+    if _parallel_fail_count[source] >= _SPOT_PARALLEL_FAIL_LIMIT:
+        _parallel_blocked_until[source] = _time.time() + _SPOT_PARALLEL_BLOCK_SECONDS
+        _parallel_fail_count[source] = 0
+        logger.warning(f"[{source}] 并行抓取连续失败{_SPOT_PARALLEL_FAIL_LIMIT}次疑似触发反爬/限流，"
+                       f"自动切换串行，{_SPOT_PARALLEL_BLOCK_SECONDS}s 后重试并行")
+
+
 _cached_total_amount: float = 0.0
 
 # 新浪 OHLC 补齐缓存（主源为腾讯时，避免每 15 秒轮询都全量拉新浪）
@@ -305,10 +357,8 @@ class _SpotMixin:
 
 
     @staticmethod
-    @_spot_fetch
-    def _fetch_spot_sina() -> pd.DataFrame:
-        """从新浪获取全市场实时行情并归一化列名"""
-        df = ak.stock_zh_a_spot()
+    def _normalize_sina_spot(df: pd.DataFrame) -> pd.DataFrame:
+        """新浪 raw 中文列 → 统一英文列（fetch 后公共归一化）"""
         if df is None or df.empty:
             return pd.DataFrame()
         df = df.rename(columns={
@@ -332,12 +382,69 @@ class _SpotMixin:
                 df[col] = default
         return df
 
+    @staticmethod
+    def _fetch_spot_sina_parallel(workers: int = 10) -> pd.DataFrame:
+        """新浪全市场行情并行分页抓取（num=100 达 API 上限，串行 ~74 页 → 并行）。
+        按字段名映射成与 akshare stock_zh_a_spot 同构的中文列（比位置映射稳健）。
+        注意：新浪反爬严格，并行高频请求可能被临时封 IP——失败由调用方回退 akshare 串行。"""
+        import re
+        import requests
+        url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+        count_url = ("http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                     "Market_Center.getHQNodeStockCount?node=hs_a")
+        page_size = 100  # 新浪 API 上限 100（akshare 默认 80，加大省 ~20% 请求）
+        base = {"sort": "symbol", "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "page",
+                "num": str(page_size)}
+        res = requests.get(count_url, timeout=_FETCH_SOCKET_TIMEOUT)
+        res.raise_for_status()
+        total_n = int(re.findall(r"\d+", res.text)[0])
+        n_pages = (total_n + page_size - 1) // page_size
+
+        def _make(idx):
+            return {**base, "page": str(idx + 1)}
+
+        def _parse(j):
+            return j if isinstance(j, list) else []
+
+        rows = _parallel_fetch_pages(url, _make, _parse, range(n_pages), workers)
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        return pd.DataFrame({
+            "代码": df["code"].astype(str),
+            "名称": df["name"].astype(str),
+            "最新价": pd.to_numeric(df["trade"], errors="coerce"),
+            "涨跌额": pd.to_numeric(df["pricechange"], errors="coerce"),
+            "涨跌幅": pd.to_numeric(df["changepercent"], errors="coerce"),
+            "昨收": pd.to_numeric(df["settlement"], errors="coerce"),
+            "今开": pd.to_numeric(df["open"], errors="coerce"),
+            "最高": pd.to_numeric(df["high"], errors="coerce"),
+            "最低": pd.to_numeric(df["low"], errors="coerce"),
+            "成交量": pd.to_numeric(df["volume"], errors="coerce"),
+            "成交额": pd.to_numeric(df["amount"], errors="coerce"),
+        })
 
     @staticmethod
     @_spot_fetch
-    def _fetch_spot_tencent() -> pd.DataFrame:
-        """从腾讯获取全市场实时行情并归一化列名"""
-        df = ak.stock_zh_a_spot_tx()
+    def _fetch_spot_sina() -> pd.DataFrame:
+        """从新浪获取全市场实时行情并归一化列名。
+        SPOT_FETCH_PARALLEL=True 时并行分页抓取，False 或并行失败回退 akshare 串行。"""
+        if settings.SPOT_FETCH_PARALLEL and _parallel_allowed("新浪"):
+            try:
+                df = _SpotMixin._fetch_spot_sina_parallel()
+                if df is None or df.empty:
+                    raise RuntimeError("并行抓取返回空(疑似被限流)")
+                _parallel_ok("新浪")
+                return _SpotMixin._normalize_sina_spot(df)
+            except Exception as e:
+                _parallel_fail("新浪")
+                logger.warning(f"新浪并行抓取失败，切串行: {e}")
+        return _SpotMixin._normalize_sina_spot(ak.stock_zh_a_spot())
+
+
+    @staticmethod
+    def _normalize_tencent_spot(df: pd.DataFrame) -> pd.DataFrame:
+        """腾讯 raw rank_list 列 → 统一英文列（fetch 后公共归一化）"""
         if df is None or df.empty:
             return pd.DataFrame()
         df = df.rename(columns={
@@ -373,6 +480,49 @@ class _SpotMixin:
             if col not in df.columns:
                 df[col] = default
         return df
+
+    @staticmethod
+    def _fetch_spot_tencent_parallel(workers: int = 10) -> pd.DataFrame:
+        """腾讯全市场行情并行分页抓取（offset 独立寻址，串行 28 页 ~30s → 并行 ~13s）。
+        返回与 akshare stock_zh_a_spot_tx 同构的原始 rank_list 列。"""
+        import requests
+        url = "https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList"
+        page_size = 200  # 腾讯 API 硬上限 200（加大返回空）
+        base = {"_appver": "11.17.0", "board_code": "aStock", "sort_type": "price",
+                "direct": "down", "count": str(page_size)}
+        r0 = requests.get(url, params={**base, "offset": "0"}, timeout=_FETCH_SOCKET_TIMEOUT)
+        r0.raise_for_status()
+        j0 = r0.json()
+        total = int(j0["data"]["total"])
+        n_pages = (total + page_size - 1) // page_size
+        first_rows = j0["data"].get("rank_list", [])
+        rest = []
+        if n_pages > 1:
+            def _make(idx):
+                return {**base, "offset": str(idx * page_size)}
+
+            def _parse(j):
+                return j.get("data", {}).get("rank_list", [])
+
+            rest = _parallel_fetch_pages(url, _make, _parse, range(1, n_pages), workers)
+        return pd.DataFrame(first_rows + rest).drop_duplicates(subset=["code"], ignore_index=True)
+
+    @staticmethod
+    @_spot_fetch
+    def _fetch_spot_tencent() -> pd.DataFrame:
+        """从腾讯获取全市场实时行情并归一化列名。
+        SPOT_FETCH_PARALLEL=True 时并行分页抓取，False 或并行失败回退 akshare 串行。"""
+        if settings.SPOT_FETCH_PARALLEL and _parallel_allowed("腾讯"):
+            try:
+                df = _SpotMixin._fetch_spot_tencent_parallel()
+                if df is None or df.empty:
+                    raise RuntimeError("并行抓取返回空(疑似被限流)")
+                _parallel_ok("腾讯")
+                return _SpotMixin._normalize_tencent_spot(df)
+            except Exception as e:
+                _parallel_fail("腾讯")
+                logger.warning(f"腾讯并行抓取失败，切串行: {e}")
+        return _SpotMixin._normalize_tencent_spot(ak.stock_zh_a_spot_tx())
 
 
     @staticmethod

@@ -352,6 +352,8 @@
 - **当日源熔断**：某源当日异常达 `SOURCE_FAIL_CIRCUIT_LIMIT=3` 次后熔断，当天不再调用该源（次日重置）。
 - **熔断状态跨重启持久化**：源熔断状态落盘 `logs/.source_circuit.json`，看门狗自动重启后的新进程当天恢复"已熔断源"，直接走备用源、不再重打被限流源（切断"重启→重打→再熔断→再重启"循环）。日线 ETL 启动时同样加载。
 - **东财全市场行情多主机轮换**（`_fetch_spot_eastmoney`）：东财 clist 端点按请求频率限流（实测连续 ~8 次请求即连接被 RemoteDisconnected 重置），akshare 默认 pz=100 分页拉全市场需 ~59 次请求必被断。改为临时补丁 akshare 分页层：① 加大 `pz=2000` 减少分页次数；② 逐页轮换 `82/92/push2/7/30.push2` 主机。解析仍交给 akshare（列口径一致）。
+- **腾讯/新浪并行抓页**（`SPOT_FETCH_PARALLEL`，默认 True）：腾讯/新浪全市场行情 akshare 串行分页慢（腾讯 28 页 ~30s、新浪 74 页 ~60s），改并行分页抓取（实测腾讯 8.7s、新浪 3.4s）。页数上限实测：**腾讯 `count` 硬上限 200**（加大返回空）、**新浪 `num` 上限 100**（已用满）。
+- **并行反爬自动切串行**：并行抓取连续失败 2 次（异常或返回空，疑似触发反爬/限流）→ 自动熔断该源并行、切回 akshare 串行，600s 冷却后重试并行；成功即清零计数。`SPOT_FETCH_PARALLEL=false` 恒走串行。新浪反爬严格，被临时封 IP 时系统会自动切串行，无需人工干预。
 - **抓取重试**：`FETCH_RETRY_COUNT=3`、`FETCH_RETRY_DELAY=2s`（指数退避）。
 - **涨停/炸板池失败退避**：刷新失败后 `POOL_CACHE_FAIL_BACKOFF_SECONDS=300s` 再试。
 - **日线 ETL**：`run_incremental` 拉近 30 天到今天的整个区间，断点续传跳过已完整覆盖 code；`run_serial` 串行低 QPS 补拉多轮收敛；进程内互斥锁 `_etl_lock` 防跨天重叠；失败 `logger.error` + Bark 系统告警。
@@ -367,6 +369,7 @@
 | MONITOR_INTERVAL_SECONDS | 15 | 盘中轮询间隔(秒) |
 | MONITOR_POOL_CACHE_SECONDS | 60 | 涨停/炸板池缓存间隔(秒) |
 | MONITOR_CYCLE_BUDGET_SECONDS | 90 | 单轮周期时间预算(秒)，超预算跳过非关键步骤防看门狗重启 |
+| SPOT_FETCH_PARALLEL | true | 腾讯/新浪行情并行分页抓取(腾讯页上限200/新浪100) |
 | VOL_BURST_THRESHOLD | 3.0 | 点火异动量比门槛 |
 | PRICE_BURST_THRESHOLD | 3.0 | 点火异动涨幅下限(%) |
 | PRICE_BURST_MAX / _20CM | 9.5 / 19.5 | 点火异动涨幅上限（主板/双创，已涨停不算） |

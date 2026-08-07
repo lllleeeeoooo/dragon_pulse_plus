@@ -320,7 +320,10 @@ class TestPureRegressions(unittest.TestCase):
             "volume": ["22125.00"], "turnover": ["296389"], "ltsz": ["16663.34"],
             "zsz": ["16663.34"], "pe_ttm": ["20.15"],
         })
-        with patch("akshare.stock_zh_a_spot_tx", return_value=raw):
+        # 测试串行归一化路径（市值单位转换）：关并行，避免走真实网络并行抓页
+        from config.settings import settings
+        with patch("akshare.stock_zh_a_spot_tx", return_value=raw), \
+             patch.object(settings, "SPOT_FETCH_PARALLEL", False):
             df = _SpotMixin._fetch_spot_tencent()
         self.assertAlmostEqual(float(df.iloc[0]["circ_market_cap"]), 16663.34e8, delta=1e7)
         self.assertAlmostEqual(float(df.iloc[0]["total_market_cap"]), 16663.34e8, delta=1e7)

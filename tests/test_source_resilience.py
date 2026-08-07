@@ -150,5 +150,137 @@ class TestCycleBudget(unittest.TestCase):
         fund.assert_not_called()  # 预算超时 → 跳过资金流检测
 
 
+class TestParallelSpotFetch(unittest.TestCase):
+    """腾讯/新浪 spot 并行分页抓取 + SPOT_FETCH_PARALLEL 开关 + 失败回退 + 反爬自动切串行"""
+
+    def setUp(self):
+        from data.fetcher_spot import _parallel_fail_count, _parallel_blocked_until
+        self._pf = _parallel_fail_count
+        self._pb = _parallel_blocked_until
+        self._pf.clear()
+        self._pb.clear()
+
+    def tearDown(self):
+        self._pf.clear()
+        self._pb.clear()
+
+    def _fake_tencent_raw(self):
+        return pd.DataFrame([{"code": "sh600001", "name": "X", "zxj": "10.0", "zdf": "1.0", "zd": "0.1",
+                              "volume": "1000", "turnover": "100000", "zf": "2.0", "hsl": "1.0",
+                              "lb": "1.0", "ltsz": "500000000", "zsz": "1000000000", "pe_ttm": "10"}])
+
+    def test_腾讯并行开启走并行(self):
+        from data.fetcher_spot import _SpotMixin
+        from config.settings import settings
+        with patch.object(settings, "SPOT_FETCH_PARALLEL", True), \
+             patch.object(_SpotMixin, "_fetch_spot_tencent_parallel",
+                          return_value=self._fake_tencent_raw()) as mp, \
+             patch("akshare.stock_zh_a_spot_tx") as ms:
+            r = _SpotMixin._fetch_spot_tencent()
+        mp.assert_called_once()
+        ms.assert_not_called()
+        self.assertEqual(r["code"].iloc[0], "600001")  # 前缀被归一化去掉
+
+    def test_腾讯并行失败回退akshare(self):
+        from data.fetcher_spot import _SpotMixin
+        from config.settings import settings
+        with patch.object(settings, "SPOT_FETCH_PARALLEL", True), \
+             patch.object(_SpotMixin, "_fetch_spot_tencent_parallel",
+                          side_effect=RuntimeError("boom")), \
+             patch("akshare.stock_zh_a_spot_tx",
+                   return_value=self._fake_tencent_raw()) as ms, \
+             patch.object(_SpotMixin, "_normalize_tencent_spot",
+                          side_effect=lambda df: df):
+            r = _SpotMixin._fetch_spot_tencent()
+        ms.assert_called_once()  # 并行失败 → 回退 akshare 串行
+
+    def test_腾讯并行关闭直接串行(self):
+        from data.fetcher_spot import _SpotMixin
+        from config.settings import settings
+        with patch.object(settings, "SPOT_FETCH_PARALLEL", False), \
+             patch.object(_SpotMixin, "_fetch_spot_tencent_parallel") as mp, \
+             patch("akshare.stock_zh_a_spot_tx",
+                   return_value=self._fake_tencent_raw()) as ms, \
+             patch.object(_SpotMixin, "_normalize_tencent_spot",
+                          side_effect=lambda df: df):
+            _SpotMixin._fetch_spot_tencent()
+        mp.assert_not_called()
+        ms.assert_called_once()
+
+    def test_并行分页合并按页排序(self):
+        from data.fetcher_spot import _parallel_fetch_pages
+
+        class _Resp:
+            def __init__(self, code):
+                self._code = code
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": {"rank_list": [{"code": self._code}]}}
+
+        def fake_get(url, params, timeout):
+            idx = int(params["offset"]) // 200
+            return _Resp(f"c{idx}")
+
+        with patch("requests.get", side_effect=fake_get):
+            rows = _parallel_fetch_pages("http://x", lambda i: {"offset": str(i * 200)},
+                                         lambda j: j["data"]["rank_list"], [2, 0, 1])
+        self.assertEqual([r["code"] for r in rows], ["c0", "c1", "c2"])  # 按页序合并
+
+    def test_新浪并行列映射(self):
+        from data.fetcher_spot import _SpotMixin
+        raw = [{"code": "sh600001", "name": "X", "trade": "10.5", "pricechange": "0.5",
+                "changepercent": "5.0", "settlement": "10.0", "open": "10.1", "high": "10.8",
+                "low": "10.0", "volume": 100000, "amount": 1000000}]
+
+        class _Resp:
+            text = "6000"
+
+            def raise_for_status(self):
+                pass
+
+        with patch("requests.get", return_value=_Resp()), \
+             patch("data.fetcher_spot._parallel_fetch_pages", return_value=raw):
+            df = _SpotMixin._fetch_spot_sina_parallel()
+        self.assertEqual(df["代码"].iloc[0], "sh600001")
+        self.assertEqual(df["最新价"].iloc[0], 10.5)
+        self.assertEqual(df["涨跌幅"].iloc[0], 5.0)
+        self.assertEqual(df["最高"].iloc[0], 10.8)
+
+    def test_并行连续失败自动熔断切串行(self):
+        """触发反爬/连续失败 2 次后，自动熔断并行、直接走串行（不再每轮白试并行）"""
+        from data.fetcher_spot import _SpotMixin
+        from config.settings import settings
+        with patch.object(settings, "SPOT_FETCH_PARALLEL", True), \
+             patch.object(_SpotMixin, "_fetch_spot_tencent_parallel",
+                          side_effect=RuntimeError("疑似反爬")) as mp, \
+             patch("akshare.stock_zh_a_spot_tx",
+                   return_value=self._fake_tencent_raw()) as ms, \
+             patch.object(_SpotMixin, "_normalize_tencent_spot", side_effect=lambda df: df):
+            _SpotMixin._fetch_spot_tencent()   # 失败1
+            _SpotMixin._fetch_spot_tencent()   # 失败2 → 熔断
+            _SpotMixin._fetch_spot_tencent()   # 熔断后：跳过并行，直接串行
+        self.assertEqual(mp.call_count, 2)      # 熔断后并行不再被调用
+        self.assertEqual(ms.call_count, 3)      # 每次都回退串行
+
+    def test_并行成功后清零失败计数不熔断(self):
+        """单次成功后清零连续失败计数，不误熔断"""
+        from data.fetcher_spot import _SpotMixin
+        from config.settings import settings
+        raw = self._fake_tencent_raw()
+        with patch.object(settings, "SPOT_FETCH_PARALLEL", True), \
+             patch.object(_SpotMixin, "_fetch_spot_tencent_parallel",
+                          side_effect=[RuntimeError("e1"), raw, raw]) as mp, \
+             patch("akshare.stock_zh_a_spot_tx", return_value=pd.DataFrame()) as ms, \
+             patch.object(_SpotMixin, "_normalize_tencent_spot", side_effect=lambda df: df):
+            _SpotMixin._fetch_spot_tencent()   # 失败1
+            _SpotMixin._fetch_spot_tencent()   # 成功 → 清零
+            _SpotMixin._fetch_spot_tencent()   # 并行仍允许（未熔断）
+        self.assertEqual(mp.call_count, 3)      # 并行始终被调用
+        self.assertEqual(ms.call_count, 1)      # 只有第一次失败回退串行
+
+
 if __name__ == "__main__":
     unittest.main()
