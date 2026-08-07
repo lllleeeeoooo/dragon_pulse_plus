@@ -111,6 +111,28 @@ class MarketIndexManager:
             session.close()
 
     @staticmethod
+    def get_index_3d_10d(code: str) -> tuple:
+        """按 code 板块返回大盘指数 3/10 日累计涨跌幅 (%, 从 market_index 表 close 计算)。
+        60→上证 sh_close，00→深证 sz_close，30→创业板 gem_close，688→上证。数据不足返回 (0,0)。"""
+        recs = MarketIndexManager.get_recent(11)
+        if len(recs) < 3:
+            return 0.0, 0.0
+        code = str(code)
+        key = "sh_close"
+        if code.startswith("00"):
+            key = "sz_close"
+        elif code.startswith(("30", "301")):
+            key = "gem_close"
+        closes = [float(r[key]) for r in recs if r.get(key)]
+        if len(closes) < 3:
+            return 0.0, 0.0
+        closes = closes[::-1]  # get_recent 返回倒序，反转为升序
+        latest = closes[-1]
+        idx_3d = round((latest / closes[-3] - 1) * 100, 2)
+        idx_10d = round((latest / closes[-10] - 1) * 100, 2) if len(closes) >= 10 else 0.0
+        return idx_3d, idx_10d
+
+    @staticmethod
     def get_recent(days: int = 5) -> List[Dict[str, Any]]:
         """获取最近 N 个交易日的大盘指数"""
         from database.models import MarketIndex

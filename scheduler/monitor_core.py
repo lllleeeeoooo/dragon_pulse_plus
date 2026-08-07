@@ -11,9 +11,11 @@ from core.strategies import MarketStyle
 from core.signal_flags import compute_signal_flags
 from core.holding_monitor import HoldingMonitor
 from core.trade_calendar import is_trading_day, get_previous_trading_day, count_trading_days
+from core.regulatory_yidong import RegulatoryYidongCalculator
 from llm.sell_advisor import DynamicSellAdvisor
 from notifier.bark import bark_notifier
 from database.services import HoldingManager, RecommendationManager
+from database.market_data import MarketIndexManager
 
 logger = logging.getLogger(__name__)
 
@@ -648,6 +650,78 @@ class _MonitorCoreMixin:
                 level="timeSensitive"
             )
 
+    def _get_stock_recent_pct_from_cache(self, code: str, limit_pct: float) -> tuple:
+        """从 daily_kline 缓存算【含今日涨停】的 3/10 日累计涨幅 (%, 现价按今日涨停价计)。
+        缓存覆盖不足时返回 (0,0)，由调用方放行（未知即放行）。"""
+        try:
+            from database.connection import db_manager
+            from database.models import DailyKline
+            session = db_manager.get_session()
+            try:
+                rows = session.query(DailyKline).filter(
+                    DailyKline.code == str(code)
+                ).order_by(DailyKline.trade_date.desc()).limit(11).all()
+            finally:
+                session.close()
+        except Exception:
+            return 0.0, 0.0
+        closes = [float(r.close) for r in rows if getattr(r, "close", 0)]
+        if len(closes) < 3:
+            return 0.0, 0.0
+        closes = closes[::-1]  # 升序
+        limit_price = closes[-1] * (1 + limit_pct / 100)  # 今日涨停价（假设封板）
+        recent_3d = round((limit_price / closes[-3] - 1) * 100, 2)
+        recent_10d = round((limit_price / closes[-10] - 1) * 100, 2) if len(closes) >= 10 else 0.0
+        return recent_3d, recent_10d
+
+    def _regulatory_blocks_buy(self, code: str) -> bool:
+        """盘中监管异动闸门：今日涨停是否触发交易所异动公告/停牌核查（一级/二级），是则拦截买入。
+        指数偏离度取 market_index 表；个股 3/10 日累计取 daily_kline 缓存（本地零网络）。
+        按 code 每日缓存一次；数据不足不拦截（未知即放行）。"""
+        if not settings.REGULATORY_GATE_ENABLED:
+            return False
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        cache = getattr(self, "_regulatory_block_cache", {})
+        if getattr(self, "_regulatory_cache_date", "") != today:
+            cache = {}
+            self._regulatory_block_cache = cache
+            self._regulatory_cache_date = today
+        if code in cache:
+            return cache[code]
+        limit_pct = 20.0 if str(code).startswith(("30", "688")) else 10.0
+        recent_3d, recent_10d = self._get_stock_recent_pct_from_cache(code, limit_pct)
+        block = False
+        if recent_3d or recent_10d:  # 数据足够才评估（0=缓存覆盖不足）
+            index_3d, index_10d = MarketIndexManager.get_index_3d_10d(code)
+            info = RegulatoryYidongCalculator.evaluate_stock_yidong(
+                code=code, name="",
+                recent_3d_pct=recent_3d, index_3d_pct=index_3d,
+                recent_10d_pct=recent_10d, index_10d_pct=index_10d)
+            block = info["level"] in ("WARNING_YIDONG", "CRITICAL_SERIOUS")
+            if block:
+                logger.info(f"[监管异动] {code} 买入拦截: {info['warning_msg'][:90]}")
+        cache[code] = block
+        return block
+
+    @staticmethod
+    def _compute_buy_cost(row, price: float, pre_close: float, vol_ratio: float) -> tuple:
+        """成交成本模型 → (cost_price, slippage_pct)。
+        普通信号按 AI_BUY_SLIPPAGE_PCT 滑点加价；逼近封板/高位放量信号默认按涨停价撮合
+        （AI_BUY_NEAR_LIMIT_FILL_LIMIT=True，打板资金实际多撮合在涨停附近，原 0.5% 滑点对回测过于乐观；
+        False 时退回 AI_BUY_SLIPPAGE_PCT + AI_BUY_SLIPPAGE_HOT_PCT 滑点模型）。"""
+        slippage = settings.AI_BUY_SLIPPAGE_PCT
+        if row.get("_signal_near_limit") or vol_ratio >= settings.NEAR_LIMIT_VOL_RATIO:
+            if settings.AI_BUY_NEAR_LIMIT_FILL_LIMIT:
+                # 逼近封板按涨停价成交（涨停线 = 昨收×(1+_limit_max%)）
+                limit_price = pre_close * (1 + float(row["_limit_max"]) / 100)
+                cost_price = round(limit_price, 2)
+                if price > 0:
+                    slippage = round((limit_price - price) / price * 100, 2)
+                return cost_price, slippage
+            slippage += settings.AI_BUY_SLIPPAGE_HOT_PCT
+        cost_price = round(price * (1 + slippage / 100), 2)
+        return cost_price, slippage
+
     def _scan_signals(self, spot_df, market_style, pending_recs, pending_codes, index_breaker_triggered):
         """第4步：扫描全市场抢筹信号 + 自动买入 + 推送（从 _check_realtime_market 拆出）"""
         # 4. 扫描全市场抢筹信号（四种类型）
@@ -777,12 +851,16 @@ class _MonitorCoreMixin:
                 # 存在任一可买概念（发酵/启动/主线高潮）即放行；无概念数据不否决（覆盖率有限）。
                 concept_blocks_buy = settings.CONCEPT_GATE_ENABLED and self._get_concept_blocks_buy(code)
                 concept_brief = self._get_stock_concept_tag(code)
-                should_buy = (not sector_blocks_buy) and (not concept_blocks_buy) and (not style_blocks_buy) and (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
+                # 监管异动闸门（评审补充）：今日涨停将触发交易所异动/停牌核查的禁止买入
+                regulatory_blocks_buy = self._regulatory_blocks_buy(code)
+                should_buy = (not sector_blocks_buy) and (not concept_blocks_buy) and (not regulatory_blocks_buy) and (not style_blocks_buy) and (not verdict_blocked) and cycle_allow and not index_breaker_triggered and (
                     (is_recommended and rec_condition_met) or is_high_signal
                 ) and not is_sealed
                 # 可观测性：候选未过买入闸门时，落 INFO 日志标注具体拦截原因，便于排查"为什么没买"
                 if not should_buy:
-                    if sector_blocks_buy:
+                    if regulatory_blocks_buy:
+                        _block = "监管异动(今日涨停将触发异动/停牌核查)"
+                    elif sector_blocks_buy:
                         _block = f"板块否决[{sector_industry or '-'} {sector_phase or '-'}{'·主线' if sector_mainline else '非主线'}]"
                     elif concept_blocks_buy:
                         _block = f"概念否决[{concept_brief or '全部概念明确负向'}]"
@@ -851,11 +929,8 @@ class _MonitorCoreMixin:
                                 # LLM/复核耗时数秒，期间其他候选可能已买入 → 二次过闸门后再执行
                                 self._auto_bought_codes.add(code)
                                 buy_reason = "复盘推荐" if is_recommended else signal_label
-                                # 成交滑点模型：模拟真实买入成本高于快照价（高位放量信号额外加滑点）
-                                slippage = settings.AI_BUY_SLIPPAGE_PCT
-                                if row["_signal_near_limit"] or vol_ratio >= settings.NEAR_LIMIT_VOL_RATIO:
-                                    slippage += settings.AI_BUY_SLIPPAGE_HOT_PCT
-                                cost_price = round(price * (1 + slippage / 100), 2)
+                                # 成交滑点模型：普通信号按滑点加价；逼近封板/高位放量信号默认按涨停价撮合
+                                cost_price, slippage = self._compute_buy_cost(row, price, pre_close, vol_ratio)
                                 HoldingManager.add_holding(
                                     code=code,
                                     name=name,
@@ -1642,22 +1717,29 @@ class _MonitorCoreMixin:
                 if holding.get("buy_date") == today:
                     continue
 
-                # 尾盘博弈次日早盘兑现（09:30-10:30）：AI_TAIL 持仓次日必清，绝不过夜第2天。
-                # 对齐回测 _process_tail_game_sells：高开≥2% 在 open~high 之间按 TAIL_GAME_TAKE_RATIO 兑现，
-                # 未高开按开盘价兑现/止损。
+                # 尾盘博弈次日早盘兑现：AI_TAIL 持仓次日必清，绝不过夜第2天。
+                # 未高开→按开盘价兑现/止损；高开→动态移动止盈（从当日最高回落≥TAIL_GAME_TRAIL_PULLBACK_PCT
+                # 实时价卖出，不再假设在开盘与最高点中点成交——原模型偏乐观），10:30 强平兜底（慢周期也不漏）。
                 if holding.get("holding_type") == "AI_TAIL" and \
-                        datetime.time(9, 30) <= datetime.datetime.now().time() <= datetime.time(10, 30):
+                        datetime.datetime.now().time() >= datetime.time(9, 30):
                     open_px = float(row.get("open", 0) or 0)
                     high_px = float(row.get("high", 0) or 0)
+                    curr_price = float(row.get("price", open_px) or open_px)
                     cost = float(holding.get("cost_price", 0) or 0)
                     if cost <= 0 or open_px <= 0:
                         continue
-                    if open_px >= cost * (1 + settings.TAIL_GAME_OPEN_GAP_PCT / 100):
-                        sell_px = open_px + (high_px - open_px) * settings.TAIL_GAME_TAKE_RATIO
-                        reason = "尾盘博弈-次日高开兑现"
-                    else:
+                    if open_px < cost * (1 + settings.TAIL_GAME_OPEN_GAP_PCT / 100):
                         sell_px = open_px
                         reason = "尾盘博弈-次日开盘兑现"
+                    elif datetime.datetime.now().time() >= datetime.time(10, 30):
+                        sell_px = curr_price
+                        reason = "尾盘博弈-次日10:30强平"
+                    elif high_px > open_px and (high_px - curr_price) / high_px * 100 >= \
+                            settings.TAIL_GAME_TRAIL_PULLBACK_PCT:
+                        sell_px = curr_price
+                        reason = "尾盘博弈-次日冲高回落止盈"
+                    else:
+                        continue  # 高开且未回落：持有等下一轮（10:30 强平兜底）
                     sell_px = round(sell_px * (1 - settings.AI_SELL_SLIPPAGE_PCT / 100), 2)
                     HoldingManager.close_holding(code=code, holding_type="AI_TAIL", sell_price=sell_px)
                     self._sell_sig_set(code, "AI_TAIL").add("尾盘博弈兑现")

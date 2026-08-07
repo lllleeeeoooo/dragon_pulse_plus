@@ -183,6 +183,10 @@ class TestWatchdog(unittest.TestCase):
         self._ar = patch("scheduler.monitor_core.settings.WATCHDOG_AUTO_RESTART", False)
         self._ar.start()
         self.addCleanup(self._ar.stop)
+        # 隔离本地 .env 覆盖（用户可能把看门狗阈值调大），固定阈值测逻辑本身
+        self._ws = patch("scheduler.monitor_core.settings.WATCHDOG_STALL_SECONDS", 120)
+        self._ws.start()
+        self.addCleanup(self._ws.stop)
 
     def test_卡死推送一次_恢复后复位(self):
         with patch("scheduler.monitor_core.bark_notifier.send") as bark:

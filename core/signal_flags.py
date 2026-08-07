@@ -39,8 +39,14 @@ def compute_signal_flags(spot_df: pd.DataFrame, dragons: Dict[str, float] = None
     df["amt_billion"] = df["amount"].astype(float) / 1e8
 
     # 辅助列：低开猛拉的拉升强度 = (现价-开盘) / (最高-最低)
+    # 分母保护：价差低于昨收×RALLY_DENOM_MIN_RATIO 时按昨收×该比例计，避免早盘微小区间把强度刷到 1.0 误触发
     price_range = df["high"].astype(float) - df["low"].astype(float)
-    rally_strength = (df["price"].astype(float) - df["open"].astype(float)) / price_range.replace(0, 1)
+    _range_floor = df["pre_close"].astype(float) * settings.RALLY_DENOM_MIN_RATIO
+    _denom = pd.concat([price_range, _range_floor], axis=1).max(axis=1)
+    rally_strength = (df["price"].astype(float) - df["open"].astype(float)) / _denom.replace(0, 1)
+    # 拉升幅度（%昨收）：现价相对开盘的涨幅，过滤单笔数百手拉高的假信号（昨收缺失时 NaN → 不触发）
+    _rally_pct = (df["price"].astype(float) - df["open"].astype(float)) / \
+        df["pre_close"].astype(float).replace(0, float("nan")) * 100
 
     # 按板块区分涨停线：主板 10cm vs 双创 20cm（科创板已在源头过滤，此处主要区分创业板 300）
     is_main_board = df["code"].astype(str).str.match(r"^(60|00)")
@@ -65,6 +71,7 @@ def compute_signal_flags(spot_df: pd.DataFrame, dragons: Dict[str, float] = None
         (df["open"].astype(float) < df["pre_close"].astype(float) * settings.LOW_OPEN_DEV) &
         (df["volume_ratio"] > settings.RALLY_VOL_RATIO) &
         (rally_strength > settings.RALLY_STRENGTH_MIN) &
+        (_rally_pct >= settings.RALLY_MIN_PCT) &  # 拉升幅度下限，过滤单笔拉高假信号
         (df["change_pct"] > 0)
     )
     df["_signal_amplitude"] = (

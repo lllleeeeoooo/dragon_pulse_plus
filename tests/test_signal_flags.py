@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """compute_signal_flags 纯函数单元测试（实盘 _scan_signals 与回测共用的信号口径）"""
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -71,6 +72,38 @@ class TestSignalFlags(unittest.TestCase):
         df = compute_signal_flags(spot)
         self.assertFalse(bool(df.iloc[0]["_signal_low_open_rally"]))  # OHLC 缺失不触发
         self.assertTrue(bool(df.iloc[0]["_signal_burst"]))           # 其余信号正常
+
+    def test_低开猛拉默认配置仍触发(self):
+        """加固后（分母保护+拉升幅度下限）默认口径下正常低开猛拉仍触发"""
+        spot = _spot([
+            # 低开<98% + 拉回昨收上方 + 放量：拉升强度 0.875>0.8，拉升幅度 7%≥2%
+            ("600003", "C", 10.4, 4.0, 4e8, 4.0, 10.5, 9.7, 9.7, 10.0, 7.0),
+        ])
+        df = compute_signal_flags(spot)
+        self.assertTrue(bool(df.iloc[0]["_signal_low_open_rally"]))
+
+    def test_低开猛拉拉升幅度下限过滤(self):
+        """仅小幅度拉升(拉升幅度<2%)虽强度高也不触发（防单笔拉高假信号）"""
+        from config.settings import settings
+        with patch.object(settings, "LOW_OPEN_DEV", 1.0):  # 放宽低开判定，隔离测试拉升幅度条件
+            spot = _spot([
+                # 强度 (10.1-10.0)/(10.1-10.0)=1.0>0.8，但拉升幅度 1%<2% → 不触发
+                ("600001", "A", 10.1, 1.0, 4e8, 4.0, 10.1, 10.0, 10.0, 10.0, 1.0),
+            ])
+            df = compute_signal_flags(spot)
+        self.assertFalse(bool(df.iloc[0]["_signal_low_open_rally"]))
+
+    def test_低开猛拉分母保护防微小区间刷强度(self):
+        """价差低于昨收×RALLY_DENOM_MIN_RATIO 时用昨收×比例作分母，避免早盘微小区间刷到 1.0"""
+        from config.settings import settings
+        with patch.object(settings, "LOW_OPEN_DEV", 1.0), \
+             patch.object(settings, "RALLY_MIN_PCT", 0.1):  # 关闭拉升幅度过滤，隔离测试分母保护
+            spot = _spot([
+                # 价差 0.02(<昨收×1%=0.1)，强度老算法 (10.0-9.98)/0.02=1.0 → 新算法 0.02/0.1=0.2<0.8 不触发
+                ("600001", "A", 10.0, 0.2, 4e8, 4.0, 10.0, 9.98, 9.98, 10.0, 0.2),
+            ])
+            df = compute_signal_flags(spot)
+        self.assertFalse(bool(df.iloc[0]["_signal_low_open_rally"]))
 
     def test_primary_signal_优先级(self):
         # 同命中 逼近封板 + 点火 → primary = 逼近封板

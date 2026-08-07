@@ -325,5 +325,35 @@ class TestDecisionSourceRecord(unittest.TestCase):
         self.assertEqual(h.decision_source, "llm")
 
 
+class TestBuyCostModel(unittest.TestCase):
+    """买入成交成本模型：逼近封板按涨停价撮合（评审：原 0.5% 滑点对打板过于乐观）"""
+
+    def test_逼近封板按涨停价撮合(self):
+        from scheduler.monitor_core import _MonitorCoreMixin
+        from config.settings import settings
+        row = {"_signal_near_limit": True, "_limit_max": 9.5}
+        with patch.object(settings, "AI_BUY_NEAR_LIMIT_FILL_LIMIT", True):
+            cost, slip = _MonitorCoreMixin._compute_buy_cost(row, 10.9, 10.0, 6.0)
+        self.assertEqual(cost, 10.95)  # 昨收10×1.095=涨停价
+        self.assertAlmostEqual(slip, (10.95 - 10.9) / 10.9 * 100, places=2)
+
+    def test_非逼近封板用普通滑点(self):
+        from scheduler.monitor_core import _MonitorCoreMixin
+        from config.settings import settings
+        row = {"_signal_near_limit": False, "_limit_max": 9.5}
+        with patch.object(settings, "AI_BUY_NEAR_LIMIT_FILL_LIMIT", True):
+            cost, slip = _MonitorCoreMixin._compute_buy_cost(row, 10.0, 10.0, 2.0)
+        self.assertEqual(cost, round(10.0 * (1 + 0.3 / 100), 2))  # 普通 0.3% 滑点
+        self.assertEqual(slip, 0.3)
+
+    def test_关闭涨停价撮合退回滑点模型(self):
+        from scheduler.monitor_core import _MonitorCoreMixin
+        from config.settings import settings
+        row = {"_signal_near_limit": True, "_limit_max": 9.5}
+        with patch.object(settings, "AI_BUY_NEAR_LIMIT_FILL_LIMIT", False):
+            cost, slip = _MonitorCoreMixin._compute_buy_cost(row, 10.9, 10.0, 6.0)
+        self.assertEqual(cost, round(10.9 * (1 + 0.5 / 100), 2))  # 0.3%+0.2% 高位滑点
+
+
 if __name__ == "__main__":
     unittest.main()

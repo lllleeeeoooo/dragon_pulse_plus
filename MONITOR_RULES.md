@@ -116,7 +116,7 @@
 | 信号 | 触发条件（全部满足） | 标签优先级 |
 |---|---|---|
 | **逼近封板** | 涨幅 ∈ [涨停线×0.84, 涨停线] 且 量比 > 5.0 | 1 |
-| **低开猛拉** | 开盘 < 昨收×0.98 且 量比 > 3.0 且 拉升强度 > 0.8 且 涨幅 > 0；拉升强度 = (现价−开盘)/(最高−最低) | 2 |
+| **低开猛拉** | 开盘 < 昨收×0.98 且 量比 > 3.0 且 拉升强度 > 0.8 且 拉升幅度 ≥ `RALLY_MIN_PCT=2.0%`（现价相对开盘，%昨收）且 涨幅 > 0；拉升强度 = (现价−开盘)/max(最高−最低, 昨收×`RALLY_DENOM_MIN_RATIO=1%`)（分母保护防早盘微小区间刷强度） | 2 |
 | **点火异动** | 量比 ≥ 3.0 且 涨幅 ≥ 3.0% 且 涨幅 < 涨停线（已涨停不算） | 3 |
 | **振幅放量** | 振幅 > 7.0% 且 量比 > 3.0 且 涨幅 > 3.0% | 4 |
 
@@ -148,7 +148,7 @@
 15. **买前复核**（`_recheck_buy_after_llm`）：LLM 等待期间价格变化，买前用最新快照复核——已封板→不买(下轮重试)；已跌停→不买(当日结束)；相对开盘回落>2%→不追；快照不可用→下轮重试。
 16. **二次过闸门** → 执行买入，记录滑点后成交价。
 
-**成交滑点模型**：买入成本 = 现价 × (1 + 滑点)。普通滑点 `AI_BUY_SLIPPAGE_PCT=0.3%`；逼近封板或量比≥5 的高位放量信号额外加 `AI_BUY_SLIPPAGE_HOT_PCT=0.2%`。
+**成交滑点模型**（`_compute_buy_cost`）：普通信号买入成本 = 现价 × (1 + `AI_BUY_SLIPPAGE_PCT=0.3%`)；**逼近封板/高位放量信号默认按涨停价撮合**（`AI_BUY_NEAR_LIMIT_FILL_LIMIT=True`，成本 = 昨收 × (1+涨停线)，打板资金实际多撮合在涨停附近，原 0.5% 滑点对回测过于乐观）；关闭该开关时退回 0.3%+`AI_BUY_SLIPPAGE_HOT_PCT=0.2%` 滑点模型。尾盘博弈/二波买入走普通滑点。
 
 **尾盘博弈**（14:30-15:00，`_scan_tail_game`）：候选 = 尾盘博弈信号（涨幅 2%~5% + 量比≥3 + 收阳 + 上影线占比≤0.3 + 收盘≥均价 VWAP）→ 站上 MA5/MA10（`TAIL_GAME_REQUIRE_MA=True`，MA 缺失**明确告警并放行**）→ 独立闸门 → 独立 LLM 确认（每轮 `TAIL_LLM_PER_CYCLE=1`）→ 买前复核 → AI_TAIL 持仓。次日 09:30-10:30 早盘兑现（见卖出节）。
 
@@ -167,6 +167,7 @@
 | 当日亏损熔断 | `DAILY_LOSS_CIRCUIT_BREAKER=-5%` | AI 持仓当日平均盈亏（相对昨收）≤ 此值停止买入 |
 | 分时形态 | `PATTERN_CHECK_MIN_AMOUNT=5亿` | 成交额≥5亿才检测分时形态；冲高回落/放量滞涨/天地板/尾盘砸盘 → 不买（TTL 缓存 300 秒） |
 | 板块集中度 | `MAX_AI_SECTOR_POSITIONS=2` | 同板块 AI 持仓已达 2 只则跳过 |
+| 监管异动 | `REGULATORY_GATE_ENABLED=true` | 今日涨停将触发交易所异动/停牌核查（一级/二级）→ 拦截（`daily_kline`+`market_index` 本地算） |
 | 已持仓 | — | 已持有该 code 不重复买 |
 
 **尾盘博弈独立闸门** `_tail_gates_open`：`TAIL_MAX_POSITIONS=2`（独立持仓）、`TAIL_MAX_DAILY_BUYS=2`（独立当日次数，不吃白天预算）、大盘熔断、已持仓、**共享**当日亏损熔断（AI_AUTO+AI_TAIL 合计）。
@@ -206,10 +207,10 @@
 
 ### 7.3 专项卖出（独立策略持仓）
 
-**尾盘博弈 AI_TAIL 次日早盘兑现**（09:30-10:30，绝不过夜第 2 天）：
-- 开盘 ≥ 成本×（1 + `TAIL_GAME_OPEN_GAP_PCT=2%`）→ 视为高开，在开盘价~当日最高之间按 `TAIL_GAME_TAKE_RATIO=0.5` 比例兑现（避免用不可成交的顶价）；
-- 未高开 → 按开盘价兑现/止损。
-- ⚠️ 回测局限：`_process_tail_game_sells` 用**全天最高价**（日线 OHLC 无分时数据）算冲高兑现，若全天高点出现在 10:30 之后回测会略高估兑现价；精确修复需引入分钟级数据，超出当前日线回测模型。
+**尾盘博弈 AI_TAIL 次日早盘兑现**（次日 09:30 起，绝不过夜第 2 天）：
+- 未高开（开盘 < 成本×（1+`TAIL_GAME_OPEN_GAP_PCT=2%`））→ 按开盘价兑现/止损；
+- **高开 → 动态移动止盈**（实盘）：从当日最高（09:30 起）回落 ≥ `TAIL_GAME_TRAIL_PULLBACK_PCT=3%` → 实时价卖出；未回落持有到 **10:30 强平**（慢周期也不漏）。不再"假设在开盘与最高点中点成交"（原模型偏乐观）。
+- **回测口径**（消除 look-ahead）：日线无分时数据，09:30-10:30 窗口最高价按 开盘×（1+`TAIL_GAME_MORNING_HIGH_CAP_PCT=5%`）封顶后按 `TAIL_GAME_TAKE_RATIO=0.5` 冲高一半兑现——全天最高出现在 10:30 之后也不虚高回测收益。
 
 **龙头二波 AI_SW**：
 - **突破前高兑现**：当日最高价 ≥ 第一波峰值（记录在持仓策略 `PEAK{price}` 中）→ 按最高价止盈卖出；
@@ -249,6 +250,7 @@
 - **一级异动警示（WARNING_YIDONG）**：`dev_3d >= dev_3d_limit - 6.0` → 提示"今日若再涨停必触发官方《交易异常波动公告》"。
 - **二级严重异动（CRITICAL_SERIOUS）**：`dev_10d >= REGULATORY_10D_LIMIT - 15.0`（即 10 日偏离 ≥ **85%**）**或** 10 日内异动次数 ≥ `MAX_YIDONG_COUNT_10D - 1`（即 ≥ **3 次**）→ 提示"再涨停极易触发停牌核查/重点监控，建议严格避开/逢高落袋"。
 - 10 日严重异动红线：`REGULATORY_10D_LIMIT=100%`。
+- **盘中买入闸门**（`REGULATORY_GATE_ENABLED=True`）：命中一级/二级 → 禁止自动买入（"今日涨停将触发异动/停牌核查"）。个股 3/10 日累计涨幅（含今日假设涨停）取 `daily_kline` 缓存，指数偏离度取 `market_index` 表（60→上证、00→深证、30→创业板），**本地零网络**；数据不足不拦截（未知即放行）。
 
 ---
 
@@ -377,6 +379,9 @@
 | NEAR_LIMIT_VOL_RATIO | 5.0 | 逼近封板量比下限 |
 | RALLY_VOL_RATIO | 3.0 | 低开猛拉/振幅放量量比下限 |
 | RALLY_STRENGTH_MIN | 0.8 | 低开猛拉拉升强度下限 |
+| RALLY_DENOM_MIN_RATIO | 0.01 | 低开猛拉分母保护：价差低于昨收×此比例时按昨收×比例计 |
+| RALLY_MIN_PCT | 2.0 | 低开猛拉最小拉升幅度(%昨收) |
+| AI_BUY_NEAR_LIMIT_FILL_LIMIT | true | 逼近封板/高位放量买入按涨停价撮合 |
 | LOW_OPEN_DEV | 0.98 | 低开判定：开盘/昨收上限 |
 | AMPLITUDE_SIGNAL_MIN | 7.0 | 振幅放量振幅下限(%) |
 | AMPLITUDE_CHANGE_MIN | 3.0 | 振幅放量涨幅下限(%) |
@@ -385,7 +390,9 @@
 | TAIL_GAME_VOL_RATIO | 3.0 | 尾盘博弈量比下限 |
 | TAIL_GAME_SHORT_UPPER_RATIO | 0.3 | 尾盘博弈上影线占比上限 |
 | TAIL_GAME_OPEN_GAP_PCT | 2.0 | 尾盘次日高开判定(%) |
-| TAIL_GAME_TAKE_RATIO | 0.5 | 尾盘高开兑现比例 |
+| TAIL_GAME_TAKE_RATIO | 0.5 | 尾盘回测高开兑现比例 |
+| TAIL_GAME_TRAIL_PULLBACK_PCT | 3.0 | 尾盘实盘高开动态止盈回落阈值(%)，10:30强平兜底 |
+| TAIL_GAME_MORNING_HIGH_CAP_PCT | 5.0 | 尾盘回测窗口最高价封顶(开盘×1+%) |
 | TAIL_MAX_DAILY_BUYS / TAIL_MAX_POSITIONS | 2 / 2 | 尾盘当日次数/持仓上限 |
 | TAIL_LLM_PER_CYCLE | 1 | 尾盘每轮 LLM 确认次数 |
 | SECOND_WAVE_RETREAT_MIN / MAX | 0.30 / 0.50 | 二波回撤区间 |
@@ -418,7 +425,8 @@
 | WATCHDOG_STALL_SECONDS / CHECK_SECONDS | 120 / 20 | 看门狗卡死判定/检查间隔(秒) |
 | WATCHDOG_AUTO_RESTART / COOLDOWN_MINUTES | True / 10 | 自动重启开关/冷却(分钟) |
 | SOURCE_FAIL_CIRCUIT_LIMIT | 3 | 源当日熔断次数 |
-| REGULATORY_MONITOR_ENABLED | True | 监管异动开关 |
+| REGULATORY_MONITOR_ENABLED | True | 监管异动计算开关 |
+| REGULATORY_GATE_ENABLED | True | 盘中买入监管异动闸门(一级/二级拦截) |
 | MAIN_BOARD_3D_DEV_LIMIT / GEM_3D / STAR_3D | 20 / 30 / 30 | 3日偏离度红线(%)（北交所硬编码45） |
 | REGULATORY_10D_LIMIT | 100.0 | 10日严重异动红线(%) |
 | MAX_YIDONG_COUNT_10D | 4 | 10日内异动次数上限 |

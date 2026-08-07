@@ -67,11 +67,15 @@ class Settings(BaseSettings):
     NEAR_LIMIT_VOL_RATIO: float = Field(default=5.0, description="逼近封板信号：量比下限")
     RALLY_VOL_RATIO: float = Field(default=3.0, description="低开猛拉/振幅放量信号：量比下限")
     RALLY_STRENGTH_MIN: float = Field(default=0.8, description="低开猛拉信号：拉升强度下限")
+    RALLY_DENOM_MIN_RATIO: float = Field(default=0.01, description="低开猛拉拉升强度分母保护：最高最低价差低于昨收×此比例时按昨收×此比例计(防早盘微小区间把强度刷到1.0误触发虚假点火)")
+    RALLY_MIN_PCT: float = Field(default=2.0, description="低开猛拉信号：现价相对开盘的拉升幅度下限(%昨收)，过滤单笔数百手拉高的假信号")
     LOW_OPEN_DEV: float = Field(default=0.98, description="低开猛拉信号：开盘价相对昨收的折扣上限（低于此视为低开）")
     AMPLITUDE_SIGNAL_MIN: float = Field(default=7.0, description="振幅放量信号：振幅下限(%)")
     AMPLITUDE_CHANGE_MIN: float = Field(default=3.0, description="振幅放量信号：涨幅下限(%)")
-    TAIL_GAME_OPEN_GAP_PCT: float = Field(default=2.0, description="尾盘博弈卖出：次日开盘涨幅≥此比例(%)视为高开，冲高兑现")
-    TAIL_GAME_TAKE_RATIO: float = Field(default=0.5, description="尾盘博弈卖出：高开时在开盘价与当日最高价之间按此比例兑现(0.5=冲高一半卖，避免用不可成交的顶价)")
+    TAIL_GAME_OPEN_GAP_PCT: float = Field(default=2.0, description="尾盘博弈卖出：次日开盘涨幅≥此比例(%)视为高开")
+    TAIL_GAME_TAKE_RATIO: float = Field(default=0.5, description="尾盘博弈回测卖出：高开时在开盘价与窗口最高价之间按此比例兑现(0.5=冲高一半卖，避免用不可成交的顶价)")
+    TAIL_GAME_TRAIL_PULLBACK_PCT: float = Field(default=3.0, description="尾盘博弈实盘卖出：次日高开后从当日最高(09:30起)回落≥此比例(%)触发动态止盈(实时价卖出)；未回落持有到 10:30 强平兜底")
+    TAIL_GAME_MORNING_HIGH_CAP_PCT: float = Field(default=5.0, description="尾盘博弈回测：次日09:30-10:30窗口最高价按 开盘×(1+此比例%) 封顶——日线无分钟数据，防用全天最高价(可能10:30后出现)虚高回测收益")
     TAIL_GAME_CHANGE_MIN: float = Field(default=2.0, description="尾盘博弈候选：当日涨幅下限(%)——低吸强势股，不追高(指南: 2%~5%)")
     TAIL_GAME_CHANGE_MAX: float = Field(default=5.0, description="尾盘博弈候选：当日涨幅上限(%)，超过视为追高剔除")
     TAIL_GAME_VOL_RATIO: float = Field(default=3.0, description="尾盘博弈候选：放量下限(量比)")
@@ -109,6 +113,7 @@ class Settings(BaseSettings):
     MAX_AI_SECTOR_POSITIONS: int = Field(default=2, description="同一板块 AI 持仓数量上限（板块集中度控制）")
     AI_BUY_SLIPPAGE_PCT: float = Field(default=0.3, description="AI 自动买入滑点(%)，模拟真实成交高于快照价")
     AI_BUY_SLIPPAGE_HOT_PCT: float = Field(default=0.2, description="高位放量信号(逼近封板等)额外滑点(%)")
+    AI_BUY_NEAR_LIMIT_FILL_LIMIT: bool = Field(default=True, description="逼近封板/高位放量买入按涨停价撮合成交(打板资金实际多撮合在涨停附近，原0.5%滑点对回测过于乐观)；false 时退回 AI_BUY_SLIPPAGE_PCT+HOT_PCT 滑点模型")
     AI_SELL_SLIPPAGE_PCT: float = Field(default=0.3, description="AI 自动卖出滑点(%)，模拟真实成交低于现价")
 
     # ==================== 股票过滤配置 ====================
@@ -118,6 +123,7 @@ class Settings(BaseSettings):
 
     # ==================== 交易所监管异动红线配置 ====================
     REGULATORY_MONITOR_ENABLED: bool = Field(default=True, description="是否开启交易所监管异动计算与风险提示")
+    REGULATORY_GATE_ENABLED: bool = Field(default=True, description="盘中买入监管异动闸门：今日涨停将触发交易所异动公告/停牌核查的标的禁止自动买入；数据不足不拦截(未知即放行)")
     MAIN_BOARD_3D_DEV_LIMIT: float = Field(default=20.0, description="主板 3 日偏离度异动红线 (%)")
     GEM_3D_DEV_LIMIT: float = Field(default=30.0, description="创业板 3 日偏离度异动红线 (%)")
     STAR_3D_DEV_LIMIT: float = Field(default=30.0, description="科创板 3 日偏离度异动红线 (%) — 科创板与创业板同为 20cm 涨停")

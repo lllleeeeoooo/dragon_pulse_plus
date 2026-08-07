@@ -108,6 +108,46 @@ class TestCircuitPersistence(unittest.TestCase):
         self.assertFalse(self._core.source_blocked("东财"))  # 昨天熔断，今天不恢复
 
 
+class TestRegulatoryGate(unittest.TestCase):
+    """盘中监管异动闸门：今日涨停将触发交易所异动/停牌核查的禁止买入（评审补充）"""
+
+    def setUp(self):
+        from scheduler.monitor_core import _MonitorCoreMixin
+        self.m = _MonitorCoreMixin()
+        self.m._regulatory_block_cache = {}
+        self.m._regulatory_cache_date = ""
+
+    def test_一级异动今日涨停触发拦截(self):
+        """3日偏离≥红线-6 → 今日涨停将触发异动公告 → 拦截"""
+        with patch.object(self.m, "_get_stock_recent_pct_from_cache", return_value=(18.0, 40.0)), \
+             patch("scheduler.monitor_core.MarketIndexManager.get_index_3d_10d",
+                   return_value=(1.0, 3.0)):
+            self.assertTrue(self.m._regulatory_blocks_buy("600001"))
+
+    def test_二级严重异动拦截(self):
+        """10日偏离≥85% → 停牌核查风险 → 拦截"""
+        with patch.object(self.m, "_get_stock_recent_pct_from_cache", return_value=(8.0, 86.0)), \
+             patch("scheduler.monitor_core.MarketIndexManager.get_index_3d_10d",
+                   return_value=(1.0, 1.0)):
+            self.assertTrue(self.m._regulatory_blocks_buy("600001"))
+
+    def test_正常偏离不拦截(self):
+        with patch.object(self.m, "_get_stock_recent_pct_from_cache", return_value=(5.0, 20.0)), \
+             patch("scheduler.monitor_core.MarketIndexManager.get_index_3d_10d",
+                   return_value=(1.0, 3.0)):
+            self.assertFalse(self.m._regulatory_blocks_buy("600001"))
+
+    def test_数据不足放行(self):
+        """daily_kline 缓存覆盖不足(返回0,0) → 未知即放行"""
+        with patch.object(self.m, "_get_stock_recent_pct_from_cache", return_value=(0.0, 0.0)):
+            self.assertFalse(self.m._regulatory_blocks_buy("600001"))
+
+    def test_开关关闭放行(self):
+        from config.settings import settings
+        with patch.object(settings, "REGULATORY_GATE_ENABLED", False):
+            self.assertFalse(self.m._regulatory_blocks_buy("600001"))
+
+
 class TestCycleBudget(unittest.TestCase):
     """Fix3：单轮监控周期时间预算——慢源拖累时跳过非关键步骤，防触发看门狗重启"""
 
