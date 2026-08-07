@@ -14,6 +14,7 @@ import pandas as pd
 
 from database.models import ConceptMember, ConceptCycle
 from database.connection import db_manager
+from database.ths_concept import ThsConceptTrendManager, _normalize_name
 from core.sector_cycle import SectorCycleMachine
 from core.concept_filter import is_thematic
 from config.settings import settings
@@ -178,6 +179,8 @@ class ConceptCycleManager:
             # 近5日(不含当日)各概念涨停家数序列
             recent = ConceptCycleManager._recent_zt_by_concept(session, trade_date, lookback=5)
             lookback = 5
+            # 同花顺概念指数趋势（独立维度，按规范化名匹配；当日无数据 → 空 dict 优雅跳过）
+            ths_map = ThsConceptTrendManager.get_trend_map_normalized(trade_date)
 
             saved = 0
             for concept, group in edf.groupby("concept"):
@@ -192,6 +195,19 @@ class ConceptCycleManager:
                 accel = zt_count - prev_zt
                 score = SectorCycleMachine.mainline_score(
                     zt_count, appear_days, accel, max_lbc, lookback)
+                # 同花顺指数趋势叠加：主线分加分 + 阶段明显修正（未匹配则 ths_chg_5d=None）
+                ths_chg_5d = None
+                ths = ths_map.get(_normalize_name(concept))
+                if ths and ths.get("chg_5d") is not None:
+                    ths_chg_5d = ths["chg_5d"]
+                    if settings.THS_SCORE_BONUS_WEIGHT > 0:
+                        ths_norm = max(0.0, min(ths_chg_5d / settings.THS_STRONG_CHG_PCT, 1.0))
+                        score = round(score + settings.THS_SCORE_BONUS_WEIGHT * ths_norm, 2)
+                    # 阶段修正（仅明显情形）：指数5日强且涨停少→发酵；指数5日弱且涨停多→退潮
+                    if ths_chg_5d >= settings.THS_STRONG_CHG_PCT and phase in ("启动", "冰点"):
+                        phase = "发酵"
+                    elif ths_chg_5d <= -settings.THS_STRONG_CHG_PCT and phase in ("发酵", "高潮"):
+                        phase = "退潮"
                 session.add(ConceptCycle(
                     trade_date=trade_date,
                     concept_name=concept,
@@ -202,6 +218,7 @@ class ConceptCycleManager:
                     prev_phase=prev_phase,
                     is_mainline=score >= settings.CONCEPT_MAINLINE_SCORE_THRESHOLD,
                     mainline_score=score,
+                    ths_chg_5d=ths_chg_5d,
                 ))
                 saved += 1
             session.commit()
@@ -296,6 +313,7 @@ class ConceptCycleManager:
                     "prev_phase": r.prev_phase,
                     "is_mainline": bool(r.is_mainline),
                     "mainline_score": r.mainline_score,
+                    "ths_chg_5d": r.ths_chg_5d,
                 }
                 for r in records
             ]

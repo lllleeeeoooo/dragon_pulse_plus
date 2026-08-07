@@ -136,7 +136,19 @@ class PostMarketAnalyzer:
                         f"主线分{score:.2f}")
                 if rep_str:
                     line += f"，代表：{rep_str}"
+                ths = item.get("ths_chg_5d")
+                if ths is not None:
+                    line += f"，指数5日{ths:+.1f}%"
                 lines.append(line)
+            # 同花顺概念指数独立强势概念（独立于涨停池的资金雷达，覆盖 375 概念）
+            try:
+                from database.ths_concept import ThsConceptTrendManager
+                strong = ThsConceptTrendManager.get_strong_concepts(top_n=8, min_chg_5d=5.0)
+                if strong:
+                    lines.append("同花顺概念指数强势(独立雷达): " + "、".join(
+                        f"{s['concept']}({s['chg_5d']:+.1f}%)" for s in strong))
+            except Exception:
+                pass
             return "\n".join(lines)
         except Exception as e:
             logger.warning(f"概念主线识别失败: {e}")

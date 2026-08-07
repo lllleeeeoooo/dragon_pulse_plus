@@ -4,7 +4,7 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from config.settings import settings
-from scheduler.daily_runner import job_pre_market, job_call_auction, job_post_market, job_kline_sync, job_data_check, job_holiday_news_summary
+from scheduler.daily_runner import job_pre_market, job_call_auction, job_post_market, job_kline_sync, job_data_check, job_ths_concept_sync, job_holiday_news_summary
 from scheduler.market_monitor import MarketMonitor
 
 # 配置统一 Log 输出格式
@@ -118,6 +118,16 @@ def main():
         name="15:30 日线同步"
     )
 
+    # 15:35 同花顺概念指数同步（独立任务：375概念板块指数历史→5日涨幅/量能，供复盘概念周期叠加）
+    scheduler.add_job(
+        job_ths_concept_sync,
+        trigger="cron",
+        hour=15,
+        minute=35,
+        id="job_ths_concept_sync",
+        name="15:35 同花顺概念指数同步"
+    )
+
     # 18:01 盘后深度复盘
     scheduler.add_job(
         job_post_market,
@@ -194,6 +204,7 @@ def main():
     logger.info("  09:26  竞价观察（竞价快照+推荐标的→LLM 买卖指令→Bark 推送）")
     logger.info("  09:30  盘中实时监控（15秒轮询，点火异动+板块联动+AI自动交易）")
     logger.info("  15:30  日线同步（串行摊速拉全市场日线，23:30前完成）")
+    logger.info("  15:35  同花顺概念指数同步（375概念板块指数→5日涨幅/量能，供概念周期叠加）")
     logger.info("  18:01  盘后深度复盘（情绪→风格→LLM复盘→指数/涨停池/板块落库→盈亏报告推送）")
     logger.info("  20:00  假日消息汇总（假期最后一天推送）")
     logger.info("Web 服务: http://127.0.0.1:8000 | 看板: /monitor | API文档: /docs")

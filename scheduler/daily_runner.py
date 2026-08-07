@@ -6,6 +6,7 @@ from scheduler.pre_market import job_pre_market
 from scheduler.auction import job_call_auction
 from scheduler.post_market import job_post_market, job_kline_sync
 from scheduler.data_check import job_data_check
+from scheduler.ths_concept import job_ths_concept_sync
 from scheduler.holiday import job_holiday_news_summary
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "job_post_market",
     "job_kline_sync",
     "job_data_check",
+    "job_ths_concept_sync",
     "job_holiday_news_summary",
 ]

@@ -267,7 +267,28 @@ class ConceptCycle(Base):
     prev_phase = Column(String(16), comment="上一交易日阶段")
     is_mainline = Column(Boolean, default=False, comment="是否主线概念")
     mainline_score = Column(Float, default=0.0, comment="主线分(涨停×持续×加速×高度归一化)")
+    ths_chg_5d = Column(Float, comment="同花顺概念板块指数5日涨幅(%)（独立维度，未匹配为NULL）")
     created_at = Column(DateTime, default=datetime.datetime.now)
+
+
+class ThsConceptTrend(Base):
+    """
+    同花顺概念板块指数趋势表（独立补充维度）
+    每日从同花顺概念板块指数历史计算：最新收盘/单日涨幅/5日涨幅/量能比。
+    与 concept_cycle 的"涨停池成员聚合"口径独立，供概念阶段与主线强弱交叉验证。
+    """
+    __tablename__ = "ths_concept_trend"
+    __table_args__ = (Index("idx_ths_concept_date", "concept_code", "trade_date", unique=True),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    concept_code = Column(String(16), nullable=False, index=True, comment="同花顺概念板块代码")
+    concept_name = Column(String(64), nullable=False, comment="概念名称")
+    trade_date = Column(String(10), nullable=False, index=True, comment="交易日期 YYYYMMDD")
+    close = Column(Float, default=0.0, comment="板块指数最新收盘")
+    chg_pct_1d = Column(Float, default=0.0, comment="板块指数单日涨跌幅(%)")
+    chg_pct_5d = Column(Float, default=0.0, comment="板块指数近5日涨跌幅(%)")
+    volume_ratio_5d = Column(Float, default=0.0, comment="最新成交量/近5日均量")
+    updated_at = Column(DateTime, default=datetime.datetime.now)
 
 
 class PreMarketReport(Base):

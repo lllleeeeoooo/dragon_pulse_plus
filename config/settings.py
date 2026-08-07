@@ -155,6 +155,9 @@ class Settings(BaseSettings):
     CONCEPT_MEMBER_REFRESH_INTERVAL_DAYS: int = Field(default=1, description="概念成分股映射刷新间隔(天)。成分股变化慢，可调大省请求(新浪约175次/刷新)")
     CONCEPT_MAINLINE_SCORE_THRESHOLD: float = Field(default=0.5, description="概念主线分阈值，≥此值判为主线概念(与板块一致)")
     CONCEPT_GATE_ENABLED: bool = Field(default=True, description="盘中概念因子否决开关。关闭后概念不参与买入闸门(板块因子仍生效)。若发现过度否决可关")
+    THS_FETCH_PACING_SECONDS: float = Field(default=0.3, description="同花顺概念指数拉取逐只间隔(秒)——375概念防限流，调大可更稳但更慢")
+    THS_STRONG_CHG_PCT: float = Field(default=5.0, description="同花顺概念指数强/弱判定：5日涨幅≥此值(%)算强(阶段升档/主线加分)，≤-此值算弱(阶段降档)")
+    THS_SCORE_BONUS_WEIGHT: float = Field(default=0.1, description="同花顺概念指数趋势对主线分的加分权重(0~1)，设0关闭指数维度")
 
     SECOND_WAVE_RETREAT_MIN: float = Field(default=0.30, description="二波战法龙头回撤最小比例 (30%)")
     SECOND_WAVE_RETREAT_MAX: float = Field(default=0.50, description="二波战法龙头回撤最大比例 (50%)")

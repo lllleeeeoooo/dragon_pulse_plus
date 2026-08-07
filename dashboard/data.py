@@ -237,6 +237,7 @@ def _build_mainlines_section() -> Dict[str, Any]:
             "lbc": rec.get("max_lbc", 0),
             "mainline": bool(rec.get("is_mainline", False)),
             "score": rec.get("mainline_score", 0),
+            "ths": rec.get("ths_chg_5d"),  # 同花顺概念指数5日涨幅(独立维度)，仅概念有
         }
 
     date = (concepts[0].get("trade_date") if concepts

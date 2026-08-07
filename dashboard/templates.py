@@ -170,8 +170,14 @@ if(d.mainlines && (d.mainlines.concepts.length>0 || d.mainlines.industries.lengt
       var star=o.mainline?'★':'';
       var sc=o.score||0;
       var nameStyle=o.mainline?'color:#ffd740;font-weight:bold':'';
+      // 同花顺概念指数5日涨幅（红涨绿跌，仅概念有）
+      var thsTag='';
+      if(o.ths!==undefined && o.ths!==null){
+        var tc=o.ths>=5?'tag-red':(o.ths<=-5?'tag-green':'tag-blue');
+        thsTag=' <span class="tag '+tc+'">指'+o.ths+'%</span>';
+      }
       return '<td><div style="'+nameStyle+'">'+star+' '+(o.name||'')+'</div>'
-        +'<div class="sub">'+B(o.phase,pMap[o.phase]||'tag-blue')+' '+o.zt+'涨停 '+o.lbc+'板 分'+sc.toFixed(2)+'</div></td>';
+        +'<div class="sub">'+B(o.phase,pMap[o.phase]||'tag-blue')+' '+o.zt+'涨停 '+o.lbc+'板 分'+sc.toFixed(2)+thsTag+'</div></td>';
     };
     html+='<tr>'+cell(c)+cell(s)+'</tr>';
   }

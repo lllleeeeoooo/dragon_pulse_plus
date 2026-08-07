@@ -18,8 +18,8 @@ from database import SystemLogManager
 logger = logging.getLogger(__name__)
 
 _cached_pre_market_report: str = ""
-# 高频/长时任务更新同一条 job_run 记录（避免重复写行）：盘中监控每 15s、日线同步进度/完成态
-_UPDATE_IN_PLACE_JOBS = {"job_monitor_loop", "job_kline_sync"}
+# 高频/长时任务更新同一条 job_run 记录（避免重复写行）：盘中监控每 15s、日线/概念指数同步进度/完成态
+_UPDATE_IN_PLACE_JOBS = {"job_monitor_loop", "job_kline_sync", "job_ths_concept_sync"}
 
 
 def _record_job_run(job_id: str, job_name: str, state: str = "", progress: str = ""):
@@ -70,6 +70,7 @@ def _get_job_status() -> List[Dict[str, Any]]:
         {"id": "job_call_auction",   "name": "竞价观察",         "time": "09:26", "desc": "竞价快照→LLM判断超预期标的"},
         {"id": "job_monitor_loop",   "name": "盘中实时监控",     "time": "09:30-15:00", "desc": "15秒轮询，点火异动+板块联动+AI自动交易"},
         {"id": "job_kline_sync",     "name": "日线同步",         "time": "15:30", "desc": "串行摊速拉全市场日线(近30天到今天)，23:30前完成"},
+        {"id": "job_ths_concept_sync","name": "概念指数同步",     "time": "15:35", "desc": "同花顺375概念板块指数历史→5日涨幅/量能，供概念周期叠加"},
         {"id": "job_post_market",    "name": "盘后深度复盘",     "time": "18:01", "desc": "LLM复盘+推荐标的+指数落库+盈亏推送"},
         {"id": "job_holiday_summary","name": "假日消息汇总",     "time": "20:00", "desc": "假期最后一天汇总近期消息"},
     ]
