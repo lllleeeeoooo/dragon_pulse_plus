@@ -94,25 +94,17 @@ class TestKlineEtl(unittest.TestCase):
                 "close": 10.0, "volume": 1000.0, "amount": 10000.0, "pre_close": 9.9,
                 "change_pct": 3.0, "amplitude": 7.0}
 
-    def test_run_incremental起点为已同步最大日期加1(self):
+    def test_run_incremental拉历史窗口到今天(self):
         from data.kline_etl import KlineEtl
-        DailyKlineManager.upsert_batch([self._krow("600001", "20260703")])
+        from config.settings import settings
+        import datetime as _dt
         with patch("data.kline_etl.KlineEtl.run", return_value={}) as m:
             KlineEtl.run_incremental()
         start, end = m.call_args[0][0], m.call_args[0][1]
-        self.assertEqual(start, "20260704")  # last=20260703 → 从次日增量拉
-        import datetime as _dt
+        expect_start = (_dt.date.today() -
+                        _dt.timedelta(days=settings.KLINE_ETL_BOOTSTRAP_DAYS)).strftime("%Y%m%d")
+        self.assertEqual(start, expect_start)  # 历史窗口起点（同时补新交易日与历史缺失）
         self.assertEqual(end, _dt.date.today().strftime("%Y%m%d"))
-
-    def test_run_incremental缓存已最新则不拉(self):
-        from data.kline_etl import KlineEtl
-        import datetime as _dt
-        today = _dt.date.today().strftime("%Y%m%d")
-        DailyKlineManager.upsert_batch([self._krow("600001", today)])
-        with patch("data.kline_etl.KlineEtl.run", return_value={}) as m:
-            r = KlineEtl.run_incremental()
-        self.assertIn("已是最新", r["message"])
-        m.assert_not_called()
 
     def test_fetch_one归一化(self):
         from data.kline_etl import KlineEtl
@@ -190,6 +182,73 @@ class TestKlineEtl(unittest.TestCase):
         self.assertEqual(r["pulled"], 1)  # 600001 已完整 → 跳过，只拉 600002
         self.assertEqual(r["skipped"], 1)
         m.assert_called_once_with("600002", "20260701", "20260702")
+
+    def test_run_serial一轮补完(self):
+        from data.kline_etl import KlineEtl
+        uni = pd.DataFrame({"code": ["600001", "600002", "600003"]})
+        fake = pd.DataFrame({"code": ["600001"], "trade_date": ["20260701"]})
+        with patch("data.kline_etl.KlineEtl.fetch_universe", return_value=uni), \
+             patch("core.backtest.AIBacktestEngine._build_trade_date_list",
+                   return_value=["20260701", "20260702", "20260703"]), \
+             patch("database.kline.DailyKlineManager.complete_codes", return_value=set()), \
+             patch("database.kline.DailyKlineManager.upsert_batch"), \
+             patch("data.kline_etl.KlineEtl.fetch_one", return_value=fake), \
+             patch("data.kline_etl.time.sleep"):
+            r = KlineEtl.run_serial("20260701", "20260703", max_rounds=3)
+        self.assertEqual(r["pulled"], 3)
+        self.assertEqual(r["remaining"], 0)
+        self.assertEqual(r["rounds"], 1)
+
+    def test_run_serial跳过已完整code(self):
+        from data.kline_etl import KlineEtl
+        uni = pd.DataFrame({"code": ["600001", "600002"]})
+        fake = pd.DataFrame({"code": ["600002"], "trade_date": ["20260701"]})
+        with patch("data.kline_etl.KlineEtl.fetch_universe", return_value=uni), \
+             patch("core.backtest.AIBacktestEngine._build_trade_date_list",
+                   return_value=["20260701", "20260702"]), \
+             patch("database.kline.DailyKlineManager.complete_codes", return_value={"600001"}), \
+             patch("database.kline.DailyKlineManager.upsert_batch"), \
+             patch("data.kline_etl.KlineEtl.fetch_one", return_value=fake) as m, \
+             patch("data.kline_etl.time.sleep"):
+            r = KlineEtl.run_serial("20260701", "20260702", max_rounds=2)
+        self.assertEqual(r["pulled"], 1)
+        self.assertEqual(r["remaining"], 0)
+        m.assert_called_once_with("600002", "20260701", "20260702")
+
+    def test_run_serial部分失败多轮收敛(self):
+        from data.kline_etl import KlineEtl
+        uni = pd.DataFrame({"code": ["600001", "600002", "600003"]})
+        fake = pd.DataFrame({"code": ["600001"], "trade_date": ["20260701"]})
+
+        def _fake_fetch(code, start, end):
+            if code == "600003":
+                return pd.DataFrame()  # 这只一直拉不到，验证多轮重试 + remaining
+            return fake
+
+        with patch("data.kline_etl.KlineEtl.fetch_universe", return_value=uni), \
+             patch("core.backtest.AIBacktestEngine._build_trade_date_list",
+                   return_value=["20260701", "20260702", "20260703"]), \
+             patch("database.kline.DailyKlineManager.complete_codes", return_value=set()), \
+             patch("database.kline.DailyKlineManager.upsert_batch"), \
+             patch("data.kline_etl.KlineEtl.fetch_one", side_effect=_fake_fetch), \
+             patch("data.kline_etl.time.sleep"):
+            r = KlineEtl.run_serial("20260701", "20260703", max_rounds=3)
+        self.assertEqual(r["pulled"], 2)  # 第1轮成功 600001/600002 后即退出重试；600003 重试满 max_rounds
+        self.assertEqual(r["remaining"], 1)
+        self.assertEqual(r["rounds"], 3)
+
+    def test_日线任务互斥锁防跨天重叠(self):
+        from data.kline_etl import KlineEtl, _etl_lock
+        _etl_lock.acquire()  # 模拟上一个日线同步仍在跑（跨天重叠场景）
+        try:
+            r1 = KlineEtl.run("20260701", "20260702")
+            r2 = KlineEtl.run_serial("20260701", "20260702")
+        finally:
+            _etl_lock.release()
+        for r in (r1, r2):
+            self.assertIn("message", r)
+            self.assertIn("跳过", r["message"])
+            self.assertNotIn("error", r)  # 跳过不算失败，不触发 _sync_kline_incremental 告警
 
 
 if __name__ == "__main__":

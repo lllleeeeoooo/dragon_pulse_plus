@@ -18,6 +18,35 @@ from llm.post_market import PostMarketAnalyzer
 from core.strategies import MarketStyle
 from core.emotion_index import EmotionVector
 from core.cycle_machine import EmotionCycleMachine
+
+
+def _alert_kline_fail(what: str, detail: str) -> None:
+    """日线增量同步失败 Bark 告警（复用看门狗「系统告警」风格；bark 自身异常不打断复盘）"""
+    try:
+        bark_notifier.send(
+            title="⚠️ [日线缓存同步失败] " + what,
+            body=detail,
+            group="系统告警",
+            level="timeSensitive",
+        )
+    except Exception:
+        pass
+
+
+def _sync_kline_incremental() -> None:
+    """盘后日线增量同步线程体：惰性 import 按需加载 kline_etl（长驻进程免重启热更新），
+    异常或空 universe 时记 error 并发 Bark 告警，线程内异常不抛回主线程。"""
+    try:
+        from data.kline_etl import KlineEtl
+        result = KlineEtl.run_incremental(workers=settings.KLINE_ETL_WORKERS)
+        if isinstance(result, dict) and result.get("error"):
+            logger.error(f"盘后日线增量同步未执行: {result['error']}")
+            _alert_kline_fail("增量同步未执行", result["error"])
+    except Exception as e:
+        logger.error(f"盘后日线增量同步执行异常: {e}")
+        _alert_kline_fail("增量同步执行异常", str(e))
+
+
 def job_post_market():
     """
     18:01 盘后复盘定时任务。非交易日自动跳过。
@@ -31,12 +60,11 @@ def job_post_market():
     # 盘后自动同步全市场日线缓存（后台线程，不阻塞复盘；供 mode=signals 回测用最新数据）
     try:
         import threading
-        from data.kline_etl import KlineEtl
-        threading.Thread(target=KlineEtl.run_incremental,
-                         kwargs={"workers": settings.KLINE_ETL_WORKERS},
-                         daemon=True, name="kline-etl").start()
+        threading.Thread(target=_sync_kline_incremental, daemon=True,
+                         name="kline-etl").start()
     except Exception as e:
-        logger.warning(f"盘后日线增量同步启动失败: {e}")
+        logger.error(f"盘后日线增量同步启动失败: {e}")
+        _alert_kline_fail("增量同步启动失败", str(e))
     try:
         today_str = datetime.datetime.now().strftime("%Y%m%d")
 

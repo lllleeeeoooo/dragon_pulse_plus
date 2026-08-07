@@ -11,6 +11,7 @@ CLI: python -m data.kline_etl --start 20260701 --end 20260731 [--workers 8] [--f
 import argparse
 import datetime
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict
@@ -24,6 +25,11 @@ logger = logging.getLogger(__name__)
 # 本进程内已确认不可用的日线源（连续失败达阈值才标记跳过，偶发失败不跳过）
 _disabled_sources: set = set()
 _source_fail_count: dict = {}
+
+# 进程内日线同步互斥锁：同刻只允许一个 ETL（run/run_serial）在跑。
+# 防跨天重叠——网络差时昨日任务可能拖到今日 18:01 仍未结束，新任务再起会并发
+# upsert 同一张表（SQLite 写锁竞争 + 重复劳动）。已在跑时新调用直接跳过，不排队。
+_etl_lock = threading.Lock()
 
 # 日线中文列 → 英文列 映射
 _COL_MAP = {
@@ -126,49 +132,103 @@ class KlineEtl:
 
     @staticmethod
     def run_incremental(workers: int = None) -> dict:
-        """盘后增量同步：从 daily_kline 已同步最大日期+1 拉到今天，只补新增交易日。
-        首次（缓存为空）回退拉最近 KLINE_ETL_BOOTSTRAP_DAYS 天全量。"""
+        """盘后增量同步：拉历史窗口(近 KLINE_ETL_BOOTSTRAP_DAYS 天)到今天整个区间。
+        KlineEtl.run 的断点续传(complete_codes)跳过已完整覆盖的 code，同时补齐新交易日
+        与历史缺失（限流部分失败下次再补，逐步收敛到全覆盖）。"""
         from config.settings import settings
-        from database.kline import DailyKlineManager
-        last = DailyKlineManager.max_trade_date()
+        start = (datetime.date.today() -
+                 datetime.timedelta(days=settings.KLINE_ETL_BOOTSTRAP_DAYS)).strftime("%Y%m%d")
         end = datetime.date.today().strftime("%Y%m%d")
-        if last:
-            start = (datetime.datetime.strptime(last, "%Y%m%d") +
-                     datetime.timedelta(days=1)).strftime("%Y%m%d")
-        else:
-            start = (datetime.date.today() -
-                     datetime.timedelta(days=settings.KLINE_ETL_BOOTSTRAP_DAYS)).strftime("%Y%m%d")
-        if start > end:
-            return {"message": "日线缓存已是最新，无需同步", "pulled": 0, "skipped": 0}
         return KlineEtl.run(start, end, workers)
 
     @staticmethod
     def run(start: str, end: str, workers: int = None, force: bool = False) -> dict:
-        """并行拉取全市场日线，断点续传。返回统计信息。"""
-        from config.settings import settings
-        from database.kline import DailyKlineManager
-        from core.backtest import AIBacktestEngine
-        workers = workers or settings.KLINE_ETL_WORKERS
-        universe = KlineEtl.fetch_universe()
-        if universe is None or universe.empty:
-            return {"universe": 0, "pulled": 0, "skipped": 0, "error": "universe 为空"}
-        expected_days = len(AIBacktestEngine._build_trade_date_list(start, end))
-        done = set() if force else DailyKlineManager.complete_codes(start, end, expected_days)
-        todo = [str(c) for c in universe["code"] if str(c) not in done]
-        if todo:
-            from tqdm import tqdm
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(KlineEtl.fetch_one, code, start, end): code for code in todo}
-                for fut in tqdm(as_completed(futs), total=len(todo), desc="拉取日线"):
-                    code = futs[fut]
+        """并行拉取全市场日线，断点续传。返回统计信息。
+        进程内互斥（_etl_lock）：已有 run/run_serial 在跑时直接跳过，防每日任务跨天重叠。"""
+        if not _etl_lock.acquire(blocking=False):
+            logger.warning("已有日线同步任务在运行，跳过本次拉取")
+            return {"universe": 0, "pulled": 0, "skipped": 0,
+                    "message": "已有日线同步在运行，跳过（防跨天重叠）"}
+        try:
+            from config.settings import settings
+            from database.kline import DailyKlineManager
+            from core.backtest import AIBacktestEngine
+            workers = workers or settings.KLINE_ETL_WORKERS
+            universe = KlineEtl.fetch_universe()
+            if universe is None or universe.empty:
+                return {"universe": 0, "pulled": 0, "skipped": 0, "error": "universe 为空"}
+            expected_days = len(AIBacktestEngine._build_trade_date_list(start, end))
+            done = set() if force else DailyKlineManager.complete_codes(start, end, expected_days)
+            todo = [str(c) for c in universe["code"] if str(c) not in done]
+            if todo:
+                from tqdm import tqdm
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(KlineEtl.fetch_one, code, start, end): code for code in todo}
+                    for fut in tqdm(as_completed(futs), total=len(todo), desc="拉取日线"):
+                        code = futs[fut]
+                        try:
+                            df = fut.result()
+                            if df is not None and not df.empty:
+                                DailyKlineManager.upsert_batch(df.to_dict("records"))
+                        except Exception as e:
+                            logger.warning(f"{code} 日线拉取失败: {e}")  # 单只失败不中断整体
+            return {"universe": len(universe), "pulled": len(todo), "skipped": len(done),
+                    "rows": DailyKlineManager.count_rows()}
+        finally:
+            _etl_lock.release()
+
+    @staticmethod
+    def run_serial(start: str, end: str, max_rounds: int = 59,
+                   per_code: float = 0.15, batch_pause: float = 5.0) -> dict:
+        """串行低 QPS 补拉全市场日线（断点续传+多轮）：并行 ETL 被源限流/静默空返回时用。
+        逐只 fetch_one + 间隔限速，每轮只重试仍未完整覆盖的 code，逐步收敛到全覆盖。
+        替代原 _backfill_kline.py 临时脚本，供手动补日线 API 调用。
+        进程内互斥（_etl_lock）：已有 run/run_serial 在跑时直接跳过。"""
+        if not _etl_lock.acquire(blocking=False):
+            logger.warning("已有日线同步任务在运行，跳过串行补拉")
+            return {"universe": 0, "pulled": 0, "remaining": 0,
+                    "message": "已有日线同步在运行，跳过（防跨天重叠）"}
+        try:
+            from database.kline import DailyKlineManager
+            from core.backtest import AIBacktestEngine
+            universe = KlineEtl.fetch_universe()
+            if universe is None or universe.empty:
+                return {"universe": 0, "pulled": 0, "remaining": 0, "error": "universe 为空"}
+            expected_days = len(AIBacktestEngine._build_trade_date_list(start, end))
+            if expected_days <= 0:
+                return {"universe": len(universe), "pulled": 0, "remaining": len(universe),
+                        "error": "区间无交易日"}
+            todo = [str(c) for c in universe["code"]]
+            pulled, rounds_used = 0, 0
+            for rnd in range(1, max_rounds + 1):
+                done = DailyKlineManager.complete_codes(start, end, expected_days)
+                todo = [c for c in todo if c not in done]
+                if not todo:
+                    break
+                rounds_used = rnd
+                logger.info(f"串行补拉第 {rnd}/{max_rounds} 轮：待补 {len(todo)} 只")
+                still = []
+                for i, code in enumerate(todo):
                     try:
-                        df = fut.result()
+                        df = KlineEtl.fetch_one(code, start, end)
                         if df is not None and not df.empty:
                             DailyKlineManager.upsert_batch(df.to_dict("records"))
-                    except Exception as e:
-                        logger.warning(f"{code} 日线拉取失败: {e}")  # 单只失败不中断整体
-        return {"universe": len(universe), "pulled": len(todo), "skipped": len(done),
-                "rows": DailyKlineManager.count_rows()}
+                            pulled += 1
+                        else:
+                            still.append(code)
+                    except Exception:
+                        still.append(code)
+                    time.sleep(per_code)
+                    if (i + 1) % 100 == 0:
+                        logger.info(f"  已处理 {i + 1}/{len(todo)}，本轮待补 {len(still)}")
+                        time.sleep(batch_pause)
+                todo = still
+                logger.info(f"第 {rnd} 轮结束：剩余 {len(todo)}")
+            return {"universe": len(universe), "pulled": pulled,
+                    "remaining": len(todo), "rounds": rounds_used,
+                    "rows": DailyKlineManager.count_rows()}
+        finally:
+            _etl_lock.release()
 
     # ------------------------------------------------------------------
     # 2) 回测读取：load_cache + build_day_spot

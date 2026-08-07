@@ -63,6 +63,6 @@ class DailyKlineManager:
 
     @staticmethod
     def max_trade_date() -> str:
-        """已同步的最大交易日期 YYYYMMDD，无数据返回空串（盘后增量同步起点用）"""
+        """已同步的最大交易日期 YYYYMMDD，无数据返回空串"""
         with db_manager.engine.connect() as conn:
             return conn.execute(text("SELECT MAX(trade_date) FROM daily_kline")).scalar() or ""

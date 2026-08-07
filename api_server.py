@@ -379,17 +379,24 @@ def run_backtest(
     return {"code": 200, "data": result}
 
 
-@app.post("/backtest/etl-kline", summary="拉取全市场日线缓存（回测 signals 模式前置）",
-          description="并行拉取回测区间内全市场历史日线到 daily_kline 表（断点续传）。"
-                      "示例：/backtest/etl-kline?start=20260701&end=20260731&workers=8",
+@app.post("/backtest/etl-kline", summary="拉取/补拉全市场日线缓存（回测 signals 模式前置）",
+          description="拉取回测区间内全市场历史日线到 daily_kline 表（断点续传）。"
+                      "默认并行(workers)；serial=true 走串行低QPS补拉（源限流/静默空时用，"
+                      "多轮重试逐步收敛到全覆盖，替代原 _backfill_kline.py 脚本）。"
+                      "示例：/backtest/etl-kline?start=20260701&end=20260806  |  serial=true",
           tags=["AkShare 数据"])
 def backtest_etl_kline(
     start: str = Query(..., description="起始日期 YYYYMMDD"),
     end: str = Query(..., description="结束日期 YYYYMMDD"),
     workers: int = Query(None, description="并行线程数，默认取 settings.KLINE_ETL_WORKERS"),
+    serial: bool = Query(False, description="串行低QPS补拉模式（限流时用，比并行慢但更不易被限流）"),
+    max_rounds: int = Query(59, ge=1, description="串行补拉最大轮数，每轮只重试未完整覆盖的 code"),
 ):
     from data.kline_etl import KlineEtl
-    result = KlineEtl.run(start, end, workers)
+    if serial:
+        result = KlineEtl.run_serial(start, end, max_rounds=max_rounds)
+    else:
+        result = KlineEtl.run(start, end, workers)
     return {"code": 200, "data": result}
 
 

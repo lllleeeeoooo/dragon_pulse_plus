@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     TAIL_LLM_PER_CYCLE: int = Field(default=1, description="尾盘博弈每轮监控周期最多 LLM 买入确认次数")
     TAIL_GAME_REQUIRE_MA: bool = Field(default=True, description="尾盘博弈候选：要求现价站上 5/10 日均线(指南: 上升趋势站均线)；MA 数据缺失时放行(未知即放行)")
     KLINE_ETL_WORKERS: int = Field(default=3, description="全市场日线 ETL 并行拉取线程数（腾讯源对高并发限流，保持低位避免静默空返回）")
-    KLINE_ETL_BOOTSTRAP_DAYS: int = Field(default=30, description="盘后增量 ETL 首次（缓存为空）回退拉取的近 N 天窗口")
+    KLINE_ETL_BOOTSTRAP_DAYS: int = Field(default=30, description="盘后增量 ETL 每次拉取的历史窗口(近 N 天)到今天；断点续传跳过已完整覆盖的 code 并自动补齐历史缺失")
     ZHABAN_ALERT_CHANGE: float = Field(default=7.0, description="炸板预警：涨停池标的当前涨幅低于此值视为炸板(%)")
     ZHABAN_ALERT_VOL_RATIO: float = Field(default=2.0, description="炸板预警：量比下限")
     MA5_FALLBACK_RATIO: float = Field(default=0.97, description="MA5 获取失败时兜底为 现价×此比例")
