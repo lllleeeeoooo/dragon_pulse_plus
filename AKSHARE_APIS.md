@@ -168,7 +168,7 @@
 
 - **AkShare接口**: `tool_trade_date_hist_sina()`
 - **系统封装**: `TradeCalendarManager.sync_calendar()`
-- **用途**: 维护±30天交易日数据库缓存，支持 `is_trading_day()` / `get_previous_trading_day()` 查询
+- **用途**: 维护 过去120天+未来30天 交易日数据库缓存（120 天历史供『龙头过期 30 个交易日』等按交易日回溯），支持 `is_trading_day()` / `get_previous_trading_day()` / `get_n_trading_days_ago()` 查询
 
 ---
 

@@ -29,12 +29,14 @@
 | 时间 | 任务 | 功能 |
 |---|---|---|
 | 04:00 | 日志清理 | 系统/LLM/错误日志保留 15 天，推送保留 30 天 |
-| 04:05 | 龙头过期 | 历史龙头 >30 天自动失效 |
+| 04:05 | 龙头过期 | 历史龙头 >30 个交易日自动失效（≈42 自然日） |
+| 08:15 | 盘前数据检查 | 核对上一交易日盘后数据是否齐全（情绪/指数/盈亏快照/日线等），缺失 Bark 告警 |
 | 08:30 | 盘前简报 | 新闻+热搜 → LLM 预测板块 → Bark 推送 |
 | 09:15-09:25 | 竞价观察窗口 | 每 30 秒采集竞价快照、量能趋势 |
 | 09:26 | 竞价观察 | 竞价快照+推荐标的 → LLM 买卖指令 → Bark 推送 |
 | 09:30-11:30 / 13:00-15:00 | 盘中实时监控 | 15 秒轮询：抢筹信号扫描 + 自动买卖 + 各类预警 |
-| 14:30-15:00 | 尾盘博弈窗口 | 独立策略，低吸强势股博次日高开 |
+| 14:45-14:52 | 尾盘博弈窗口 | 14:45-14:51 候选入池，14:51 统一 LLM 选最优 2 只博次日高开 |
+| 15:30 | 日线同步（独立任务） | 串行摊速拉全市场日线(近30天到今天)，到 23:30 前完成，看板显示进度 |
 | 18:01 | 盘后深度复盘 | 情绪→风格→LLM 复盘→指数/涨停池/板块落库→盈亏报告 |
 | 20:00 | 假日消息汇总 | 假期最后一天推送 |
 
@@ -47,7 +49,7 @@
 - 非交易日：每 **5 分钟**检查一次（`time.sleep(300)`），不浪费 API。
 - 竞价窗口 `is_auction_time()`（09:15-09:25）：每 **30 秒**采集一次竞价快照。
 - 交易时段 `is_trading_time()`（09:30-11:30 / 13:00-15:00）：每 **15 秒**（`MONITOR_INTERVAL_SECONDS=15`）跑一轮 `_check_realtime_market`。
-- 尾盘博弈窗口 `is_tail_end_time()`（14:30-15:00）：`_scan_tail_game` 内部按此窗口门控（指南：避开 14:00-14:30 跳水段，买在走势定型后）。
+- 尾盘博弈窗口 `is_tail_end_time()`（14:45-14:52）：`_scan_tail_game` 内部按此窗口门控——14:45-14:51 候选先入池不买，到 `TAIL_GAME_SELECT_TIME=14:51` 统一 LLM 选最优（避开 14:00-14:45 跳水段，买入统一在选时点后）。
 - 每轮执行顺序（`_check_realtime_market`）：
   1. 换日重置当日去重状态（`_reset_daily_state`，盘中重启后从数据库重建当日已买集合）。
   2. 08:30 盘前简报缺失时自愈补发一次。
@@ -56,7 +58,7 @@
   5. 计算最高连板/炸板率、判定市场风格、检查大盘熔断。
   6. **持仓卖出/止损监控前置**（先于买入扫描，绝对止损等硬护栏不因买入 LLM 同步调用被拖后）。
   7. 扫描四类抢筹信号 + 买入 + 推送。
-  8. 尾盘博弈（14:30-15:00）。
+  8. 尾盘博弈（14:45-14:52：14:45-14:51 候选入池，14:51 统一 LLM 选最优）。
   9. 龙头二波（全天盘中）。
   10. 炸板预警、情绪到顶预警、一致性预警。
 
@@ -150,7 +152,7 @@
 
 **成交滑点模型**（`_compute_buy_cost`）：普通信号买入成本 = 现价 × (1 + `AI_BUY_SLIPPAGE_PCT=0.3%`)；**逼近封板/高位放量信号默认按涨停价撮合**（`AI_BUY_NEAR_LIMIT_FILL_LIMIT=True`，成本 = 昨收 × (1+涨停线)，打板资金实际多撮合在涨停附近，原 0.5% 滑点对回测过于乐观）；关闭该开关时退回 0.3%+`AI_BUY_SLIPPAGE_HOT_PCT=0.2%` 滑点模型。尾盘博弈/二波买入走普通滑点。
 
-**尾盘博弈**（14:50-14:57 买入窗口，`_scan_tail_game`，评审：14:00-14:45 尾盘跳水最危险段，收窄到临近收盘形态定型后买）：候选 = 尾盘博弈信号（涨幅 2%~5% + **量比温和放量 1.2~2.5**（评审：低涨幅+量比≥3 是放量滞涨/出货）+ 收阳 + 上影线占比≤0.3 + 收盘≥均价 VWAP）→ 站上 MA5/MA10（`TAIL_GAME_REQUIRE_MA=True`，MA 缺失**明确告警并放行**）→ 独立闸门 → 独立 LLM 确认（每轮 `TAIL_LLM_PER_CYCLE=1`）→ 买前复核 → AI_TAIL 持仓。次日 09:35 统一卖出（见卖出节）。
+**尾盘博弈**（`_scan_tail_game`，窗口 14:45-14:52，**候选先入池 → 选时点统一 LLM 选**，评审：14:00-14:45 尾盘跳水最危险段，买入统一在选时点之后）：窗口内（14:45-`TAIL_GAME_SELECT_TIME`=14:51）每轮只把尾盘博弈信号候选（涨幅 2%~5% + **量比温和放量 1.2~2.5**（评审：低涨幅+量比≥3 是放量滞涨/出货）+ 收阳 + 上影线占比≤0.3 + 收盘≥均价 VWAP）收进 `_tail_pool` **不买**（避免早买占满 `TAIL_MAX_POSITIONS=2` 把后续更优票永久拦截）；到 14:51 从池中取当前仍有效（信号+站上 MA5/MA10，`TAIL_GAME_REQUIRE_MA=True`，MA 缺失**明确告警并放行**）且按量比→涨幅排序的前 `TAIL_SELECT_POOL_SIZE=10` 条，**一次统一 LLM 决策**：喂「当前市场环境（风格/涨跌停/最高连板/情绪/K/情绪周期/晋级率）+ 昨日涨停今日开盘溢价（高开>3%占比/红盘率，次日高开预期最直接代理）」让 LLM 选明天高开概率最大的 2 只（+`TAIL_SELECT_BACKUP=2` 备选，按概率降序）→ 按序 独立闸门 → 买前复核（主选被拦用备选顶；封板/快照不可用下轮重试）→ AI_TAIL 持仓。次日 09:35 统一卖出（见卖出节）。
 
 **龙头二波**（全天 9:30-15:00，`_scan_second_wave`）：近 `SECOND_WAVE_LOOKBACK_DAYS=30` 天历史龙头（`peak_price`）+ 现价回撤 **30%~50%** + 当日涨幅 > `SECOND_WAVE_CHANGE_MIN=3.0%`（止跌反包）→ **地量止跌确认**（`SW_REQUIRE_GROUND_BOTTOM=True`，评审防A杀半山腰/死猫跳：止跌窗口 T-4..T-1 缩量至峰值×`SW_GROUND_VOL_PEAK_RATIO=0.35` 或 <0.55×MA20量 + 振幅收敛≥`SW_GROUND_MIN_DAYS=2`天(≤4%) + 不创新低 + 今日放量>地量日；数据不足放行）→ 站上 MA5/MA10 → 独立闸门 → 独立 LLM 确认（每轮 `SW_LLM_PER_CYCLE=1`）→ AI_SW 持仓（策略记录 `PEAK{前高}-VALLEY{谷底}`）。回撤越浅+涨幅高优先。**卖出：黄金分割止盈**（谷底+(前高-谷底)×`SW_TAKE_PROFIT_RATIO=0.618` 止盈，前高×`SW_TAKE_PROFIT_HIGH_RATIO=0.95` 次高点全清，不再死守突破前高）/ `SW_HOLD_DAYS=5` 天未达止盈位离场。
 
@@ -170,7 +172,7 @@
 | 监管异动 | `REGULATORY_GATE_ENABLED=true` | 今日涨停将触发交易所异动/停牌核查（一级/二级）→ 拦截（`daily_kline`+`market_index` 本地算） |
 | 已持仓 | — | 已持有该 code 不重复买 |
 
-**尾盘博弈独立闸门** `_tail_gates_open`：`TAIL_MAX_POSITIONS=2`（独立持仓）、`TAIL_MAX_DAILY_BUYS=2`（独立当日次数，不吃白天预算）、大盘熔断、已持仓、**共享**当日亏损熔断（AI_AUTO+AI_TAIL 合计）。
+**尾盘博弈独立闸门** `_tail_gates_open`：`TAIL_MAX_POSITIONS=2`（独立持仓）、`TAIL_MAX_DAILY_BUYS=2`（独立当日次数，不吃白天预算）、大盘熔断、已持仓、**共享**当日亏损熔断（AI_AUTO+AI_TAIL 合计）。闸门在**选时点后**按选购顺序逐候选评估；窗口内（选时点前）只入池不买。
 
 **龙头二波独立闸门** `_second_wave_gates_open`：`SW_MAX_POSITIONS=2`、`SW_MAX_DAILY_BUYS=2`、大盘熔断、已持仓、**共享**当日亏损熔断（AI_AUTO+AI_TAIL+AI_SW 合计）。
 
@@ -356,11 +358,12 @@
 - **当日源熔断**：某源当日异常达 `SOURCE_FAIL_CIRCUIT_LIMIT=3` 次后熔断，当天不再调用该源（次日重置）。
 - **熔断状态跨重启持久化**：源熔断状态落盘 `logs/.source_circuit.json`，看门狗自动重启后的新进程当天恢复"已熔断源"，直接走备用源、不再重打被限流源（切断"重启→重打→再熔断→再重启"循环）。日线 ETL 启动时同样加载。
 - **东财全市场行情多主机轮换**（`_fetch_spot_eastmoney`）：东财 clist 端点按请求频率限流（实测连续 ~8 次请求即连接被 RemoteDisconnected 重置），akshare 默认 pz=100 分页拉全市场需 ~59 次请求必被断。改为临时补丁 akshare 分页层：① 加大 `pz=2000` 减少分页次数；② 逐页轮换 `82/92/push2/7/30.push2` 主机。解析仍交给 akshare（列口径一致）。
-- **腾讯/新浪并行抓页**（`SPOT_FETCH_PARALLEL`，默认 True）：腾讯/新浪全市场行情 akshare 串行分页慢（腾讯 28 页 ~30s、新浪 74 页 ~60s），改并行分页抓取（实测腾讯 8.7s、新浪 3.4s）。页数上限实测：**腾讯 `count` 硬上限 200**（加大返回空）、**新浪 `num` 上限 100**（已用满）。
+- **腾讯并行抓页**（`SPOT_FETCH_PARALLEL`，默认 True）：腾讯全市场行情 akshare 串行分页慢（28 页 ~30s），改并行分页抓取（实测 8.7s）。腾讯 `count` 硬上限 200。
+- **新浪默认串行**（`SPOT_SINA_PARALLEL`，默认 False）：新浪反爬严格，59 并发请求实测触发 HTTP 456 限流（曾致 `getHQNodeStockCount` 456 + OHLC 补齐 decode 失败）——默认恒走 akshare 串行（74 页 ~60s，仅作东财+腾讯都挂时的末位兜底），开启并行有封 IP 风险。
 - **并行反爬自动切串行**：并行抓取连续失败 2 次（异常或返回空，疑似触发反爬/限流）→ 自动熔断该源并行、切回 akshare 串行，600s 冷却后重试并行；成功即清零计数。`SPOT_FETCH_PARALLEL=false` 恒走串行。新浪反爬严格，被临时封 IP 时系统会自动切串行，无需人工干预。
 - **抓取重试**：`FETCH_RETRY_COUNT=3`、`FETCH_RETRY_DELAY=2s`（指数退避）。
 - **涨停/炸板池失败退避**：刷新失败后 `POOL_CACHE_FAIL_BACKOFF_SECONDS=300s` 再试。
-- **日线 ETL**：`run_incremental` 拉近 30 天到今天的整个区间，断点续传跳过已完整覆盖 code；`run_serial` 串行低 QPS 补拉多轮收敛；进程内互斥锁 `_etl_lock` 防跨天重叠；失败 `logger.error` + Bark 系统告警。
+- **日线 ETL（独立 15:30 任务 `job_kline_sync`，不再挂在 18:01 复盘里）**：走 **`run_incremental_paced` 串行摊速版**（零并发）——从启动(15:30)逐只摊速到 `KLINE_ETL_PACED_DEADLINE=23:30` 前完成全市场，源 QPS 最低防限流（每只间隔 = 剩余时间/剩余只数，`max_sleep` 封顶）；断点续传跳过已完整覆盖 code；进度每 100 只经 `_record_job_run` 落库，**看板"⏰ 定时任务"实时显示运行中/完成/失败 + 已拉/总数**；`run_incremental`/`run_serial` 保留供 CLI/手动补拉（`run` 并行、`run_serial` 串行低 QPS 多轮收敛）；进程内互斥锁 `_etl_lock` 防跨天重叠；失败 `logger.error` + Bark 系统告警。
 
 ---
 
@@ -373,7 +376,8 @@
 | MONITOR_INTERVAL_SECONDS | 15 | 盘中轮询间隔(秒) |
 | MONITOR_POOL_CACHE_SECONDS | 60 | 涨停/炸板池缓存间隔(秒) |
 | MONITOR_CYCLE_BUDGET_SECONDS | 90 | 单轮周期时间预算(秒)，超预算跳过非关键步骤防看门狗重启 |
-| SPOT_FETCH_PARALLEL | true | 腾讯/新浪行情并行分页抓取(腾讯页上限200/新浪100) |
+| SPOT_FETCH_PARALLEL | true | 腾讯行情并行分页抓取(页上限200) |
+| SPOT_SINA_PARALLEL | false | 新浪行情并行抓取(默认关，反爬456限流) |
 | VOL_BURST_THRESHOLD | 3.0 | 点火异动量比门槛 |
 | PRICE_BURST_THRESHOLD | 3.0 | 点火异动涨幅下限(%) |
 | PRICE_BURST_MAX / _20CM | 9.5 / 19.5 | 点火异动涨幅上限（主板/双创，已涨停不算） |
@@ -392,9 +396,11 @@
 | TAIL_GAME_VOL_RATIO_MIN / MAX | 1.2 / 2.5 | 尾盘博弈量比区间（温和放量，防放量滞涨） |
 | TAIL_GAME_SHORT_UPPER_RATIO | 0.3 | 尾盘博弈上影线占比上限 |
 | TAIL_GAME_SELL_TIME | 09:35 | 尾盘博弈次日统一卖出时刻(HH:MM)，到点按现价清仓 |
-| TAIL_GAME_WINDOW_START / END | 14:50 / 14:57 | 尾盘博弈买入窗口（规避 14:00-14:45 跳水段） |
+| TAIL_GAME_WINDOW_START / END | 14:45 / 14:52 | 尾盘博弈买入窗口（14:45-14:51 候选入池，14:51 统一选） |
+| TAIL_GAME_SELECT_TIME | 14:51 | 尾盘博弈统一选时点（从入池候选中排序，一次 LLM 选最优） |
+| TAIL_SELECT_POOL_SIZE | 10 | 入池后排序取前 N 条给 LLM 统一选 |
+| TAIL_SELECT_BACKUP | 2 | 统一选主选之外的备选数（主选被拦时按序顶） |
 | TAIL_MAX_DAILY_BUYS / TAIL_MAX_POSITIONS | 2 / 2 | 尾盘当日次数/持仓上限 |
-| TAIL_LLM_PER_CYCLE | 1 | 尾盘每轮 LLM 确认次数 |
 | SECOND_WAVE_RETREAT_MIN / MAX | 0.30 / 0.50 | 二波回撤区间 |
 | SECOND_WAVE_LOOKBACK_DAYS | 30 | 二波追溯龙头天数 |
 | SECOND_WAVE_CHANGE_MIN | 3.0 | 二波止跌信号涨幅下限(%) |

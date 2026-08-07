@@ -81,7 +81,8 @@ def _push_daily_pnl_report(trade_date: str, spot_df=None):
     ]
 
     for h in report.get("holdings", [])[:15]:
-        emoji = "🟢" if h["profit_pct"] > 0 else ("🔴" if h["profit_pct"] < 0 else "⚪")
+        # 红涨绿跌（A股习惯）：盈利=红，亏损=绿
+        emoji = "🔴" if h["profit_pct"] > 0 else ("🟢" if h["profit_pct"] < 0 else "⚪")
         tag = h["strategy"][:4] if h["strategy"] else ""
         lines.append(
             f"  {emoji} {h['name']}({h['code']}) "
@@ -95,7 +96,8 @@ def _push_daily_pnl_report(trade_date: str, spot_df=None):
         lines.append("")
         lines.append(f"🔚 今日平仓 ({report['today_closed_count']}笔):")
         for t in report.get("today_closed_trades", []):
-            emoji = "✅" if t["return_pct"] > 0 else "❌"
+            # 红涨绿跌（A股习惯）：盈利=红，亏损=绿
+            emoji = "🔴" if t["return_pct"] > 0 else "🟢"
             lines.append(f"  {emoji} {t['name']}({t['code']}) {_s(t['return_pct'])}% | {t.get('strategy', '')}")
 
     body = "\n".join(lines)

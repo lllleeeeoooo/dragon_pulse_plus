@@ -428,8 +428,9 @@ class _SpotMixin:
     @_spot_fetch
     def _fetch_spot_sina() -> pd.DataFrame:
         """从新浪获取全市场实时行情并归一化列名。
-        SPOT_FETCH_PARALLEL=True 时并行分页抓取，False 或并行失败回退 akshare 串行。"""
-        if settings.SPOT_FETCH_PARALLEL and _parallel_allowed("新浪"):
+        SPOT_SINA_PARALLEL=True 时并行分页抓取（默认关闭：新浪反爬严格，59并发易触发 HTTP 456 限流），
+        否则恒走 akshare 串行；并行失败回退串行。"""
+        if settings.SPOT_SINA_PARALLEL and _parallel_allowed("新浪"):
             try:
                 df = _SpotMixin._fetch_spot_sina_parallel()
                 if df is None or df.empty:
@@ -617,6 +618,9 @@ class _SpotMixin:
             logger.info("腾讯源 OHLC 缺失，已用新浪补齐")
             return out
         except Exception as e:
+            # 失败退避：新浪被限流(456/HTML)时不再每 60s 重试，退避到 POOL_CACHE_FAIL_BACKOFF_SECONDS 后再试
+            #（_sina_ohlc_cache_time 已在 try 里声明为 global）
+            _sina_ohlc_cache_time = _time.time() + settings.POOL_CACHE_FAIL_BACKOFF_SECONDS
             logger.warning(f"用新浪补齐 OHLC 失败: {e}")
             return df
 

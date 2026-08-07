@@ -1,5 +1,6 @@
 import datetime
 import logging
+import threading
 from typing import Dict, Any, List, Optional
 import pandas as pd
 
@@ -35,21 +36,56 @@ def _alert_kline_fail(what: str, detail: str) -> None:
 
 def _sync_kline_incremental() -> None:
     """盘后日线增量同步线程体：惰性 import 按需加载 kline_etl（长驻进程免重启热更新），
+    串行摊速模式（零并发）——从启动(约15:30)逐只摊速到 KLINE_ETL_PACED_DEADLINE(默认23:30) 前完成，
+    源 QPS 最低防限流。进度每 100 只通过 _record_job_run 落库供看板实时显示；
     异常或空 universe 时记 error 并发 Bark 告警，线程内异常不抛回主线程。"""
+    def _on_progress(pulled=None, total=None, done=False):
+        _record_job_run("job_kline_sync", "日线同步",
+                        state="完成" if done else "运行中",
+                        progress=f"{pulled or 0}/{total or 0}" if total else "")
     try:
         from data.kline_etl import KlineEtl
-        result = KlineEtl.run_incremental(workers=settings.KLINE_ETL_WORKERS)
+        result = KlineEtl.run_incremental_paced(on_progress=_on_progress)
         if isinstance(result, dict) and result.get("error"):
-            logger.error(f"盘后日线增量同步未执行: {result['error']}")
+            logger.error(f"日线增量同步未执行: {result['error']}")
+            _record_job_run("job_kline_sync", "日线同步", state="失败", progress=result["error"])
             _alert_kline_fail("增量同步未执行", result["error"])
+        else:
+            _record_job_run("job_kline_sync", "日线同步", state="完成",
+                            progress=f"{result.get('pulled', 0)}/{result.get('universe', 0)}")
+            logger.info(f"日线增量同步完成: {result}")
     except Exception as e:
-        logger.error(f"盘后日线增量同步执行异常: {e}")
+        logger.error(f"日线增量同步执行异常: {e}")
+        _record_job_run("job_kline_sync", "日线同步", state="失败", progress=str(e)[:120])
         _alert_kline_fail("增量同步执行异常", str(e))
+
+
+def job_kline_sync():
+    """
+    15:30 日线同步独立定时任务（不再挂在 18:01 复盘里）：串行摊速拉取全市场日线，
+    到 KLINE_ETL_PACED_DEADLINE(默认23:30) 前完成。非交易日自动跳过。
+    任务状态（运行中/完成/失败 + 进度）通过 _record_job_run 落库，看板"定时任务"实时显示。
+    """
+    _record_job_run("job_kline_sync", "日线同步", state="运行中")
+    if not is_trading_day():
+        logger.info("今日非交易日，跳过日线同步")
+        _record_job_run("job_kline_sync", "日线同步", state="跳过")
+        return
+    logger.info(">>> 触发 15:30 日线同步定时任务...")
+    # 后台线程串行摊速（长任务，不阻塞调度线程；供 mode=signals 回测用最新数据）
+    try:
+        threading.Thread(target=_sync_kline_incremental, daemon=True,
+                         name="kline-sync").start()
+    except Exception as e:
+        logger.error(f"日线同步启动失败: {e}")
+        _record_job_run("job_kline_sync", "日线同步", state="失败", progress=str(e)[:100])
+        _alert_kline_fail("同步启动失败", str(e))
 
 
 def job_post_market():
     """
     18:01 盘后复盘定时任务。非交易日自动跳过。
+    （日线同步已拆分为独立 15:30 任务 job_kline_sync，不再挂在本任务内）
     """
     _record_job_run("job_post_market", "盘后深度复盘")
     if not is_trading_day():
@@ -57,14 +93,6 @@ def job_post_market():
         return
 
     logger.info(">>> 触发 18:01 盘后深度复盘定时任务...")
-    # 盘后自动同步全市场日线缓存（后台线程，不阻塞复盘；供 mode=signals 回测用最新数据）
-    try:
-        import threading
-        threading.Thread(target=_sync_kline_incremental, daemon=True,
-                         name="kline-etl").start()
-    except Exception as e:
-        logger.error(f"盘后日线增量同步启动失败: {e}")
-        _alert_kline_fail("增量同步启动失败", str(e))
     try:
         today_str = datetime.datetime.now().strftime("%Y%m%d")
 

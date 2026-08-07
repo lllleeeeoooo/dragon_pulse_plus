@@ -1,6 +1,7 @@
 import time
 import datetime
 import logging
+import re
 from typing import Dict, Any, List, Optional
 import pandas as pd
 
@@ -51,6 +52,17 @@ class _MonitorCoreMixin:
         self._auto_bought_codes: set = set()
         # 尾盘博弈独立预算：当日已买入的 AI_TAIL 持仓 code 集合（独立于 _auto_bought_codes）
         self._tail_auto_bought_codes: set = set()
+        # 尾盘博弈「先入池后统一LLM选」：_tail_pool = code -> {code,name,price,change_pct,vol_ratio,amt_billion,ts}
+        # 窗口内(选时点前)只累积候选不买；到 TAIL_GAME_SELECT_TIME 统一 LLM 选最优 2 只再买
+        self._tail_pool: Dict[str, dict] = {}
+        # 选时点统一 LLM 决策冻结的选购顺序（主选+备选，按次日高开概率降序）
+        self._tail_select_order: list = []
+        # 选购来源：'llm'=统一LLM选 / 'rule'=LLM失败降级规则兜底
+        self._tail_select_source: str = ""
+        # 选购阶段已终态处理过的 code（已买/退化/复核最终失败），避免跨周期重复评估
+        self._tail_select_attempted: set = set()
+        # 选购阶段是否已结束（持仓满/次数满/候选空/选购序全resolve），结束后每周期直接返回
+        self._tail_select_done: bool = False
         # 龙头二波独立预算：当日已买入的 AI_SW 持仓 code 集合
         self._sw_auto_bought_codes: set = set()
         self._emotion_top_alerted_today: bool = False
@@ -105,6 +117,11 @@ class _MonitorCoreMixin:
             self._auto_bought_codes = self._load_today_ai_bought_codes()
             self._tail_auto_bought_codes = self._load_today_tail_bought_codes()
             self._sw_auto_bought_codes = self._load_today_sw_bought_codes()
+            self._tail_pool.clear()
+            self._tail_select_order.clear()
+            self._tail_select_source = ""
+            self._tail_select_attempted.clear()
+            self._tail_select_done = False
             self._emotion_top_alerted_today = False
             self._consistency_alerted_today = False
             self._pending_sell_codes.clear()
@@ -266,8 +283,9 @@ class _MonitorCoreMixin:
         return datetime.time(9, 15) <= current_time <= datetime.time(9, 25)
 
     def is_tail_end_time(self) -> bool:
-        """判断是否在尾盘博弈买入窗口 (默认 14:50-14:57，可配 TAIL_GAME_WINDOW_START/END)。
-        评审：14:00-14:45 是尾盘跳水最危险段，收窄到临近收盘、全天形态定型后再买。"""
+        """判断是否在尾盘博弈买入窗口 (可配 TAIL_GAME_WINDOW_START/END，默认 14:45-14:52)。
+        窗口内候选先入池不买；到 TAIL_GAME_SELECT_TIME(默认14:51) 统一 LLM 选最优再买。
+        （评审：14:00-14:45 是尾盘跳水最危险段，买入统一在选时点之后，规避跳水段）"""
         now = datetime.datetime.now()
         if now.weekday() >= 5:
             return False
@@ -279,8 +297,21 @@ class _MonitorCoreMixin:
             _start = datetime.time(int(_hs), int(_ms))
             _end = datetime.time(int(_he), int(_me))
         except Exception:
-            _start, _end = datetime.time(14, 50), datetime.time(14, 57)
+            _start, _end = datetime.time(14, 45), datetime.time(14, 52)
         return _start <= current_time <= _end
+
+    def _tail_select_time_reached(self) -> bool:
+        """是否已到尾盘博弈统一选时点 TAIL_GAME_SELECT_TIME (HH:MM，默认 14:51)。
+        选时点须 ≤ TAIL_GAME_WINDOW_END，否则选购阶段永不触发。"""
+        now = datetime.datetime.now()
+        if now.weekday() >= 5:
+            return False
+        try:
+            _hs, _ms = settings.TAIL_GAME_SELECT_TIME.split(":")
+            _sel = datetime.time(int(_hs), int(_ms))
+        except Exception:
+            _sel = datetime.time(14, 51)
+        return now.time() >= _sel
 
 
     def _refresh_pool_cache(self):
@@ -564,7 +595,7 @@ class _MonitorCoreMixin:
             logger.info(f"单轮监控周期超预算({settings.MONITOR_CYCLE_BUDGET_SECONDS}s)，跳过非关键步骤提前收尾")
             return
 
-        # 尾盘博弈（14:30-15:00）：独立策略，闸门+LLM+AI_TAIL 持仓，次日早盘兑现（内部 is_tail_end_time 门控）
+        # 尾盘博弈（窗口默认14:45-14:52）：候选先入池，SELECT_TIME(14:51) 统一LLM选最优，AI_TAIL 次日早盘兑现
         self._scan_tail_game(spot_df, index_breaker_triggered)
 
         # 龙头二波（全天盘中）：历史龙头回撤30-50%止跌反包 → AI_SW 持仓，N天不创新高离场（内部 is_trading_time 门控）
@@ -994,23 +1025,152 @@ class _MonitorCoreMixin:
 
     def _scan_tail_game(self, spot_df, index_breaker_triggered):
         """
-        尾盘博弈（14:30-15:00）：按指南选低吸强势股（涨幅2-5%/放量/收阳/短上影/收盘≥均价）博次日高开。
-        独立预算(TAIL_MAX_*)、闸门+LLM 风控、AI_TAIL 持仓、次日 _monitor_holdings 早盘兑现。
+        尾盘博弈（窗口默认14:45-14:52）：候选先入池，到 TAIL_GAME_SELECT_TIME(默认14:51) 统一 LLM 选最优买入。
+        每个 15s 周期：
+          - 选时点前：仅把命中 _signal_tail_game 的候选 upsert 入 _tail_pool（不买，避免早买占满仓位）。
+          - 选时点后：一次性 LLM 批次选（当前市场环境 + 次日高开预期 + 候选 topN → 选明日高开概率最大
+            TAIL_MAX_POSITIONS 只），按序 闸门→MA→买前复核→买入（主选被拦用备选顶）。
+        独立预算(TAIL_MAX_*)、闸门风控、AI_TAIL 持仓、次日 _monitor_holdings 早盘兑现不变。
         独立策略，不污染 _alerted_burst_codes/风格质量过滤。
         """
         if not self.is_tail_end_time():
             return
-        spot_df = compute_signal_flags(spot_df)
-        candidates = spot_df[spot_df["_signal_tail_game"]]
-        if candidates is None or candidates.empty:
+        if self._tail_select_done:
             return
-        candidates = candidates.sort_values(
-            by=["volume_ratio", "change_pct"], ascending=[False, False])
+        spot_df = compute_signal_flags(spot_df)
+        if spot_df is None or spot_df.empty:
+            return
+        if not self._tail_select_time_reached():
+            self._tail_pool_candidates(spot_df)  # 阶段一：入池（不买）
+            return
+        self._tail_select_and_buy(spot_df, index_breaker_triggered)  # 阶段二：统一选+买
+
+    def _tail_pool_candidates(self, spot_df):
+        """阶段一：窗口内(选时点前)每轮把命中尾盘信号的候选收进池，不做闸门/LLM/买入。"""
+        cands = spot_df[spot_df["_signal_tail_game"]]
+        if cands is None or cands.empty:
+            return
         tail_codes = {h["code"] for h in HoldingManager.get_active_holdings(holding_type="AI_TAIL")}
-        self._tail_llm_confirm_this_cycle = 0
-        for _, row in candidates.head(max(settings.TAIL_MAX_DAILY_BUYS, 1) * 2).iterrows():
+        now_ts = datetime.datetime.now()
+        prev = len(self._tail_pool)
+        for _, row in cands.iterrows():
             code = str(row["code"])
             if code in self._tail_auto_bought_codes or code in tail_codes:
+                continue  # 已买/已持仓不入池
+            self._tail_pool[code] = {
+                "code": code, "name": str(row["name"]),
+                "price": float(row["price"]), "change_pct": float(row["change_pct"]),
+                "vol_ratio": float(row["volume_ratio"]),
+                "amt_billion": float(row["amt_billion"]), "ts": now_ts,
+            }
+        if len(self._tail_pool) != prev:
+            logger.info(f"[尾盘博弈] 入池候选 {len(self._tail_pool)} 只: {sorted(self._tail_pool)}")
+
+    def _tail_build_llm_candidates(self, spot_df) -> list:
+        """选时点：从池中取「当前仍有效（信号+站均线）」候选，按量比→涨幅排序，取前 TAIL_SELECT_POOL_SIZE 条。
+        绝不给 LLM 喂已劣化候选（用当轮最新 spot 复核，不用入池旧价）。"""
+        if not self._tail_pool:
+            return []
+        cands = []
+        for code in self._tail_pool:
+            # 用当轮最新 spot 按 code 过滤（与 _recheck_buy_after_llm 同口径），重复行取首行
+            sub = spot_df[spot_df["code"].astype(str) == str(code)]
+            if sub.empty:
+                continue  # 最新快照已无此股 → 劣化
+            row = sub.iloc[0]
+            if not bool(row.get("_signal_tail_game", False)):
+                continue  # 已不满足尾盘信号（涨幅/量比/收阳/上影/均价任一条目）
+            price = float(row["price"])
+            if not self._tail_above_ma(code, price):
+                continue  # 跌破均线不入选
+            cands.append({
+                "code": str(code), "name": str(row["name"]), "price": price,
+                "change_pct": float(row["change_pct"]), "vol_ratio": float(row["volume_ratio"]),
+                "amt_billion": float(row["amt_billion"]),
+            })
+        cands.sort(key=lambda c: (c["vol_ratio"], c["change_pct"]), reverse=True)
+        return cands[:settings.TAIL_SELECT_POOL_SIZE]
+
+    def _tail_market_env(self, index_breaker_triggered) -> str:
+        """选时点市场环境串：风格/涨跌停/最高连板/情绪/K/情绪周期/晋级率 + 昨日涨停今日开盘溢价
+        （次日高开预期最直接代理）+ 大盘熔断态。数据全部来自 _current_market_style（每轮已更新），零额外拉取。"""
+        s = self._current_market_style or {}
+        lines = [
+            f"风格:[{s.get('style', '未知')}] {s.get('reason', '')}",
+            f"涨停:{s.get('zt_count', 0)} 跌停:{s.get('dt_count', 0)} "
+            f"炸板:{s.get('zhaban_count', 0)}({s.get('zhaban_rate', 0)}%) 最高连板:{s.get('height', 0)}板",
+            f"情绪分:{s.get('sentiment_index', '')} 容量因子K:{s.get('capacity_factor', '')} "
+            f"情绪周期:{s.get('cycle_phase', '未知')} 晋级率:{s.get('promotion_rate', '')}%",
+            f"昨日涨停今日开盘: 开盘溢价{s.get('premium_opening', 0)}% 即时溢价{s.get('premium_intraday', 0)}% "
+            f"高开>3%占比{s.get('high_open_ratio', 0)}% 红盘率{s.get('positive_ratio', 0)}% (样本{s.get('total_count', 0)}只)",
+        ]
+        if s.get("top_sectors"):
+            lines.append("活跃板块: " + " ".join(f"{t['name']}{t['zt_count']}家" for t in s["top_sectors"]))
+        if index_breaker_triggered:
+            lines.append("⚠️大盘熔断: 全市场均涨幅过深，今日系统性风险高")
+        return "\n".join(lines)
+
+    def _tail_llm_select(self, cands: list, index_breaker_triggered: bool) -> list:
+        """统一 LLM 批次决策：喂「当前市场环境+次日预期」+候选 topN，选明天高开概率最大的
+        TAIL_MAX_POSITIONS 只（+TAIL_SELECT_BACKUP 只备选），输出按概率降序的 code 列表。
+        解析保序提取 6 位代码并过滤不在候选集内的幻觉码；LLM 失败返回 []（调用方降级规则）。"""
+        market_env = self._tail_market_env(index_breaker_triggered)
+        text = DynamicSellAdvisor.format_tail_select_decision(
+            market_env=market_env, candidates=cands,
+            select_n=settings.TAIL_MAX_POSITIONS, backup_n=settings.TAIL_SELECT_BACKUP)
+        if not text:
+            return []
+        valid = {c["code"] for c in cands}
+        order = []
+        for m in re.findall(r"(?<!\d)\d{6}(?!\d)", text):
+            if m in valid and m not in order:
+                order.append(m)
+        return order
+
+    def _tail_select_and_buy(self, spot_df, index_breaker_triggered):
+        """阶段二：选时点起统一 LLM 选 TAIL_MAX_POSITIONS 只并按序买入。
+        LLM 批次决策只在首个选周期调用一次并冻结选购顺序；之后每轮只做买前复核+买入。"""
+        if not self._tail_select_order:
+            cands = self._tail_build_llm_candidates(spot_df)
+            if not cands:
+                logger.info("[尾盘博弈] 选时点池内无有效候选，今日尾盘不买")
+                self._tail_select_done = True
+                return
+            order = self._tail_llm_select(cands, index_breaker_triggered)
+            if not order:
+                self._tail_select_source = "rule"
+                order = [c["code"] for c in cands[:settings.TAIL_MAX_POSITIONS]]
+                logger.info(f"[尾盘博弈] LLM 统一选失败/无有效选择，降级规则按量比涨幅取前{len(order)}只: {order}")
+            else:
+                self._tail_select_source = "llm"
+                logger.info(f"[尾盘博弈] LLM 统一选序: {order}（市场环境+次日高开预期）")
+            self._tail_select_order = order
+
+        tail_holdings = HoldingManager.get_active_holdings(holding_type="AI_TAIL")
+        if len(tail_holdings) >= settings.TAIL_MAX_POSITIONS:
+            self._tail_select_done = True
+            logger.info(f"[尾盘博弈] 持仓已达上限({len(tail_holdings)}/{settings.TAIL_MAX_POSITIONS})，选购结束")
+            return
+
+        tail_codes = {h["code"] for h in tail_holdings}
+        for code in self._tail_select_order:
+            if len(tail_holdings) >= settings.TAIL_MAX_POSITIONS:
+                break
+            if len(self._tail_auto_bought_codes) >= settings.TAIL_MAX_DAILY_BUYS:
+                break
+            if code in self._tail_select_attempted:
+                continue
+            if code in self._tail_auto_bought_codes or code in tail_codes:
+                self._tail_select_attempted.add(code)
+                continue
+            # 用当轮最新 spot 复核：消失/劣化 → 终态跳过（不用入池旧价买入）
+            sub = spot_df[spot_df["code"].astype(str) == str(code)]
+            if sub.empty:
+                self._tail_select_attempted.add(code)
+                continue
+            row = sub.iloc[0]
+            if not bool(row.get("_signal_tail_game", False)):
+                self._tail_select_attempted.add(code)
                 continue
             name = str(row["name"])
             price = float(row["price"])
@@ -1018,31 +1178,33 @@ class _MonitorCoreMixin:
             vol_ratio = float(row["volume_ratio"])
             amt_billion = float(row["amt_billion"])
             if not self._tail_gates_open(code, amt_billion, index_breaker_triggered):
+                self._tail_select_attempted.add(code)
                 continue
             # 指南：上升趋势站上 5/10 日均线（MA 数据缺失放行）
             if not self._tail_above_ma(code, price):
+                self._tail_select_attempted.add(code)
                 continue
-            # 独立 LLM 预算：尾盘时段每轮最多确认 TAIL_LLM_PER_CYCLE 次
-            if self._tail_llm_confirm_this_cycle >= settings.TAIL_LLM_PER_CYCLE:
-                continue
-            self._tail_llm_confirm_this_cycle += 1
-            decision_source, llm_allow = self._llm_confirm_buy(
-                code, name, price, change_pct, vol_ratio, "尾盘博弈", ["尾盘博弈"])
-            if not llm_allow:
-                logger.info(f"[尾盘博弈] {name}({code}) LLM 判观望，不买入")
-                continue
-            price, recheck_ok, _retry = self._recheck_buy_after_llm(code, price)
+
+            price, recheck_ok, retry = self._recheck_buy_after_llm(code, price)
             if not recheck_ok:
+                if retry:
+                    logger.info(f"[尾盘博弈] {name}({code}) 买前复核瞬时失败(封板/快照不可用)，下轮重试")
+                    continue  # 不标记终态 → 下轮重试
+                self._tail_select_attempted.add(code)
                 logger.info(f"[尾盘博弈] {name}({code}) 买前复核未通过，放弃")
                 continue
             if not self._tail_gates_open(code, amt_billion, index_breaker_triggered):
+                self._tail_select_attempted.add(code)
                 continue
+
+            decision_source = self._tail_select_source or "rule"
             slippage = settings.AI_BUY_SLIPPAGE_PCT
             cost_price = round(price * (1 + slippage / 100), 2)
             HoldingManager.add_holding(
                 code=code, name=name, cost_price=cost_price, holding_type="AI_TAIL",
                 strategy="尾盘博弈-次日高开", decision_source=decision_source)
             self._tail_auto_bought_codes.add(code)
+            self._tail_select_attempted.add(code)
             # 通知里带上对应个股 MA5/MA10（_get_ma_prices 当日缓存，命中不联网）
             ma_info = ""
             try:
@@ -1058,6 +1220,16 @@ class _MonitorCoreMixin:
                 body=(f"尾盘博弈标的 {name}({code}) 现价:{price}元(+{change_pct}%), 量比{vol_ratio}倍, "
                       f"成本:{cost_price}元(含滑点{slippage:.2f}%),{ma_info}，明日早盘兑现卖出。"),
                 group="AI自动持仓", level="timeSensitive")
+            tail_holdings = HoldingManager.get_active_holdings(holding_type="AI_TAIL")
+
+        # 选购整体结束判定：持仓满 / 当日买满 / 选购顺序全 resolve
+        remaining = [c for c in self._tail_select_order
+                     if c not in self._tail_select_attempted and c not in self._tail_auto_bought_codes]
+        tail_holdings = HoldingManager.get_active_holdings(holding_type="AI_TAIL")
+        if (len(tail_holdings) >= settings.TAIL_MAX_POSITIONS
+                or len(self._tail_auto_bought_codes) >= settings.TAIL_MAX_DAILY_BUYS
+                or not remaining):
+            self._tail_select_done = True
 
     def _tail_gates_open(self, code: str, amt_billion: float, index_breaker_triggered: bool) -> bool:
         """尾盘博弈独立闸门：独立持仓上限/当日次数 + 共享亏损熔断 + 已持仓 + 大盘熔断。"""

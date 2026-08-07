@@ -382,9 +382,7 @@ EXCLUDE_ST=true            # 排除 ST/*ST 股
 # 首次使用先拉日线缓存：python -m data.kline_etl --start 20260701 --end 20260731
 # 然后回测：GET /backtest?start=20260701&end=20260731&mode=signals
 # 结果 signal_compare 里对比 点火异动/逼近封板/低开猛拉/振幅放量/尾盘博弈 各桶胜率与平均收益。
-TAIL_GAME_OPEN_GAP_PCT=2.0    # 尾盘博弈：次日开盘涨幅≥此比例(%)视为高开，用当日最高价兑现
-TAIL_GAME_NEAR_LIMIT_RATIO=0.92  # 尾盘博弈候选：涨幅≥涨停线×此比例的涨停附近放量下限
-TAIL_GAME_VOL_RATIO=3.0       # 尾盘博弈候选：放量下限（量比）
+# 尾盘博弈候选阈值走 TAIL_GAME_CHANGE_MIN/MAX + TAIL_GAME_VOL_RATIO_MIN/MAX（见 .env.example 尾盘配置）
 KLINE_ETL_WORKERS=8           # 全市场日线 ETL 并行线程数
 
 # ==================== 6. 交易所监管异动与胆量风控 ====================

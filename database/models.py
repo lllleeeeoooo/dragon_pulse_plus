@@ -415,7 +415,8 @@ class SystemLog(Base):
 class TradeCalendar(Base):
     """
     交易日历表
-    缓存过去30天+未来30天的交易日，每日自动维护
+    缓存过去120天+未来30天的交易日，每日自动维护
+    （历史 120 天：供『龙头过期 30 个交易日』等按交易日回溯）
     """
     __tablename__ = "trade_calendar"
 
@@ -476,6 +477,20 @@ class DatabaseManager:
             pool_pre_ping=True,
         )
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        # 每个新连接都设置 busy_timeout（busy_timeout 是连接级 PRAGMA，不随连接池继承）：
+        # 修复复盘/监控多进程并发写 SQLite 时，错误日志等写入立刻报 "database is locked"
+        # （此前只有 _enable_wal 里对单条连接设过，连接池溢出新建的连接没有该设置）
+        from sqlalchemy import event
+
+        @event.listens_for(self.engine, "connect")
+        def _set_busy_timeout(dbapi_connection, connection_record):
+            try:
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA busy_timeout=10000")
+                cursor.close()
+            except Exception:
+                pass
+
         self.create_tables()
         # 启用 WAL 模式提升并发读/写性能，降低 "database is locked" 概率
         self._enable_wal()
@@ -498,7 +513,7 @@ class DatabaseManager:
             with self.engine.connect() as conn:
                 from sqlalchemy import text
                 conn.execute(text("PRAGMA journal_mode=WAL;"))
-                conn.execute(text("PRAGMA busy_timeout=5000;"))
+                conn.execute(text("PRAGMA busy_timeout=10000;"))  # 与 connect 事件一致，写锁竞争时等待而非立刻报错
                 conn.commit()
         except Exception:
             pass

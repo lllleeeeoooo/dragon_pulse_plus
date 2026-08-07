@@ -60,6 +60,49 @@ def get_previous_trading_day(date: Optional[datetime.date] = None) -> str:
     return prev.strftime("%Y%m%d")
 
 
+def get_n_trading_days_ago(n: int, date: Optional[datetime.date] = None) -> str:
+    """返回 date 往前第 n 个交易日对应的日期 (YYYYMMDD)。
+    供按交易日衰减的逻辑（如『龙头过期 30 个交易日』）——自然日含周末/节假日，
+    活跃期按交易日算更贴合实际（≈42 自然日）。
+    交易日取 trade_calendar 表（akshare 同步，历史覆盖 120 天）；表内查不到（表空/同步失败）
+    时降级为工作日(周一~周五)估算，避免因表覆盖不足而死循环。"""
+    _ensure_synced()
+    earliest = _get_calendar_earliest()
+    d = date or datetime.date.today()
+    cnt = 0
+    while cnt < n:
+        d -= datetime.timedelta(days=1)
+        if _is_td_best_effort(d, earliest):
+            cnt += 1
+    return d.strftime("%Y%m%d")
+
+
+def _get_calendar_earliest() -> Optional[str]:
+    """trade_calendar 表内最早日期 (YYYY-MM-DD)，用于判断日期是否在表覆盖范围内。"""
+    try:
+        from database.connection import db_manager
+        from database.models import TradeCalendar
+        session = db_manager.get_session()
+        try:
+            e = session.query(TradeCalendar).order_by(TradeCalendar.trade_date.asc()).first()
+            return e.trade_date if e else None
+        finally:
+            session.close()
+    except Exception:
+        return None
+
+
+def _is_td_best_effort(d: datetime.date, earliest: Optional[str]) -> bool:
+    """覆盖范围内用 trade_calendar 真实交易日（含节假日/调休）；范围外/表空按工作日估算兜底。"""
+    if earliest and d.isoformat() >= earliest:
+        try:
+            from database.services import TradeCalendarManager
+            return TradeCalendarManager.is_trading_day(d.isoformat())
+        except Exception:
+            return d.weekday() < 5
+    return d.weekday() < 5
+
+
 def count_trading_days(start: datetime.date, end: datetime.date) -> int:
     """start(含)~end(含)之间的交易日数。
     日历覆盖范围内精确计数；超出覆盖范围或日历不可用时按工作日(周一~周五)估算。

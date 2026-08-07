@@ -151,6 +151,19 @@ class KlineEtl:
         return KlineEtl.run(start, end, workers)
 
     @staticmethod
+    def run_incremental_paced(deadline: str = None, on_progress=None) -> dict:
+        """盘后增量同步（串行摊速版，盘后自动任务默认走这条）：从启动时刻(约15:30)起逐只串行拉取，
+        每只间隔按「剩余时间/剩余只数」动态摊速，整体在 KLINE_ETL_PACED_DEADLINE(默认23:30) 前完成——
+        源 QPS 最低，防并发限流/封 IP。窗口=近 KLINE_ETL_BOOTSTRAP_DAYS 天到今天；
+        断点续传跳过已完整覆盖的 code。on_progress(pulled,total,done=False) 每 100 只回调一次供看板显示进度。"""
+        from config.settings import settings
+        start = (datetime.date.today() -
+                 datetime.timedelta(days=settings.KLINE_ETL_BOOTSTRAP_DAYS)).strftime("%Y%m%d")
+        end = datetime.date.today().strftime("%Y%m%d")
+        deadline = deadline or settings.KLINE_ETL_PACED_DEADLINE
+        return KlineEtl.run_paced(start, end, deadline=deadline, on_progress=on_progress)
+
+    @staticmethod
     def run(start: str, end: str, workers: int = None, force: bool = False) -> dict:
         """并行拉取全市场日线，断点续传。返回统计信息。
         进程内互斥（_etl_lock）：已有 run/run_serial 在跑时直接跳过，防每日任务跨天重叠。"""
@@ -235,6 +248,71 @@ class KlineEtl:
                 logger.info(f"第 {rnd} 轮结束：剩余 {len(todo)}")
             return {"universe": len(universe), "pulled": pulled,
                     "remaining": len(todo), "rounds": rounds_used,
+                    "rows": DailyKlineManager.count_rows()}
+        finally:
+            _etl_lock.release()
+
+    @staticmethod
+    def run_paced(start: str, end: str, deadline: str = "23:30",
+                  min_sleep: float = 0.05, max_sleep: float = 10.0,
+                  on_progress=None) -> dict:
+        """串行+deadline 动态摊速全市场日线（盘后自动任务专用，零并发）：
+        逐只 fetch_one + 每只后 sleep = max(min_sleep, min(max_sleep, 剩余时间/剩余只数))，
+        整体在 deadline(默认23:30) 前完成。动态自适应——todo 大时每只间隔约数秒摊满整个晚上
+        （源 QPS 最低，防限流）；todo 小时被 max_sleep 封顶快速结束（不必死守 23:30）。
+        断点续传跳过已完整 code；已过 deadline 时退化为最小间隔串行快拉。
+        on_progress(pulled,total,done=False) 每 100 只回调一次（供看板实时进度）。
+        进程内互斥(_etl_lock)：已有 run/run_serial/run_paced 在跑时直接跳过。"""
+        if not _etl_lock.acquire(blocking=False):
+            logger.warning("已有日线同步任务在运行，跳过摊速拉取")
+            return {"universe": 0, "pulled": 0, "remaining": 0,
+                    "message": "已有日线同步在运行，跳过（防跨天重叠）"}
+        try:
+            from database.kline import DailyKlineManager
+            from core.backtest import AIBacktestEngine
+            universe = KlineEtl.fetch_universe()
+            if universe is None or universe.empty:
+                return {"universe": 0, "pulled": 0, "remaining": 0, "error": "universe 为空"}
+            expected_days = len(AIBacktestEngine._build_trade_date_list(start, end))
+            if expected_days <= 0:
+                return {"universe": len(universe), "pulled": 0, "remaining": len(universe),
+                        "error": "区间无交易日"}
+            done = DailyKlineManager.complete_codes(start, end, expected_days)
+            todo = [str(c) for c in universe["code"] if str(c) not in done]
+            # deadline(HH:MM) → 今日对应时间戳
+            try:
+                _hh, _mm = str(deadline).split(":")
+                _dl = datetime.datetime.combine(datetime.date.today(),
+                                                datetime.time(int(_hh), int(_mm)))
+            except Exception:
+                _dl = datetime.datetime.combine(datetime.date.today(), datetime.time(23, 30))
+            deadline_ts = _dl.timestamp()
+            logger.info(f"摊速日线同步启动: 待拉 {len(todo)} 只, 目标 {deadline} 前完成, 串行零并发")
+            pulled, still = 0, []
+            for i, code in enumerate(todo):
+                # 动态摊速：剩余时间 / 剩余只数 ×0.85（预留约15%给请求本身耗时，保证整体在 deadline 前完成；
+                # max_sleep 封顶防小量同步空等一晚，min_sleep 兜底防已过 deadline 时死循环）
+                remaining_sec = deadline_ts - time.time()
+                per_stock = max(min_sleep, min(max_sleep, remaining_sec * 0.85 / max(len(todo) - i, 1)))
+                try:
+                    df = KlineEtl.fetch_one(code, start, end)
+                    if df is not None and not df.empty:
+                        DailyKlineManager.upsert_batch(df.to_dict("records"))
+                        pulled += 1
+                    else:
+                        still.append(code)
+                except Exception:
+                    still.append(code)
+                time.sleep(per_stock)
+                if (i + 1) % 100 == 0 or (i + 1) == len(todo):
+                    logger.info(f"  摊速日线同步 {i + 1}/{len(todo)}，待补 {len(still)}")
+                    if on_progress:
+                        try:
+                            on_progress(pulled=pulled, total=len(todo), done=False)
+                        except Exception:
+                            pass  # 进度回调异常不影响拉取主流程
+            logger.info(f"摊速日线同步完成: 拉取 {pulled} 只, 剩余 {len(still)} 只")
+            return {"universe": len(universe), "pulled": pulled, "remaining": len(still),
                     "rows": DailyKlineManager.count_rows()}
         finally:
             _etl_lock.release()

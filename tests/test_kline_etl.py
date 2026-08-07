@@ -79,6 +79,11 @@ class TestDailyKlineManager(unittest.TestCase):
 class TestKlineEtl(unittest.TestCase):
     """ETL 逻辑：fetch_one 归一化 / build_day_spot 组装 / 断点续传 / 增量起点"""
 
+    @classmethod
+    def setUpClass(cls):
+        # 必须自带切测试库：setUp 会 DELETE 整张 daily_kline，单独跑本类时若指向生产库会误删生产数据
+        switch_to_test_db()
+
     def setUp(self):
         session = db_manager.get_session()
         try:
@@ -237,15 +242,51 @@ class TestKlineEtl(unittest.TestCase):
         self.assertEqual(r["remaining"], 1)
         self.assertEqual(r["rounds"], 3)
 
+    def test_run_paced串行摊速拉取(self):
+        """run_paced：零并发串行拉取（非线程池），跳过已完整 code，每只后按剩余时间摊速 sleep"""
+        from data.kline_etl import KlineEtl
+        uni = pd.DataFrame({"code": ["600001", "600002", "600003"]})
+        fake = pd.DataFrame({"code": ["600001"], "trade_date": ["20260701"]})
+        with patch("data.kline_etl.KlineEtl.fetch_universe", return_value=uni), \
+             patch("core.backtest.AIBacktestEngine._build_trade_date_list",
+                   return_value=["20260701", "20260702", "20260703"]), \
+             patch("database.kline.DailyKlineManager.complete_codes", return_value={"600001"}), \
+             patch("database.kline.DailyKlineManager.upsert_batch"), \
+             patch("data.kline_etl.KlineEtl.fetch_one", return_value=fake) as m, \
+             patch("data.kline_etl.time.sleep") as sleeper:
+            r = KlineEtl.run_paced("20260701", "20260703", deadline="23:30", max_sleep=10.0)
+        self.assertEqual(r["pulled"], 2)  # 跳过已完整的 600001
+        self.assertEqual(r["remaining"], 0)
+        self.assertEqual(m.call_count, 2)  # 串行逐只，非并发线程池
+        self.assertEqual(sleeper.call_count, 2)  # 每只后摊速 sleep 一次
+        for call in sleeper.call_args_list:
+            self.assertGreater(call.args[0], 0.0)       # 有摊速间隔（不并发猛拉）
+            self.assertLessEqual(call.args[0], 10.0)    # 被 max_sleep 封顶
+
+    def test_run_incremental_paced窗口与deadline(self):
+        """run_incremental_paced：窗口=近 KLINE_ETL_BOOTSTRAP_DAYS 天到今天，deadline 用配置默认"""
+        from data.kline_etl import KlineEtl
+        from config.settings import settings
+        import datetime as _dt
+        with patch("data.kline_etl.KlineEtl.run_paced", return_value={}) as m:
+            KlineEtl.run_incremental_paced()
+        start, end = m.call_args[0][0], m.call_args[0][1]
+        expect_start = (_dt.date.today() -
+                        _dt.timedelta(days=settings.KLINE_ETL_BOOTSTRAP_DAYS)).strftime("%Y%m%d")
+        self.assertEqual(start, expect_start)
+        self.assertEqual(end, _dt.date.today().strftime("%Y%m%d"))
+        self.assertEqual(m.call_args.kwargs.get("deadline"), settings.KLINE_ETL_PACED_DEADLINE)
+
     def test_日线任务互斥锁防跨天重叠(self):
         from data.kline_etl import KlineEtl, _etl_lock
         _etl_lock.acquire()  # 模拟上一个日线同步仍在跑（跨天重叠场景）
         try:
             r1 = KlineEtl.run("20260701", "20260702")
             r2 = KlineEtl.run_serial("20260701", "20260702")
+            r3 = KlineEtl.run_paced("20260701", "20260702")
         finally:
             _etl_lock.release()
-        for r in (r1, r2):
+        for r in (r1, r2, r3):
             self.assertIn("message", r)
             self.assertIn("跳过", r["message"])
             self.assertNotIn("error", r)  # 跳过不算失败，不触发 _sync_kline_incremental 告警

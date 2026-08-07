@@ -283,7 +283,14 @@ if(d.jobs && d.jobs.length>0){
   html+='<h2>⏰ 定时任务</h2>';
   html+='<table class="tbl"><tr><th>时间</th><th>任务</th><th>今日</th><th>最后执行</th></tr>';
   d.jobs.forEach(function(j){
-    var ran=j.ran_today?'<span class="tag tag-green">已执行</span>':'<span class="tag tag-red">未执行</span>';
+    var ran;
+    if(j.status){
+      // 有运行状态（如日线同步：运行中/完成/失败/跳过）→ 显示状态标签 + 进度
+      var cls=j.status==='完成'?'tag-green':(j.status==='失败'?'tag-red':(j.status==='跳过'?'tag-yellow':'tag-blue'));
+      ran='<span class="tag '+cls+'">'+j.status+'</span>'+(j.progress?' '+j.progress:'');
+    }else{
+      ran=j.ran_today?'<span class="tag tag-green">已执行</span>':'<span class="tag tag-red">未执行</span>';
+    }
     html+='<tr><td style="font-weight:bold;color:#40c4ff">'+j.time+'</td>';
     html+='<td><div>'+j.name+'</div><div style="font-size:10px;color:#5c6e80">'+j.desc+'</div></td>';
     html+='<td>'+ran+'</td>';

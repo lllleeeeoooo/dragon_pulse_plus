@@ -17,6 +17,33 @@ def _strip_json_block(text: str) -> str:
     return re.sub(r"```json\s*.*?\s*```", "", text, flags=re.DOTALL).strip()
 
 
+def _detable(text: str) -> str:
+    """把 Markdown 表格转成纯文本行（Bark 渲染不了 md 表格，作为兜底；prompt 已另约束 LLM 少用表格）。
+    `| a | b |` → `a | b`；`| --- | --- |` 分隔行直接丢弃。非表格行原样保留。"""
+    out = []
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if s.startswith("|") and s.count("|") >= 2:
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            # 分隔行 |---|---| → 丢弃
+            if cells and all(re.fullmatch(r":?-{2,}:?", c or "-") for c in cells):
+                continue
+            out.append(" | ".join(c for c in cells if c != ""))
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _preserve_line_breaks(text: str) -> str:
+    """Bark 用原生 Markdown 渲染：单个 \\n 是软换行（并进同一段落，不显示换行），
+    \\n\\n 是段落分隔（会空一行）。要"换行但不多空一行"，用原生硬换行：
+    把段内单 \\n 转成「行尾两个空格 + \\n」（CommonMark 硬换行标准写法），
+    段落分隔 \\n\\n 原样保留（大段之间仍空一行）。"""
+    text = text.replace("\r\n", "\n")
+    paragraphs = re.split(r"\n{2,}", text)
+    return "\n\n".join(p.replace("\n", "  \n") for p in paragraphs)
+
+
 def _split_body(body: str, max_chars: int = BARK_MAX_CHARS) -> List[str]:
     """将长文本按段落边界拆分为多个 chunk，每个不超过 max_chars"""
     if len(body) <= max_chars:
@@ -92,8 +119,11 @@ class BarkNotifier:
             return False
 
         endpoint = f"{self.server_url}/{self.token}"
+        # Bark 用原生 Markdown：单 \n 是软换行（并段）→ 转原生硬换行(行尾两空格+\n)保证换行可见且不空行；
+        # md 表格 Bark 渲染不了 → 兜底转纯文本（prompt 已约束 LLM 少用表格）
+        push_body = _preserve_line_breaks(_detable(body))
         payload: Dict[str, Any] = {
-            "title": title, "markdown": body, "group": group,
+            "title": title, "markdown": push_body, "group": group,
             "sound": sound, "level": level, "isArchive": 1,
             "ttl": 604800,  # 7 天后自动清理历史记录和通知中心
         }

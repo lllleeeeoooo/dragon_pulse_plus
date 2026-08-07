@@ -282,3 +282,37 @@ class DynamicSellAdvisor:
             logger.warning(f"买入 LLM 决策失败: {e}")
             return ""
 
+    @classmethod
+    def format_tail_select_decision(cls, market_env: str, candidates: list,
+                                    select_n: int = 2, backup_n: int = 2) -> str:
+        """
+        尾盘博弈统一选（批次决策）：喂「当前市场环境 + 次日高开预期数据」+ 候选 topN，
+        LLM 选明天高开概率最大的 select_n 只（另给最多 backup_n 只备选，按概率降序）。
+        输出：每行一个 6 位股票代码，严禁输出文字/理由（便于保序解析）。
+        失败返回空串（调用方降级规则兜底）。
+        candidates: [{"code","name","price","change_pct","vol_ratio","amt_billion"}, ...]
+        """
+        lines = []
+        for i, c in enumerate(candidates[:select_n + backup_n + 8], 1):
+            lines.append(
+                f"{i}. {c['name']}({c['code']}) 现价{c['price']} 涨幅{c['change_pct']}% "
+                f"量比{c['vol_ratio']} 成交{c['amt_billion']}亿")
+        user = (
+            f"【当前市场环境与次日预期】\n{market_env}\n\n"
+            f"【尾盘博弈入池候选（低吸强势股博次日高开：涨幅2-5%/温和放量/收阳/短上影/收盘≥均价/站均线）】\n"
+            + "\n".join(lines) +
+            f"\n\n请结合当前市场环境与下个交易日高开预期，从上述候选中选出明天高开概率最大的 "
+            f"{select_n} 只（可再给最多 {backup_n} 只备选，按概率从高到低排序）。\n"
+            f"输出要求：每行一个 6 位股票代码（如 600002），不要输出任何文字或理由。"
+        )
+        system = (
+            "你是A股尾盘博弈选股操盘手。尾盘买入强势股博次日高开，核心是判断明天集合竞价高开概率。\n"
+            "综合当前市场环境（风格/情绪/连板高度/昨日涨停今日溢价与高开占比）与个股强度（涨幅/量比/成交额）\n"
+            "选出明日最可能高开的股票。只输出6位股票代码，每行一个，按概率从高到低，严禁输出理由。"
+        )
+        try:
+            return llm_client.generate(system_prompt=system, user_prompt=user, module="sell_advisor")
+        except Exception as e:
+            logger.warning(f"尾盘博弈统一选 LLM 失败: {e}")
+            return ""
+

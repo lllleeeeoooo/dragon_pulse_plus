@@ -5,7 +5,9 @@ from database.connection import db_manager
 logger = logging.getLogger(__name__)
 
 class TradeCalendarManager:
-    """交易日历管理服务。维护过去30天+未来30天的交易日数据。"""
+    """交易日历管理服务。维护过去120天+未来30天的交易日数据。
+    （历史窗口 120 天：供『龙头过期 30 个交易日』等按交易日回溯——30 交易日≈42 自然日+长假余量；
+    原 ±30 天覆盖不够，30 个交易日会超出表范围导致查不到。）"""
 
     @staticmethod
     def is_trading_day(date_str: str) -> bool:
@@ -20,7 +22,7 @@ class TradeCalendarManager:
 
     @staticmethod
     def count_trading_days(start_date: str, end_date: str) -> Optional[int]:
-        """start~end(含)之间的交易日数；区间超出日历覆盖范围(±30天)返回 None，由调用方回退估算。"""
+        """start~end(含)之间的交易日数；区间超出日历覆盖范围(过去120天~未来30天)返回 None，由调用方回退估算。"""
         session = db_manager.get_session()
         try:
             earliest = session.query(TradeCalendar).order_by(TradeCalendar.trade_date.asc()).first()
@@ -39,13 +41,14 @@ class TradeCalendarManager:
     @staticmethod
     def sync_calendar(force: bool = False):
         """
-        从 akshare 同步交易日历，保留 ±30 天数据，清理过期记录。
-        每周强制全量覆盖 ±30 天窗口（应对调休/假期安排变动）。
+        从 akshare 同步交易日历，保留 过去120天+未来30天 数据，清理过期记录。
+        每周强制全量覆盖（应对调休/假期安排变动）。
+        历史窗口 120 天：30 个交易日≈42 自然日，原 ±30 天覆盖不够按交易日回溯的场景。
         :param force: True 强制刷新，忽略缓存
         """
         import datetime
         today = datetime.date.today()
-        start = today - datetime.timedelta(days=30)
+        start = today - datetime.timedelta(days=120)
         end = today + datetime.timedelta(days=30)
 
         session = db_manager.get_session()
@@ -58,12 +61,18 @@ class TradeCalendarManager:
                     TradeCalendar.trade_date == today_str
                 ).count()
                 if existing > 0:
-                    # 检查最新同步日期（用表中最新日期推断）
+                    # 未来数据充足 且 历史覆盖到 120 天前 → 跳过；
+                    # 历史不足（如升级前的旧 ±30 天数据）→ 重新同步补齐历史窗口，供 30 个交易日回溯
                     last_date = session.query(TradeCalendar).order_by(
                         TradeCalendar.trade_date.desc()
                     ).first()
-                    if last_date and last_date.trade_date >= (today + datetime.timedelta(days=25)).isoformat():
-                        return  # 未来数据充足，跳过
+                    first_date = session.query(TradeCalendar).order_by(
+                        TradeCalendar.trade_date.asc()
+                    ).first()
+                    if (last_date and last_date.trade_date >= (today + datetime.timedelta(days=25)).isoformat()
+                            and first_date
+                            and first_date.trade_date <= (today - datetime.timedelta(days=115)).isoformat()):
+                        return  # 未来充足且历史覆盖足够，跳过
 
             # 从 akshare 拉取
             import akshare as ak
@@ -73,7 +82,7 @@ class TradeCalendarManager:
                 all_dates = pd.to_datetime(df["trade_date"]).dt.date.tolist()
                 window_dates = [d for d in all_dates if start <= d <= end]
 
-                # 全量覆盖：先删后插 ±30 天范围，确保调休变动被更新
+                # 全量覆盖：先删后插 覆盖窗口 数据，确保调休变动被更新
                 session.query(TradeCalendar).filter(
                     TradeCalendar.trade_date >= start.isoformat(),
                     TradeCalendar.trade_date <= end.isoformat()
@@ -83,7 +92,7 @@ class TradeCalendarManager:
                     session.add(TradeCalendar(trade_date=d.isoformat()))
 
                 # 清理过期数据
-                cutoff = (today - datetime.timedelta(days=31)).isoformat()
+                cutoff = (today - datetime.timedelta(days=121)).isoformat()
                 session.query(TradeCalendar).filter(
                     TradeCalendar.trade_date < cutoff
                 ).delete()
